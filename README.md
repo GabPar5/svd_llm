@@ -1,5 +1,5 @@
 # svd_llm
-Implementation of svd_llm for Qwen-like models (tested on Qwen 2.5 only).
+Implementation of svd_llm for Qwen-like models (tested on Qwen 2.5 only).  
 To compress, save and evaluate a model (for instance, Qwen 2.5 1.5B), you can run:
 ```
 python main.py --model "Qwen/Qwen2.5-1.5B" --save_path "./output" --compress_mlp --compress_att_qkv --compress_att_out --compression_ratio 0.2 --batch_size 16 --max_whitening_samples 2048 --evaluate --eval_batch_size 16 --eval_benchmarks "wikitext:103:document_level|0"
@@ -29,7 +29,7 @@ Here's a list of all available possible arguments:
 - `--eval_batch_size`: Evaluation batch size (default = `1`)
 - `--eval_benchmarks`: Evaluation benchmarks, the pattern is "benchmarkName:taskName|numShots,..." (default = `ethics:commonsense|0`)
 - `--eval_temperature`: Evaluation temperature (default = `0.7`)
-- `--max_eval_tokens`: Max number of tokens to generate during evaluation (default = `1024`)
+- `--max_eval_tokens`: Max number of tokens to generate during evaluation (default = `1024`)  
 
 
 **WARNING**: Please note that the current implementation is not the most efficient in terms of VRAM usage. Thus, be careful increasing the batch size.
