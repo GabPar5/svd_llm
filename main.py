@@ -2,11 +2,11 @@ from src.utils import *
 from src.svd_llm import *
 import argparse
 import gc
+import json
 from transformers import AutoModelForCausalLM, AutoConfig
-from lighteval.models.model_input import GenerationParameters
-from lighteval.logging.evaluation_tracker import EvaluationTracker
-from lighteval.models.transformers.transformers_model import TransformersModel, TransformersModelConfig
-from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+import lm_eval
+from lm_eval.models.huggingface import HFLM
+from lm_eval.utils import setup_logging, handle_non_serializable
 
 
 if __name__ == "__main__":
@@ -29,9 +29,9 @@ if __name__ == "__main__":
     parser.add_argument('--compress_att_qkv', action='store_true', help='Compress attention qkv matrices')
     parser.add_argument('--compress_att_out', action='store_true', help='Compress attention output projection matrix')
     parser.add_argument('--hf_token', type=str, default=None, help='Huggingface token to download/upload models')
-    parser.add_argument('--evaluate', action='store_true', help='Evaluate the compressed model against the uncompressed one using LightEval')
+    parser.add_argument('--evaluate', action='store_true', help='Evaluate the model on a set of tasks')
     parser.add_argument('--eval_batch_size', type=int, default=1, help='Evaluation batch size')
-    parser.add_argument('--eval_benchmarks', type=str, default='ethics:commonsense|0',help='Evaluation benchmark, the pattern is "benchmarkName:taskName|numShots"')
+    parser.add_argument('--eval_tasks', type=str, default='wikitext|0',help='Evaluation tsks, the pattern is "taskName1,taskName2,...,taskNameK|numShots"')
     parser.add_argument('--eval_temperature', type=float, default=0.7,help='Evaluation temperature (conditional sampling)')
     parser.add_argument('--max_eval_tokens', type=int, default=1024,help='Max number of tokens to generate during evaluation')
 
@@ -41,9 +41,14 @@ if __name__ == "__main__":
         if args.compressed_model_path:
             print("DEBUG: Loading compressed model from disk...")
             vram_usage("Before loading compressed model")
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(args.compressed_model_path, padding_side="left")
+
             # Load model config from HF and instantiate base model
             config = AutoConfig.from_pretrained(args.model)
             model = AutoModelForCausalLM.from_config(config)
+            # Avoid warning
+            model.generation_config.pad_token_id = model.generation_config.eos_token_id
 
             # Load checkpoint
             checkpoint = torch.load(args.compressed_model_path, map_location="cpu")
@@ -63,7 +68,7 @@ if __name__ == "__main__":
         else:
             dataset_name = args.calibration_dataset.split(":")[0]
             dataset_split = args.calibration_dataset.split(":")[1]
-            model = compress_svd_llm(
+            model, tokenizer = compress_svd_llm(
                 model_name = args.model,
                 ratio = round(1-args.compression_ratio, 2),
                 dataset = {"dataset_name": dataset_name, 
@@ -86,6 +91,7 @@ if __name__ == "__main__":
     else:
         print("DEBUG: Loading original model from the hub...")
         vram_usage("Before loading original model")
+        tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             dtype=args.dtype,
@@ -93,55 +99,70 @@ if __name__ == "__main__":
             use_safetensors=True,
             token=args.hf_token
         )
+        # Avoid warning
+        model.generation_config.pad_token_id = model.generation_config.eos_token_id
         vram_usage("After loading original model")
     
     if args.evaluate:
         # Don't return last KV cache
         model.config.use_cache = False
 
-        # Setup evaluation pipeline
-        evaluation_tracker = EvaluationTracker(output_dir="./results", save_details=True)
-        pipeline_params = PipelineParameters(
-            launcher_type=ParallelismManager.NONE,
-            dataset_loading_processes=1
-        )
+        # Setup logging level
+        setup_logging("DEBUG")
 
-        # Load model config
-        model_path = "/".join(args.compressed_model_path.split("/")[:-1]) if args.compressed_model_path else args.save_path + "/models/" + args.model.replace("/", "_").replace("-", "_") + "/"
-        model_name = "/".join(args.compressed_model_path.split("/")[-1])[:-3] if args.compressed_model_path else model_path + args.model.replace("/", "_").replace("-", "_") + "_" + str(args.compression_ratio) + "_compressed"
-        model_config = TransformersModelConfig(
-            model_name=args.model,
-            tokenizer=model_path,
+        # Preprocess tasks
+        tasks_shots = args.eval_tasks.split("|")
+        if len(tasks_shots) > 2:
+            raise ValueError('The argument `eval_tasks_split` must be a string following this format: "taskName1,taskName2,...,taskNameK|numShots"')
+        elif  len(tasks_shots) == 1:
+            # Default zero-shot
+            num_fewshot = 0
+        else:
+            num_fewshot = int(tasks_shots[1])
+        tasks_list = tasks_shots[0].split(",")
+        print(f"DEBUG: Num few-shots: {num_fewshot}")
+        print(f"DEBUG: List of evaluation tasks: {tasks_list}")
+
+        # Load model
+        eval_model = HFLM(
+            pretrained=model,
+            tokenizer = tokenizer,
             batch_size=args.eval_batch_size,
-            device=args.device,
-            dtype=args.dtype,
-            override_chat_template=True,
-            generation_parameters=GenerationParameters(
-                temperature=args.eval_temperature,
-                max_new_tokens=args.max_eval_tokens
-            )
+            device = args.device,
+            dtype = args.dtype,
+            max_length = args.max_eval_tokens
         )
 
-        # Convert 'transformers' model into a 'LightevalModel'
-        wrapped_model = TransformersModel.from_model(
-            model=model,
-            config=model_config,
-            accelerator=None
-        )
-        del model
-        gc.collect()
-
-        pipeline = Pipeline(
-            tasks=args.eval_benchmarks,
-            pipeline_parameters=pipeline_params,
-            evaluation_tracker=evaluation_tracker,
-            model=wrapped_model
-        )
 
         vram_usage("Before evaluation")
 
-        with torch.no_grad():
-            results = pipeline.evaluate()
-        pipeline.show_results()
+        results = lm_eval.simple_evaluate(
+            model=eval_model,
+            tasks=tasks_list,
+            num_fewshot=num_fewshot,
+            batch_size=args.eval_batch_size,
+            device=args.device,
+            use_cache=None,
+            gen_kwargs={
+                "temperature": args.eval_temperature,
+                "do_sample": True,
+                "max_gen_toks": args.max_eval_tokens,
+            },
+            random_seed=args.seed,
+            numpy_random_seed=args.seed,
+            torch_random_seed=args.seed,
+            fewshot_random_seed=args.seed
+        )
+
+        # Save results
+        if args.compressed_model_path:
+            model_path = "/".join(args.compressed_model_path.split("/")[:-1])
+        else:
+            model_path = args.save_path + \
+                         "/models/" + \
+                         args.model.replace("/", "_").replace("-", "_") + \
+                         "/"
+        with open(model_path + "/evaluation_results.json", "w") as f:
+            json.dump(results, f, default=handle_non_serializable, indent=2)
 
         vram_usage("After evaluation")

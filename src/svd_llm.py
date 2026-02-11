@@ -262,7 +262,7 @@ def compress_svd_llm(
            ".pt")
         print("DEBUG: Compressed model saved succesfully")
 
-    return model
+    return model, tokenizer
 
 def apply_lowrank(model, rank_map):
     """
