@@ -11,9 +11,10 @@ python main.py --model "Qwen/Qwen2.5-1.5B" --save_path "./output" --compressed_m
 Here's a list of all available possible arguments:  
 - `--model`: LLM to load from huggingface (default = `Qwen/Qwen2.5-1.5B`)
 - `--dtype`: Weights dtype for original and compressed models (default = `bfloat16`)
-- `--compression_ratio`: Target compression ratio, 0.2 means only keeping about 20% of the params (default = `0.2`)
+- `--compression_ratio`: Target compression ratio, 0.2 means removing about 20% of the params (default = `0.2`)
 - `--calibration_dataset`: Calibration dataset, format is "datasetNameOrPath:split" (default = `tatsu-lab/alpaca:train`)
 - `--max_whitening_samples`: Number of calibration data samples used to calculate the whitening matrices (default = `1024`)
+- `--max_length`: Maximum context length for the LLM (default = `2048`)
 - `--batch_size`: Batch size for data preprocessing and forward pass (default = `16`)
 - `--seed`: Seed used while sampling the calibration data (default = `6363`)
 - `--device`: Device used to load the model during forward pass and after compression (default = `cuda`)
@@ -26,10 +27,12 @@ Here's a list of all available possible arguments:
 - `--compress_att_out`: Compress attention output projection matrices (default = `False`)
 - `--hf_token`: Huggingface token used to download/upload models (default = `None`)
 - `--evaluate`: Evaluate the model on a set of tasks (default = `False`)
+- `--eval_sampling`: Use conditional sampling during evaluation (default = `False`)
 - `--eval_batch_size`: Evaluation batch size (default = `1`)
-- `--eval_tasks`: Evaluation tsks, the pattern is "taskName1,taskName2,...,taskNameK|numShots" (default = `wikitext|0`)
+- `--eval_tasks`: Evaluation tasks, the pattern is "taskName1,taskName2,...,taskNameK|numShots" or "taskName1,taskName2,...,taskNameK|numShots1,numShots2,...,numShotsK" (default = `wikitext|0`)
 - `--eval_temperature`: Evaluation temperature (default = `0.7`)
-- `--max_eval_tokens`: Max number of tokens to generate during evaluation (default = `1024`)  
+- `--max_eval_tokens`: Maximum number of tokens to generate during evaluation (default = `256`)  
 
+Two example scripts that can be used for evaluation of original and compressed model are available too (`eval-original.sh` and `eval-compressed.sh`).  
 
 **WARNING**: Please note that the current implementation is not the most efficient in terms of VRAM usage. Thus, be careful increasing the batch size.

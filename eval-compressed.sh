@@ -1,0 +1,1 @@
+python main.py --save_path "./output" --model "Qwen/Qwen2.5-1.5B" --use_compressed --compression_ratio 0.2 --max_whitening_samples 2048 --compress_mlp --compress_att_qkv --compress_att_out --evaluate --eval_batch_size 32 --eval_tasks "wikitext,c4,openbookqa,winogrande,hellaswag,arc_easy,piqa,truthfulqa_mc2,gsm8k|0,0,0,5,10,5,0,0,4"

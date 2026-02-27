@@ -1,0 +1,1 @@
+python main.py --save_path "./output" --model "Qwen/Qwen2.5-1.5B" --evaluate --eval_batch_size 32 --eval_tasks "wikitext,c4,openbookqa,winogrande,hellaswag,arc_easy,piqa,truthfulqa_mc2,gsm8k|0,0,0,5,10,5,0,0,4"

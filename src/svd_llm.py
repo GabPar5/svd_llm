@@ -129,7 +129,6 @@ def compress_svd_llm(
         dataset["split"],
         tokenizer,
         dataset["max_samples"],
-        dataset["seq_len"],
         batch_size,
         seed,
         save_path
@@ -205,12 +204,13 @@ def compress_svd_llm(
         # Perform SVD on WS
         WS = torch.matmul(W, whitening_matrix)
         U, L, VT = torch.linalg.svd(WS, full_matrices = False)
-        # Calculate the number of singular values to keep based on compression ratio
-        num_sv_reduced = int((W.shape[0] * W.shape[1] * ratio) / (W.shape[1] + W.shape[0]))
-        rank_map[layers_str[i]] = num_sv_reduced
-        U_r = U[:, :num_sv_reduced]
-        L_r = torch.diag(L[:num_sv_reduced])
-        VT_r = torch.matmul(VT[:num_sv_reduced, :], whitening_matrix_inv)
+        # Calculate the rank (number of singular values to keep) based on compression ratio
+        # TODO implement several methods to select the rank
+        rank = int((W.shape[0] * W.shape[1] * (1-ratio)) / (W.shape[0] + W.shape[1]))
+        rank_map[layers_str[i]] = rank
+        U_r = U[:, :rank]
+        L_r = torch.diag(L[:rank])
+        VT_r = torch.matmul(VT[:rank, :], whitening_matrix_inv)
         L_r_sqrt = torch.sqrt(L_r)
         # Compute the new weight matrices
         W_u = torch.matmul(U_r, L_r_sqrt).cpu().to(layer_attr.weight.dtype)
@@ -219,7 +219,7 @@ def compress_svd_llm(
         van = LowRank(
             layer_attr.in_features, 
             layer_attr.out_features, 
-            num_sv_reduced, 
+            rank, 
             layer_attr.bias is not None
         )
         van.W_u.weight.data = W_u
@@ -257,7 +257,7 @@ def compress_svd_llm(
            compress_att_qkv_str + 
            compress_att_out_str + 
            compress_mlp_str + 
-           str(round(1-ratio, 2)) + 
+           str(round(ratio, 2)) + 
            "_compressed" + 
            ".pt")
         print("DEBUG: Compressed model saved succesfully")

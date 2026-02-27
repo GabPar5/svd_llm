@@ -45,8 +45,7 @@ def build_example(batch: Dict[str, List[str]]):
 
 def tokenize_example(
         batch: Dict[str, List[str]], 
-        tokenizer: Qwen2TokenizerFast,
-        seq_len: int
+        tokenizer: Qwen2TokenizerFast
 ):
     # Build message with system prompt
     messages = [
@@ -75,7 +74,6 @@ def tokenize_dataset(
         split: str,
         tokenizer: Qwen2TokenizerFast,
         max_samples: int = 512,
-        seq_len: int = 512,
         batch_size: int = 32,
         seed: Optional[int] = None,
         save_path: Optional[str] = None
@@ -97,7 +95,7 @@ def tokenize_dataset(
     preprocessed_df = df.map(build_example, batched = True, batch_size = batch_size, remove_columns = ["instruction", "input", "output", "text"], load_from_cache_file=False)
 
     # Tokenize preprocessed examples
-    tokenized_df = preprocessed_df.map(tokenize_example, batched = True, batch_size = batch_size, fn_kwargs = {"tokenizer": tokenizer, "seq_len": seq_len}, load_from_cache_file=False)
+    tokenized_df = preprocessed_df.map(tokenize_example, batched = True, batch_size = batch_size, fn_kwargs = {"tokenizer": tokenizer}, load_from_cache_file=False)
 
     return tokenized_df.with_format("torch")
 
