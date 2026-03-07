@@ -10,6 +10,7 @@ python main.py --model "Qwen/Qwen2.5-1.5B" --save_path "./output" --compressed_m
 ```
 Here's a list of all available possible arguments:  
 - `--model`: LLM to load from huggingface (default = `Qwen/Qwen2.5-1.5B`)
+- `--run_v2`: Run SVD-LLM V2 (default = `False`)
 - `--dtype`: Weights dtype for original and compressed models (default = `bfloat16`)
 - `--compression_ratio`: Target compression ratio, 0.2 means removing about 20% of the params (default = `0.2`)
 - `--calibration_dataset`: Calibration dataset, format is "datasetNameOrPath:split" (default = `tatsu-lab/alpaca:train`)
@@ -25,6 +26,7 @@ Here's a list of all available possible arguments:
 - `--compress_mlp`: Compress MLP weights (default = `False`)
 - `--compress_att_qkv`: Compress attention qkv matrices (default = `False`)
 - `--compress_att_out`: Compress attention output projection matrices (default = `False`)
+- `--het`: Assign heterogeneous compression ratio (default= `False`)
 - `--hf_token`: Huggingface token used to download/upload models (default = `None`)
 - `--evaluate`: Evaluate the model on a set of tasks (default = `False`)
 - `--eval_sampling`: Use conditional sampling during evaluation (default = `False`)

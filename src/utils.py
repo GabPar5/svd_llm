@@ -6,13 +6,18 @@ from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 import torch.nn as nn
 import torch
 
+class GroupBy(Enum):
+    GLOBAL="global"
+    DECODER="decoder"
+    TYPE="type"
+
 class DtypeMap(Enum):
-    float32: torch.dtype = torch.float32
-    fp32: torch.dtype = float32
-    float16: torch.dtype = torch.float16
-    fp16: torch.dtype = float16
-    bfloat16: torch.dtype = torch.bfloat16
-    bf16: torch.dtype = bfloat16
+    float32= torch.float32
+    fp32= float32
+    float16= torch.float16
+    fp16= float16
+    bfloat16= torch.bfloat16
+    bf16= bfloat16
 
     @classmethod
     def get_dtype(cls, _v) -> torch.dtype:
@@ -62,7 +67,7 @@ def tokenize_example(
 
     # Tokenize
     tokenized_example = tokenizer(
-        text, 
+        text,  # pyright: ignore[reportArgumentType]
         padding = True,
         return_tensors = "pt"
     )
@@ -79,6 +84,7 @@ def tokenize_dataset(
         save_path: Optional[str] = None
 ):
     # Load train split, shuffle it and take samples
+    print(f"DEBUG: dataset name/path: {name}")
     if os.path.isdir(name):
         print("DEBUG: Loading dataset from disk...")
         df = load_from_disk(name + "/" + split)
@@ -89,7 +95,7 @@ def tokenize_dataset(
             print("DEBUG: Saving dataset to disk...")
             df.save_to_disk(save_path + "/calibration_datasets/" + name + "/" + split)
     shuffled_df = df.shuffle(seed)
-    df = shuffled_df.select(range(max_samples)).flatten_indices()
+    df = shuffled_df.select(range(max_samples)).flatten_indices() # pyright: ignore[reportAttributeAccessIssue]
 
     # Preprocess examples
     preprocessed_df = df.map(build_example, batched = True, batch_size = batch_size, remove_columns = ["instruction", "input", "output", "text"], load_from_cache_file=False)
@@ -130,3 +136,12 @@ def get_layers(model: nn.Module, layers_str: list[str], split_attributes=False):
         return layers_list, attributes
     else:
         return layers_list
+    
+def get_group(
+        layer_path: str, 
+        group_patterns: Dict[str, List[str]]
+    ) -> Optional[str]:
+    for group_name, patterns in group_patterns.items():
+        if any(layer_path.endswith(p) for p in patterns):
+            return group_name
+    return None

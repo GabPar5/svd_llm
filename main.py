@@ -13,7 +13,10 @@ from lm_eval.utils import setup_logging, handle_non_serializable
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
+    # TODO - add group criteria argument
+    # TODO - add score function argument
     parser.add_argument('--model', type=str, default='Qwen/Qwen2.5-1.5B', help='LLM to load from huggingface')
+    parser.add_argument('--run_v2', action='store_true', help='Run SVD-LLM V2')
     parser.add_argument('--dtype', type=str, default='bfloat16', help='Weights dtype (original and compressed)')
     parser.add_argument('--compression_ratio', type=float, default=0.2, help='Target compression ratio,(0,1), default=0.2, means removing about 20%% of the params.')
     parser.add_argument('--calibration_dataset', type=str, default='tatsu-lab/alpaca:train',help='Calibration dataset, format is "datasetNameOrPath:split"')
@@ -29,6 +32,7 @@ if __name__ == "__main__":
     parser.add_argument('--compress_mlp', action='store_true', help='Compress MLP weights')
     parser.add_argument('--compress_att_qkv', action='store_true', help='Compress attention qkv matrices')
     parser.add_argument('--compress_att_out', action='store_true', help='Compress attention output projection matrix')
+    parser.add_argument('--het', action='store_true', help='Assign heterogeneous compression ratio')
     parser.add_argument('--hf_token', type=str, default=None, help='Huggingface token to download/upload models')
     parser.add_argument('--evaluate', action='store_true', help='Evaluate the model on a set of tasks')
     parser.add_argument('--eval_sampling', action='store_true', help='Use conditional sampling during evaluation')
@@ -51,7 +55,7 @@ if __name__ == "__main__":
             token=args.hf_token
         )
         # Avoid warning
-        model.generation_config.pad_token_id = model.generation_config.eos_token_id
+        model.generation_config.pad_token_id = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
         vram_usage("After loading original model")
     elif args.compressed_model_path:
         print("DEBUG: Loading compressed model from disk...")
@@ -86,9 +90,12 @@ if __name__ == "__main__":
         model, tokenizer = compress_svd_llm(
             model_name = args.model,
             ratio = round(args.compression_ratio, 2),
-            dataset = {"dataset_name": dataset_name, 
-                    "split": dataset_split, 
-                    "max_samples": args.max_whitening_samples},
+            dataset = {
+                "dataset_name": dataset_name, 
+                "split": dataset_split, 
+                "max_samples": args.max_whitening_samples
+            },
+            is_v2 = args.run_v2,
             dtype = args.dtype,
             batch_size = args.batch_size,
             seed = args.seed,
@@ -98,6 +105,7 @@ if __name__ == "__main__":
             compress_mlp = args.compress_mlp,
             compress_att_qkv = args.compress_att_qkv,
             compress_att_out = args.compress_att_out,
+            heterogeneous = args.het,
             hf_token = args.hf_token
         )
         model=model.to(args.device, dtype=DtypeMap.get_dtype(args.dtype))
@@ -109,7 +117,7 @@ if __name__ == "__main__":
         model.config.use_cache = False
 
         # Setup logging level
-        setup_logging("DEBUG")
+        setup_logging("DEBUG") # pyright: ignore[reportArgumentType]
 
         # Preprocess tasks
         tasks_shots = args.eval_tasks.split("|")
@@ -133,66 +141,71 @@ if __name__ == "__main__":
         print(f"DEBUG: List of evaluation tasks: {tasks_list}")
         print(f"DEBUG: Tasks dictionaries: {tasks_dict}")
 
+        # WARNING - PyRight reports lots of issues when dealing with lm-eval-harness 
         # Load model
         eval_model = HFLM(
-            pretrained=model,
-            tokenizer = tokenizer,
-            batch_size=args.eval_batch_size,
-            device = args.device,
-            dtype = args.dtype,
-            max_length = args.max_length
+            pretrained=model, # pyright: ignore[reportCallIssue]
+            tokenizer = tokenizer, # pyright: ignore[reportCallIssue]
+            batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
+            device = args.device, # pyright: ignore[reportCallIssue]
+            dtype = args.dtype, # pyright: ignore[reportCallIssue]
+            max_length = args.max_length # pyright: ignore[reportCallIssue]
         )
 
 
         vram_usage("Before evaluation")
 
-        # Run evaluation
+        # Run evaluation 
         results = lm_eval.simple_evaluate(
-            model=eval_model,
-            tasks=tasks_dict,
-            batch_size=args.eval_batch_size,
-            device=args.device,
-            use_cache=None,
-            log_samples=False,
-            gen_kwargs={
+            model=eval_model, # pyright: ignore[reportCallIssue]
+            tasks=tasks_dict,  # type: ignore
+            batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
+            device=args.device, # pyright: ignore[reportCallIssue]
+            use_cache=None, # pyright: ignore[reportCallIssue]
+            log_samples=False, # pyright: ignore[reportCallIssue]
+            gen_kwargs={ # pyright: ignore[reportCallIssue]
                 "temperature": args.eval_temperature,
                 "do_sample": args.eval_sampling,
                 "max_gen_toks": args.max_eval_tokens
             },
             apply_chat_template=True,
-            random_seed=args.seed,
-            numpy_random_seed=args.seed,
-            torch_random_seed=args.seed,
-            fewshot_random_seed=args.seed
-        )
+            random_seed=args.seed, # pyright: ignore[reportCallIssue]
+            numpy_random_seed=args.seed, # pyright: ignore[reportCallIssue]
+            torch_random_seed=args.seed, # pyright: ignore[reportCallIssue]
+            fewshot_random_seed=args.seed # pyright: ignore[reportCallIssue]
+        ) # pyright: ignore[reportCallIssue]
 
         # Save results
         if not args.use_compressed:
             model_path = args.save_path + \
-                         "/models/" + \
+                         "/eval/" + \
                          args.model.replace("/", "_").replace("-", "_") + \
                          "/"
             model_name = args.model.replace("/", "_").replace("-", "_")
         elif args.compressed_model_path:
-            model_path = "/".join(args.compressed_model_path.split("/")[:-1])
+            model_path = "/".join(args.compressed_model_path.split("/")[:-2]) + "/eval/"
             model_name = args.compressed_model_path.split("/")[-1][:-3]
         else:
             model_path = args.save_path + \
-                         "/models/" + \
+                         "/eval/" + \
                          args.model.replace("/", "_").replace("-", "_") + \
                          "/"
             compress_mlp_str = "mlp_" if args.compress_mlp else ""
             compress_att_qkv_str = "qkv_" if args.compress_att_qkv else ""
             compress_att_out_str = "out_" if args.compress_att_out else ""
+            heterogeneous_str = "het_" if args.het else ""
+            v2_str = "v2_" if args.run_v2 else ""
             model_name = args.model.replace("/", "_").replace("-", "_") + \
                          "_" + \
                          compress_att_qkv_str + \
                          compress_att_out_str + \
                          compress_mlp_str + \
-                         str(round(args.compression_ratio, 2)) + \
-                         "_compressed"
+                         str(round(args.compression_ratio, 2)) + "_" + \
+                         heterogeneous_str + \
+                         v2_str + \
+                         "compressed"
             
-        with open(model_path + "/" + model_name + "_evaluation.json", "w") as f:
+        with open(model_path + "/" + model_name + ".json", "w") as f:
             json.dump(results, f, default=handle_non_serializable, indent=2)
 
         vram_usage("After evaluation")
