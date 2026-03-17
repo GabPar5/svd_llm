@@ -1,7 +1,9 @@
 import os
 import torch.nn as nn
 import torch
+import numpy as np
 from typing import Dict, Optional, List
+from tqdm import tqdm
 from enum import Enum
 from datasets import load_dataset, load_from_disk, Dataset
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
@@ -198,3 +200,86 @@ def get_group(
         if any(layer_path.endswith(p) for p in patterns):
             return group_name
     return None
+
+@torch.no_grad()
+def ppl_eval(
+        model,
+        tokenizer,
+        dataset_name: str = "wikitext",
+        subset: str = "wikitext-2-raw-v1",
+        split: str = "test",
+        eval_max_length: int = 2048,
+        batch_size: int = 8,
+        device: str = "cuda"
+) -> float:
+    """
+    Evaluates perplexity using the exact same methodology as the SVD-LLM paper.
+
+    The key design choices that make this directly comparable to the paper are:
+      1. All test documents are concatenated into a single token stream with
+         double-newline separators before tokenization, so there are no
+         artificial document boundaries that would give the model a "cold start"
+         at the beginning of each document.
+      2. The stream is sliced into non-overlapping fixed-length chunks of
+         exactly model_seq_len tokens. The final incomplete chunk is discarded
+         via integer division.
+      3. Perplexity is computed as exp(mean NLL) where the mean is taken
+         uniformly over every token position across all chunks.
+      4. Batches containing non-finite logits (NaN or inf) are skipped.
+    """
+    # Concatenate all samples with "\n\n"
+    data = load_dataset(path=dataset_name, name=subset, split=split, num_proc=8)
+    text = "\n\n".join(data["text"])
+    encodings = tokenizer(text, return_tensors="pt")
+
+    # input_ids has shape [1, total_tokens]; we take [0] to get a 1D tensor
+    # just like the original's `input_ids[0]`, then work with it as a 2D
+    # [num_chunks, model_seq_len] tensor after slicing.
+    total_tokens = encodings.input_ids.shape[1]
+    print(f"[PPL EVAL] Total tokens in test stream: {total_tokens}")
+
+    # --- Step 2: slice into non-overlapping fixed-length chunks ---
+    # Integer division naturally drops the final incomplete chunk,
+    # exactly as `nsamples = test_ids.numel() // seq_len` does in the original.
+    num_chunks = total_tokens // eval_max_length
+    input_ids = encodings.input_ids[:, :num_chunks * eval_max_length]
+    input_ids = input_ids.reshape(num_chunks, eval_max_length)
+    print(f"[PPL EVAL] Evaluating on {num_chunks} complete chunks of {eval_max_length} tokens "
+          f"({total_tokens - num_chunks * eval_max_length} tokens discarded from the tail)")
+
+    # --- Step 3: compute NLL for each chunk ---
+    nlls = []
+    for i in tqdm(range(0, num_chunks, batch_size), desc="Evaluating perplexity..."):
+        batch = input_ids[i : i + batch_size].to(device)  # [B, model_seq_len]
+        output = model(batch, use_cache=False)
+        lm_logits = output.logits  # [B, model_seq_len, vocab_size]
+
+        # Skip batches with non-finite logits — this matches the original's
+        # `if torch.isfinite(lm_logits).all()` guard and protects against
+        # a single degenerate batch corrupting the entire perplexity estimate.
+        if not torch.isfinite(lm_logits).all():
+            print(f"[PPL EVAL] Warning: non-finite logits in batch starting at chunk {i}, skipping.")
+            continue
+
+        # Standard next-token-prediction loss: token i predicts token i+1,
+        # so we shift logits and labels by one position.
+        shift_logits = lm_logits[:, :-1, :].contiguous()   # [B, seq_len-1, vocab]
+        shift_labels = batch[:, 1:].contiguous()            # [B, seq_len-1]
+
+        # reduction="none" gives us one loss value per token, which we
+        # accumulate across batches before taking the mean — this ensures
+        # the mean is computed over all tokens equally, not as a mean of
+        # per-batch means (which would weight shorter final batches differently).
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        loss = loss_fct(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1)
+        )
+        nlls.append(loss.cpu())
+
+    # --- Step 4: compute final perplexity ---
+    # exp(mean NLL over all tokens) matches the original's
+    # np.exp(torch.cat(nlls, dim=-1).mean().item())
+    ppl = torch.exp(torch.cat(nlls).mean()).item()
+    print(f"[PPL EVAL] Perplexity: {ppl:.4f}")
+    return ppl

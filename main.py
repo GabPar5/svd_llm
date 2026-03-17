@@ -181,7 +181,7 @@ if __name__ == "__main__":
     if not args.use_compressed:
         print("DEBUG: Loading original model from the hub...")
         vram_usage("Before loading original model")
-        tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             dtype=args.dtype,
@@ -197,7 +197,7 @@ if __name__ == "__main__":
         print("DEBUG: Loading compressed model from disk...")
         vram_usage("Before loading compressed model")
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained("/".join(args.compressed_model_path.split("/")[:-1]), padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained("/".join(args.compressed_model_path.split("/")[:-1]))
 
         # Load model config from HF and instantiate base model
         config = AutoConfig.from_pretrained(args.model)
@@ -286,47 +286,82 @@ if __name__ == "__main__":
                 num_fewshot = int(tasks_shots[1])
         
         if isinstance(num_fewshot, list):
-            tasks_dict = [{"task": tasks_list[i], "num_fewshot": int(num_fewshot[i])} for i in range(len(tasks_list))]
+            tasks_dict = [{"task": tasks_list[i], "num_fewshot": int(num_fewshot[i])} for i in range(len(tasks_list)) if tasks_list[i] != "wikitext" and tasks_list[i] != "c4"]
         else:
-            tasks_dict = [{"task": tasks_list[i], "num_fewshot": int(num_fewshot)} for i in range(len(tasks_list))]
-        print(f"DEBUG: Num few-shots: {num_fewshot}")
-        print(f"DEBUG: List of evaluation tasks: {tasks_list}")
-        print(f"DEBUG: Tasks dictionaries: {tasks_dict}")
+            tasks_dict = [{"task": tasks_list[i], "num_fewshot": int(num_fewshot)} for i in range(len(tasks_list)) if tasks_list[i] != "wikitext" and tasks_list[i] != "c4"]
+        print(f"[DEBUG] Num few-shots: {num_fewshot}")
+        print(f"[DEBUG] List of evaluation tasks: {tasks_list}")
+        print(f"[DEBUG] Tasks dictionaries: {tasks_dict}")
+        print(f"[DEBUG] HF model context length: {model.config.max_position_embeddings}")
+        print(f"[DEBUG] Evaluation context length: {args.eval_max_length}")
 
-        # WARNING - PyRight reports lots of issues when dealing with lm-eval-harness 
-        # Load model
-        eval_model = HFLM(
-            pretrained=model, # pyright: ignore[reportCallIssue]
-            tokenizer = tokenizer, # pyright: ignore[reportCallIssue]
-            batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
-            device = args.device, # pyright: ignore[reportCallIssue]
-            dtype = args.dtype, # pyright: ignore[reportCallIssue]
-            max_length = args.eval_max_length # pyright: ignore[reportCallIssue]
+        # Clamp max model context
+        max_length = min(
+            args.eval_max_length,
+            model.config.max_position_embeddings
         )
 
+        wikitext_ppl = None
+        c4_ppl = None
+        if "wikitext" in tasks_list:
+            wikitext_ppl = ppl_eval(
+                model,
+                tokenizer,
+                dataset_name="wikitext",
+                subset="wikitext-2-raw-v1",
+                split="test",
+                eval_max_length=max_length,
+                batch_size=args.eval_batch_size,
+                device=args.device
+            )
+        if "c4" in tasks_list:
+            # TODO c4 task
+            c4_ppl = ppl_eval(
+                model,
+                tokenizer,
+                dataset_name="wikitext",
+                subset="wikitext-2-raw-v1",
+                split="test",
+                eval_max_length=max_length,
+                batch_size=args.eval_batch_size,
+                device=args.device
+            )
 
-        vram_usage("Before evaluation")
+        if tasks_dict is not None and len(tasks_dict) > 0:
+            # WARNING - PyRight reports lots of issues when dealing with lm-eval-harness 
+            eval_model = HFLM(
+                pretrained=model, # pyright: ignore[reportCallIssue]
+                tokenizer = tokenizer, # pyright: ignore[reportCallIssue]
+                batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
+                device = args.device, # pyright: ignore[reportCallIssue]
+                dtype = args.dtype, # pyright: ignore[reportCallIssue]
+                max_length = max_length # pyright: ignore[reportCallIssue]
+            )
+            print(f"[DEBUG] HFLM model context length: {eval_model.max_length}") # pyright: ignore[reportAttributeAccessIssue]
 
-        # Run evaluation 
-        results = lm_eval.simple_evaluate(
-            model=eval_model, # pyright: ignore[reportCallIssue]
-            tasks=tasks_dict,  # type: ignore
-            batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
-            device=args.device, # pyright: ignore[reportCallIssue]
-            use_cache=None, # pyright: ignore[reportCallIssue]
-            log_samples=False, # pyright: ignore[reportCallIssue]
-            gen_kwargs={ # pyright: ignore[reportCallIssue]
-                "temperature": args.eval_temperature,
-                "do_sample": args.eval_sampling,
-                "max_gen_toks": args.max_eval_tokens,
-                "max_new_tokens": args.max_eval_tokens
-            },
-            apply_chat_template=False,
-            random_seed=args.seed, # pyright: ignore[reportCallIssue]
-            numpy_random_seed=args.seed, # pyright: ignore[reportCallIssue]
-            torch_random_seed=args.seed, # pyright: ignore[reportCallIssue]
-            fewshot_random_seed=args.seed # pyright: ignore[reportCallIssue]
-        ) # pyright: ignore[reportCallIssue]
+
+            vram_usage("Before evaluation")
+
+            # Run evaluation 
+            results = lm_eval.simple_evaluate(
+                model=eval_model, # pyright: ignore[reportCallIssue]
+                tasks=tasks_dict,  # type: ignore
+                batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
+                device=args.device, # pyright: ignore[reportCallIssue]
+                use_cache=None, # pyright: ignore[reportCallIssue]
+                log_samples=False, # pyright: ignore[reportCallIssue]
+                gen_kwargs={ # pyright: ignore[reportCallIssue]
+                    "temperature": args.eval_temperature,
+                    "do_sample": args.eval_sampling,
+                    "max_gen_toks": args.max_eval_tokens,
+                    "max_new_tokens": args.max_eval_tokens
+                },
+                apply_chat_template=False,
+                random_seed=args.seed, # pyright: ignore[reportCallIssue]
+                numpy_random_seed=args.seed, # pyright: ignore[reportCallIssue]
+                torch_random_seed=args.seed, # pyright: ignore[reportCallIssue]
+                fewshot_random_seed=args.seed # pyright: ignore[reportCallIssue]
+            ) # pyright: ignore[reportCallIssue]
 
         # Save results
         if not args.use_compressed:
@@ -361,7 +396,17 @@ if __name__ == "__main__":
                          v2_str + \
                          "compressed"
             
+        if not os.path.isdir(model_path):
+            os.mkdir(model_path)
+            
         with open(model_path + model_name + ".json", "w") as f:
-            json.dump(results, f, default=handle_non_serializable, indent=2)
+            if wikitext_ppl is not None:
+                # TODO structure output as a json - append to results dict
+                print(f"WIKITEXT-2 per token perplexity: {wikitext_ppl}", end="\n\n", file = f)
+            if c4_ppl is not None:
+                # TODO structure output as a json - append to results dict
+                print(f"C4 per token perplexity: {c4_ppl}", end="\n\n", file = f)
+            if tasks_dict is not None and len(tasks_dict) > 0:
+                json.dump(results, f, default=handle_non_serializable, indent=2)
 
         vram_usage("After evaluation")
