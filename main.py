@@ -301,6 +301,7 @@ if __name__ == "__main__":
             model.config.max_position_embeddings
         )
 
+        results = {}
         wikitext_ppl = None
         c4_ppl = None
         if "wikitext" in tasks_list:
@@ -398,15 +399,23 @@ if __name__ == "__main__":
             
         if not os.path.isdir(model_path):
             os.mkdir(model_path)
+
+        if "results" not in results:  # pyright: ignore[reportOperatorIssue]
+            results["results"] = {} # pyright: ignore[reportOptionalSubscript]
+        if wikitext_ppl is not None:
+            results["results"]["wikitext"] = { # pyright: ignore[reportOptionalSubscript]
+                "alias": "wikitext",
+                "token_perplexity,none": wikitext_ppl,
+                "token_perplexity_stderr,none": "N/A"
+            }
+        if c4_ppl is not None:
+            results["results"]["c4"] = { # pyright: ignore[reportOptionalSubscript]
+                "alias": "c4",
+                "token_perplexity,none": c4_ppl,
+                "token_perplexity_stderr,none": "N/A"
+            }
             
         with open(model_path + model_name + ".json", "w") as f:
-            if wikitext_ppl is not None:
-                # TODO structure output as a json - append to results dict
-                print(f"WIKITEXT-2 per token perplexity: {wikitext_ppl}", end="\n\n", file = f)
-            if c4_ppl is not None:
-                # TODO structure output as a json - append to results dict
-                print(f"C4 per token perplexity: {c4_ppl}", end="\n\n", file = f)
-            if tasks_dict is not None and len(tasks_dict) > 0:
-                json.dump(results, f, default=handle_non_serializable, indent=2)
+            json.dump(results, f, default=handle_non_serializable, indent=2)
 
         vram_usage("After evaluation")
