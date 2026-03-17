@@ -1,27 +1,21 @@
+import torch
+import re
+import gc
 from typing import Dict, Optional, List, Union, Literal
 from collections import defaultdict
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-import torch
 from torch.utils.data import DataLoader
 from .utils import *
-
-GROUP_PATTERNS = {
-                "q_proj": ["self_attn.q_proj"],
-                "k_proj": ["self_attn.k_proj"],
-                "v_proj": ["self_attn.v_proj"],
-                "o_proj": ["self_attn.o_proj"],
-                "mlp": ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"],
-            }
 
 class LowRank(torch.nn.Module):
     def __init__(self, in_features, out_features, rank, bias):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.W_v = nn.Linear(in_features, rank, bias)
-        self.W_u = nn.Linear(rank, out_features, bias)
+        self.W_v = nn.Linear(in_features, rank, bias=False)
+        self.W_u = nn.Linear(rank, out_features, bias=bias)
         
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         output =  self.W_u(self.W_v(input))
@@ -76,7 +70,7 @@ def get_whitening_matrices(
     # Empty cache and move model to CPU
     torch.cuda.empty_cache()
     model = model.cpu()
-    print("DEBUG: Cache emptied succesfully after model execution on calibration data")
+    print("[DEBUG] Cache emptied succesfully after model execution on calibration data")
 
     # Build whitening matrices applying Cholesky decomposition to X^T @ X
     whitening_matrices = {}
@@ -91,7 +85,7 @@ def get_whitening_matrices(
                     try:
                         whitening_matrix = torch.linalg.cholesky(raw_xxt_matrix)
                     except Exception as e:
-                        print("WARNING: eigen whitening_matrix is not positive!")
+                        print("[WARNING] Eigen whitening_matrix is not positive!")
                         eigenvalues = torch.linalg.eigvalsh(raw_xxt_matrix)
                         rows: int = raw_xxt_matrix.shape[0] # type: ignore
                         raw_xxt_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(rows).to(device, dtype=torch.float64)
@@ -105,10 +99,9 @@ def get_whitening_matrices(
 
     return whitening_matrices
 
-# TODO add "group_criterion" argument to decide wheter to group by weight type, layer or globally
 def allocate_ratios(
         group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]],
-        loss_map: Dict,
+        score_map: Dict,
         layers_str: List[str],
         target_ratio: float,
         group_patterns: Dict[str, List[str]] | None = None
@@ -117,72 +110,128 @@ def allocate_ratios(
     Redistributes compression budget within each weight group.
     Groups: MLP (gate, up, down), Q proj, K proj, V proj, Attention out proj.
     
-    Within each group, matrices with higher truncation loss get a lower
+    Within each group, matrices with higher score get a lower
     compression ratio and vice versa.
     """
+    # Coerce to enum
+    if isinstance(group_criterion, str):
+        try:
+            group_criterion = GroupBy(group_criterion)
+        except ValueError:
+            raise ValueError(
+                f"Invalid `group_criterion`: '{group_criterion}'. "
+                f"Expected one of: {[e.value for e in GroupBy]}"
+            )
+        
+    print(f"\n[BUDGET] Initializing redistribution using strategy: {group_criterion.value.upper()}")
+        
+    # Group weight matrices by desired criterion
+    groups = defaultdict(list)
+    unmatched_keys = []
+    missing_score_keys = []
 
     match group_criterion:
         case GroupBy.GLOBAL:
-            return
+            # Filter keys that have score data
+            valid_keys = []
+            for k in layers_str:
+                if k in score_map: valid_keys.append(k)
+                else: missing_score_keys.append(k)
+            # All weight matrices in a single bucket named "global"
+            groups["global"] = valid_keys
+
         case GroupBy.DECODER:
-            return
+            # Group by layer index (e.g., "layers.5")
+            # This regex looks for digits surrounded by dots or at the start/end
+            for key in layers_str:
+                if key not in score_map:
+                    missing_score_keys.append(key)
+                    continue
+                match = re.search(r'\.layers\.(\d+)\.', key)
+                layer_idx = match.group(1) if match else "remainder"
+                groups[f"layer_{layer_idx}"].append(key)
+
         case GroupBy.TYPE:
             if group_patterns is None:
-                raise Exception("`group_patterns` must be a map of layer types into groups")
-            # Define group membership by matching layer path suffixes - TODO make it an argument to provide with group_criterion
-            # Assign each layer to its group
-            groups = defaultdict(list)
+                raise ValueError("`group_patterns` required for GroupBy.TYPE")
             for key in layers_str:
-                if key not in loss_map:
+                if key not in score_map:
+                    missing_score_keys.append(key)
                     continue
-                group = get_group(key, GROUP_PATTERNS) # TODO - replace constant with variable
-                if group is not None:
-                    groups[group].append(key)
+
+                group_name = None
+                for name, patterns in group_patterns.items():
+                    if any(p in key for p in patterns):
+                        group_name = name
+                        break
+
+                if group_name is not None:
+                    groups[group_name].append(key)
                 else:
-                    print(f"WARNING: {key} did not match any group, using target ratio {target_ratio}")
+                    unmatched_keys.append(key)
 
-            # Redistribute budget within each group
-            ratio_map = {}
-            for group_name, keys in groups.items():
-                # Get losses within the group
-                losses = torch.tensor(
-                    [loss_map[k] for k in keys],
-                    dtype=torch.float64
-                )
+    # Redistribute budget within each group
+    ratio_map = {}
+    for group_name, keys in groups.items():
+        if not keys:
+            print(f"[WARNING] Group {group_name} is empty")
+            continue
 
-                if len(keys) == 1:
-                    # Single-member group: no redistribution possible
-                    ratio_map[keys[0]] = target_ratio
-                    continue
+        # Get scores within the group
+        scores = torch.tensor(
+            [score_map[k] for k in keys],
+            dtype=torch.float64
+        )
 
-                # Inverse-log normalization:
-                #   high loss  -> 1/log(loss) is small -> less compression (matrix is information-dense)
-                #   low loss   -> 1/log(loss) is large -> more compression (matrix is redundant)
-                log_losses = torch.log(losses + 1.0)   # +1 guards against log(0) or log(very small)
-                inv_log_losses = 1.0 / log_losses
-                normalized = inv_log_losses / inv_log_losses.sum()
-                print(f"  [{group_name}] log_losses={log_losses}; inv_log_losses={inv_log_losses}; sum={inv_log_losses.sum()}; normalized={normalized}")
+        if len(keys) == 1:
+            # Single-member group: no redistribution possible
+            print(f"  [GROUP: {group_name}] Single member detected. Assigning target_ratio {target_ratio:.4f} to {keys[0]}")
+            ratio_map[keys[0]] = target_ratio
+            continue
 
-                # Scale so that the mean ratio across the group equals `target_ratio`,
-                # preserving the global memory budget
-                ratios = len(keys) * target_ratio * normalized
+        # Inverse-log normalization:
+        #   high score  -> 1/log(scores) is small -> less compression (matrix is information-dense)
+        #   low score   -> 1/log(scores) is large -> more compression (matrix is redundant)
+        log_scores = torch.log(scores + 1e-9)   # +1e-9 guards against log(0) or log(very small)
+        inv_log_scores = 1.0 / (log_scores + 1e-9) # +1e-9 guards against log_scores=0 (log(1))
+        normalized = inv_log_scores / inv_log_scores.sum()
 
-                for key, r in zip(keys, ratios.tolist()):
-                    ratio_map[key] = r
-                    print(f"  [{group_name}] {key}: ratio={r:.4f} (loss={loss_map[key]:.4f})")
+        # Scale so that the mean ratio across the group equals `target_ratio`,
+        # preserving the global memory budget
+        ratios = len(keys) * target_ratio * normalized
 
-            # Fallback for any unmatched layers
-            for key in layers_str:
-                if key not in ratio_map:
-                    ratio_map[key] = target_ratio
+        print(f"  [GROUP: {group_name}] Redistributing over {len(keys)} layers:")
+        for key, r in zip(keys, ratios.tolist()):
+            ratio_map[key] = r
+            print(f"    - {key:<50} | Ratio: {r:.4f} | Score: {score_map[key]:.6f}")
 
-            return ratio_map
+    # Fallback for any unmatched layers
+    final_fallbacks = []
+    for key in layers_str:
+        if key not in ratio_map:
+            ratio_map[key] = target_ratio
+            # Identify the reason for the fallback
+            reason = "Missing score data" if key in missing_score_keys else "No pattern match"
+            final_fallbacks.append((key, reason))
+
+    # --- Summary Report ---
+    print(f"\n[BUDGET] Allocation Summary:")
+    print(f"  - Successfully Redistributed:       {len(ratio_map) - len(final_fallbacks)} layers")
+    print(f"  - Fallback (assigned target_ratio): {len(final_fallbacks)} layers")
+    if final_fallbacks:
+        print(f"[BUDGET] Fallback Details:")
+        for key, reason in final_fallbacks:
+            print(f"  - {key:<50} | Reason: {reason}")
+
+    print("-" * 80 + "\n")
+    return ratio_map
 
 # Compress model with SVD-LLM
 def compress_svd_llm(
         model_name: str,
         ratio: float, 
         dataset: Dict,
+        max_length: int = 2048,
         is_v2: bool = False,
         dtype: str = "bfloat16",
         batch_size: int = 32,
@@ -193,7 +242,10 @@ def compress_svd_llm(
         compress_mlp: bool = False,
         compress_att_qkv: bool = False,
         compress_att_out: bool = False,
+        score_metric: Union[ScoreMetric, Literal["truncation", "entropy"]] = "truncation",
         heterogeneous: bool = False,
+        group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]] = "type",
+        group_patterns: Dict[str, List[str]] | None = None,
         hf_token: Optional[str] = None
 ):
     # Load model and tokenizer
@@ -214,14 +266,20 @@ def compress_svd_llm(
     print("=== DATASET PREPROCESSING ===")
     vram_usage("Before loading dataset")
     calibration_dataset = tokenize_dataset(
-        dataset["dataset_name"],
+        dataset["name"],
+        dataset["subset"],
         dataset["split"],
         tokenizer,
         dataset["max_samples"],
         batch_size,
+        max_length,
         seed,
         save_path
     )
+    print(calibration_dataset)
+    print(calibration_dataset["input_ids"])
+    print(calibration_dataset["input_ids"][0])
+    print(len(calibration_dataset["input_ids"][0]))
     calibration_dataloader = DataLoader(
         calibration_dataset, # pyright: ignore[reportArgumentType]
         batch_size=batch_size,
@@ -243,7 +301,7 @@ def compress_svd_llm(
     # Compute/load whitening matrices for each layer
     vram_usage("Before loading whitening matrices")
     if whitening_mat_path:
-        print("DEBUG: Loading whitening matrices from disk...")
+        print("[DEBUG] Loading whitening matrices from disk...")
         whitening_matrices = torch.load(whitening_mat_path, map_location="cpu")
     else:
         print("=== WHITENING MATRICES GENERATION ===")
@@ -257,20 +315,19 @@ def compress_svd_llm(
             is_v2
         )
         if save_path:
-            print("DEBUG: Saving whitening matrices to disk...")
+            print("[DEBUG] Saving whitening matrices to disk...")
             save_path_whitening = save_path + "/whitening_matrices/"
-            v2_str = "v2" if is_v2 else ""
+            v2_str = "_v2" if is_v2 else ""
             if not os.path.exists(save_path_whitening):
                 os.makedirs(save_path_whitening)
             torch.save(whitening_matrices, save_path_whitening + 
                                            model_name.replace("/", "_").replace("-", "_") + 
                                            '_whitening_'+ 
-                                           dataset["dataset_name"].replace("/", "_").replace("-", "_").split("_")[-1] + 
+                                           dataset["name"].replace("/", ";").replace("-", ";").split(";")[-1] + 
                                            '_' + 
                                            str(dataset["max_samples"]) + 
                                            '_' + 
                                            str(seed) +
-                                           '_' +
                                            v2_str +
                                            '.pt')
     vram_usage("After loading whitening matrices")
@@ -285,14 +342,27 @@ def compress_svd_llm(
 
     # Compression ratio allocation
     if heterogeneous:
-        # Compute SVD for all layers and collect truncation losses
-        loss_map = {}
+        # Compute SVD for all layers and collect score metric
+        vram_usage("Before performing scores calculation")
+
+        # Coerce to enum
+        if isinstance(score_metric, str):
+            try:
+                score_metric = ScoreMetric(score_metric)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid `score_metric`: '{score_metric}'. "
+                    f"Expected one of: {[e.value for e in ScoreMetric]}"
+                )
+            
+        print(f"\n[DEBUG] Score metric is: {score_metric.value.upper()}")
+
+        score_map = {}
         steps: int = 2
-        vram_usage("Before performing truncation loss calculation")
         for i, (layer, attr) in tqdm(
             enumerate(zip(layers_list, attributes)),
             total=len(layers_list),
-            desc=f"Step {steps_counter}/{steps}: Computing truncation losses..."
+            desc=f"Step {steps_counter}/{steps}: Computing scores..."
         ):
             # Get weight and whitening matrix
             layer_attr = getattr(layer, attr)
@@ -302,10 +372,10 @@ def compress_svd_llm(
             if is_v2:
                 # Perform SVD on whitening matrix (S)
                 U_s, L_s, _ = torch.linalg.svd(whitening_matrix, full_matrices=False)
-                L_s_sqrt = torch.diag(torch.sqrt(L_s))
+                L_s_sqrt = torch.sqrt(L_s)
 
                 # Perform SVD on W x U_s x sqrt(L_s)
-                D = torch.matmul(W, torch.matmul(U_s, L_s_sqrt))
+                D = torch.matmul(W, U_s * L_s_sqrt.unsqueeze(0))
                 # Calculate svdvals only
                 L = torch.linalg.svdvals(D)
 
@@ -318,23 +388,27 @@ def compress_svd_llm(
 
             # Compute a tentative rank under the uniform target ratio.
             rank = int((W.shape[0] * W.shape[1] * (1 - ratio)) / (W.shape[0] + W.shape[1]))
-            print(f"DEBUG: L shape: {L.shape}")
             rank = max(1, min(rank, L.shape[0] - 1))
 
-            # Calculate theoretical truncation loss
-            # After whitening, this equals the sum of squared singular values
-            loss_map[layers_str[i]] = torch.sum(L[rank:] ** 2).item()
+            # Calculate score metric
+            match score_metric:
+                case "truncation":
+                    # After whitening, theoretical truncation loss equals the sum of squared singular values
+                    score_map[layers_str[i]] = torch.sum(L[rank:] ** 2).item()
+                case "entropy":
+                    # After whitening, entropy loss equals the sum of normalized singular values, scaled by their log
+                    norm_spectrum = L/L.sum()
+                    score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:] + 1e-9)).sum().item()
 
             # Free up vram and ram
             W = whitening_matrix = WS = L = U_s = L_s = L_s_sqrt = D = None
             del W, whitening_matrix, WS, L, U_s, L_s, L_s_sqrt, D
             torch.cuda.empty_cache()
 
-        # Allocate compression ratios to each layer based on theoretical truncation loss
-        # TODO - replace constants with variables
-        ratio_map = allocate_ratios("type", loss_map, layers_str, ratio, GROUP_PATTERNS)
+        # Allocate compression ratios to each layer based on score metric
+        ratio_map = allocate_ratios(group_criterion, score_map, layers_str, ratio, group_patterns)
         steps_counter += 1
-        vram_usage("After performing truncation loss calculation")
+        vram_usage("After performing scores calculation")
     else:
         ratio_map = {k: ratio for k in layers_str}
 
@@ -354,43 +428,46 @@ def compress_svd_llm(
         rank = int((W.shape[0] * W.shape[1] * (1 - layer_ratio)) / (W.shape[0] + W.shape[1]))
         
         if is_v2:
-            # Get whitening matrix
-            whitening_matrix = whitening_matrices[layers_str[i]].to(device, dtype=torch.float32)
-
             if layers_str[i] in us_cache:
                 # Heterogeneous mode - get cached U_s and L_s from pass 1
                 U_s, L_s = (t.to(device) for t in us_cache.pop(layers_str[i]))
-                L_s_sqrt = torch.diag(torch.sqrt(L_s))
             else:
                 # Homogeneous mode - perform SVD on whitening matrix (S)
+                whitening_matrix = whitening_matrices[layers_str[i]].to(device, dtype=torch.float32)
                 U_s, L_s, _ = torch.linalg.svd(whitening_matrix, full_matrices=False)
-                L_s_sqrt = torch.diag(torch.sqrt(L_s))
-            # Free whitening matrix as soon as U_s and L_s_sqrt are ready
-            whitening_matrix = None
-            del whitening_matrix
-            torch.cuda.empty_cache()
+
+                # Free whitening matrix as soon as U_s and L_s_sqrt are ready
+                whitening_matrix = None
+                del whitening_matrix
+                torch.cuda.empty_cache()
+
+            # Auxiliary matrix
+            L_s_sqrt = torch.sqrt(L_s)
 
             # Perform SVD on W x U_s x sqrt(L_s)
             D = torch.matmul(
                 W, 
-                torch.matmul(U_s, L_s_sqrt)
+                U_s * L_s_sqrt.unsqueeze(0)
             )
             # Free W as soon as D is ready
-            W = None
-            del W
+            W = L_s_sqrt = None
+            del W, L_s_sqrt
             torch.cuda.empty_cache()
 
             U_ws, L_ws, V_wsT = torch.linalg.svd(D, full_matrices=False)
-            print(f"DEBUG: L_ws shape: {L_ws.shape}")
             # Free D as soon as U_ws, L_ws and V_wsT are ready
             D = None
             del D
             torch.cuda.empty_cache()
 
             # Calculate sqrt(L_s) and U_s inverse matrices
-            L_s_sqrt_inv = torch.diag(1.0 / torch.sqrt(L_s))
-            print(f"DEBUG: L_s_sqrt_inv shape: {L_s_sqrt_inv.shape}")
+            L_s_sqrt_inv = (1.0 / torch.sqrt(L_s + 1e-9))
             U_s_inv = torch.transpose(U_s, 0, 1)
+
+            # Free U_s and L_s
+            U_s = L_s = None
+            del U_s, L_s
+            torch.cuda.empty_cache()
 
             # Calculate final rank and truncate matrices
             rank = max(1, min(rank, L_ws.shape[0] - 1))
@@ -398,19 +475,19 @@ def compress_svd_llm(
             U_ws_r = U_ws[:, :rank]
             L_ws_r = L_ws[:rank]
             V_wsT_r = torch.matmul(
-                V_wsT[:rank, :], 
-                torch.matmul(L_s_sqrt_inv, U_s_inv)
+                V_wsT[:rank, :] * L_s_sqrt_inv.unsqueeze(0),
+                U_s_inv
             )
 
             # Free full-rank matrices as soon as truncated slices are built
-            U_ws = L_ws = V_wsT = L_s = L_s_sqrt = L_s_sqrt_inv = U_s = U_s_inv = None
-            del U_ws, L_ws, V_wsT, L_s, L_s_sqrt, L_s_sqrt_inv, U_s, U_s_inv
+            U_ws = L_ws = V_wsT = L_s_sqrt_inv = U_s_inv = None
+            del U_ws, L_ws, V_wsT, L_s_sqrt_inv, U_s_inv
             torch.cuda.empty_cache()
 
             # Compute approximate weight matrix, split in two matrices
-            L_ws_r_sqrt = torch.diag(torch.sqrt(L_ws_r))
-            W_u = torch.matmul(U_ws_r, L_ws_r_sqrt).cpu().to(layer_attr.weight.dtype)
-            W_v = torch.matmul(L_ws_r_sqrt, V_wsT_r).cpu().to(layer_attr.weight.dtype)
+            L_ws_r_sqrt = torch.sqrt(L_ws_r)
+            W_u = (U_ws_r * L_ws_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
+            W_v = (V_wsT_r * L_ws_r_sqrt.unsqueeze(1)).cpu().to(layer_attr.weight.dtype)
             # Free low-rank matrices, leave only W_u and W_v
             U_ws_r = L_ws_r = V_wsT_r = L_ws_r_sqrt = None
             del U_ws_r, L_ws_r, V_wsT_r, L_ws_r_sqrt
@@ -422,14 +499,14 @@ def compress_svd_llm(
             try:
                 whitening_matrix_inv = torch.linalg.inv(whitening_matrix)
             except Exception as e:
-                print("WARNING: whitening_matrix is not full rank!")
+                print("[WARNING] whitening_matrix is not full rank!")
                 whitening_matrix += 1e-6 * torch.eye(
                     whitening_matrix.shape[0],
                     dtype=whitening_matrix.dtype
                 ).to(device)
                 whitening_matrix_inv = torch.linalg.inv(whitening_matrix)
 
-            # Cast whitening matrix (and inverse) to lower precision
+            # Cast whitening matrix and inverse to lower precision
             whitening_matrix = whitening_matrix.to(dtype=torch.float32)
             whitening_matrix_inv = whitening_matrix_inv.to(dtype=torch.float32)
 
@@ -450,7 +527,7 @@ def compress_svd_llm(
             rank = max(1, min(rank, L.shape[0] - 1))
             rank_map[layers_str[i]] = rank
             U_r = U[:, :rank]
-            L_r = torch.diag(L[:rank])
+            L_r_sqrt = torch.sqrt(L[:rank])
             VT_r = torch.matmul(VT[:rank, :], whitening_matrix_inv)
             # Free full-rank matrices as soon as truncated slices are built
             U = L = VT = whitening_matrix_inv = None
@@ -458,12 +535,11 @@ def compress_svd_llm(
             torch.cuda.empty_cache()
 
             # Compute approximate weight matrix, split in two matrices
-            L_r_sqrt = torch.sqrt(L_r)
-            W_u = torch.matmul(U_r, L_r_sqrt).cpu().to(layer_attr.weight.dtype)
-            W_v = torch.matmul(L_r_sqrt, VT_r).cpu().to(layer_attr.weight.dtype)
+            W_u = (U_r * L_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
+            W_v = (VT_r * L_r_sqrt.unsqueeze(1)).cpu().to(layer_attr.weight.dtype)
             # Free low-rank matrices, leave only W_u and W_v
-            U_r = L_r = VT_r = L_r_sqrt = None
-            del U_r, L_r, VT_r, L_r_sqrt
+            U_r = VT_r = L_r_sqrt = None
+            del U_r, VT_r, L_r_sqrt
 
         # Replace the original nn.Linear with the LowRank module, which implements the forward pass as W_u(W_v(x)).
         van = LowRank(
@@ -477,16 +553,41 @@ def compress_svd_llm(
         if layer_attr.bias is not None:
             van.W_u.bias.data = layer_attr.bias.data
 
+        # DIAGNOSTICS
+        W_check = layer_attr.weight.data.to(device, dtype=torch.float32)
+        W_reconstructed = torch.matmul(W_u.to(device, dtype=torch.float32), 
+                                W_v.to(device, dtype=torch.float32))
+        abs_err = (W_check - W_reconstructed).abs()
+        frob_original = W_check.norm(p='fro')
+        frob_error = (W_check - W_reconstructed).norm(p='fro')
+        # The gold standard: best possible rank-r approximation with no whitening
+        U_plain, S_plain, Vh_plain = torch.linalg.svd(W_check, full_matrices=False)
+        W_best = (U_plain[:, :rank] * S_plain[:rank]) @ Vh_plain[:rank, :]
+        frob_best = (W_best - W_check).norm(p='fro') / W_check.norm(p='fro')
+        print(f"\n[SANITY] Layer: {layers_str[i]}")
+        print(f"  W original norm:      {W_check.norm():.6f}")
+        print(f"  W reconstructed norm: {W_reconstructed.norm():.6f}")
+        print(f"  Max absolute error:   {abs_err.max():.6e}")
+        print(f"  Mean absolute error:  {abs_err.mean():.6e}")
+        print(f"  Rel error (mean):     {(abs_err / (W_check.abs() + 1e-8)).mean():.6e}")
+        print(f"  Relative Frobenius error: {(frob_error / frob_original).item():.4e}")
+        print(f"  Best possible rank-{rank} Frobenius error (plain SVD): {frob_best.item():.4e}")
+        print(f"  Whitened error / plain SVD error ratio: {(frob_error/W_check.norm(p='fro')).item() / frob_best.item():.2f}x")
+
         setattr(layer, attr, van)
 
         # Free ram and vram from all leftover matrices
         W_u = W_v = whitening_matrices[layers_str[i]] = None
         del W_u, W_v, whitening_matrices[layers_str[i]]
         torch.cuda.empty_cache()
+    for name, param in model.named_parameters():
+        if 'W_v' in name or 'W_u' in name:
+            print(f"{name}: dtype={param.dtype}, device={param.device}, norm={param.norm():.4f}")
+            break  # just check the first one
     vram_usage("After performing layer compression")
 
     if save_path:
-        print("DEBUG: Saving compressed model to disk...")
+        print("[DEBUG] Saving compressed model to disk...")
         # Create model directory
         save_path_model = save_path + \
                           "/models/" + \
@@ -516,8 +617,12 @@ def compress_svd_llm(
            v2_str +
            "compressed" + 
            ".pt")
-        print("DEBUG: Compressed model saved succesfully")
+        print("[DEBUG] Compressed model saved succesfully")
 
+    us_cache.clear()
+    del us_cache
+    gc.collect()
+    torch.cuda.empty_cache()
     return model, tokenizer
 
 def apply_lowrank(model, rank_map):

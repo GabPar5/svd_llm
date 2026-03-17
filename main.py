@@ -4,8 +4,9 @@ import argparse
 import gc
 import json
 import time
-from transformers import AutoModelForCausalLM, AutoConfig
+import torch
 import lm_eval
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import setup_logging, handle_non_serializable
 
@@ -13,33 +14,167 @@ from lm_eval.utils import setup_logging, handle_non_serializable
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    # TODO - add group criteria argument
     # TODO - add score function argument
-    parser.add_argument('--model', type=str, default='Qwen/Qwen2.5-1.5B', help='LLM to load from huggingface')
-    parser.add_argument('--run_v2', action='store_true', help='Run SVD-LLM V2')
-    parser.add_argument('--dtype', type=str, default='bfloat16', help='Weights dtype (original and compressed)')
-    parser.add_argument('--compression_ratio', type=float, default=0.2, help='Target compression ratio,(0,1), default=0.2, means removing about 20%% of the params.')
-    parser.add_argument('--calibration_dataset', type=str, default='tatsu-lab/alpaca:train',help='Calibration dataset, format is "datasetNameOrPath:split"')
-    parser.add_argument('--max_whitening_samples', type=int, default=1024, help='Number of calibration data samples for whitening.')
-    parser.add_argument('--max_length', type=int, default=2048, help='Maximum context length for the LLM')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for data preprocessing and forward pass')
-    parser.add_argument('--seed',type=int, default=6363, help='Seed for sampling the calibration data')
-    parser.add_argument('--device', type=str, default="cuda", help='device')
-    parser.add_argument('--save_path', type=str, default=None, help='Path to save the whitening matrices and the compressed model checkpoints.')
-    parser.add_argument('--whitening_mat_path', type=str, default=None, help='Local path to load the whitening matrices')
-    parser.add_argument('--use_compressed', action='store_true', help='Use compressed model for evaluation')
-    parser.add_argument('--compressed_model_path', type=str, default=None, help='Local path to load the compressed model - if you need to do evaluation only')
-    parser.add_argument('--compress_mlp', action='store_true', help='Compress MLP weights')
-    parser.add_argument('--compress_att_qkv', action='store_true', help='Compress attention qkv matrices')
-    parser.add_argument('--compress_att_out', action='store_true', help='Compress attention output projection matrix')
-    parser.add_argument('--het', action='store_true', help='Assign heterogeneous compression ratio')
-    parser.add_argument('--hf_token', type=str, default=None, help='Huggingface token to download/upload models')
-    parser.add_argument('--evaluate', action='store_true', help='Evaluate the model on a set of tasks')
-    parser.add_argument('--eval_sampling', action='store_true', help='Use conditional sampling during evaluation')
-    parser.add_argument('--eval_batch_size', type=int, default=1, help='Evaluation batch size')
-    parser.add_argument('--eval_tasks', type=str, default='wikitext|0',help='Evaluation tasks, the pattern is "taskName1,taskName2,...,taskNameK|numShots" or "taskName1,taskName2,...,taskNameK|numShots1,numShots2,...,numShotsK"')
-    parser.add_argument('--eval_temperature', type=float, default=0.7,help='Evaluation temperature (conditional sampling)')
-    parser.add_argument('--max_eval_tokens', type=int, default=256,help='Maximum number of tokens to generate during evaluation')
+    parser.add_argument(
+        '--model', 
+        type=str, 
+        default='Qwen/Qwen2.5-1.5B', 
+        help='LLM to load from huggingface'
+    )
+    parser.add_argument(
+        '--run_v2', 
+        action='store_true', 
+        help='Run SVD-LLM V2'
+    )
+    parser.add_argument(
+        '--dtype', 
+        type=str, 
+        default='float32', 
+        help='Weights dtype (original and compressed)'
+    )
+    parser.add_argument(
+        '--compression_ratio', 
+        type=float,
+        default=0.2, 
+        help='Target compression ratio,(0,1), default=0.2, means removing about 20%% of the params.'
+    )
+    parser.add_argument(
+        '--calibration_dataset', 
+        type=str, 
+        default='tatsu-lab/alpaca:train',
+        help='Calibration dataset, format is "datasetNameOrPath:subset:split"'
+    )
+    parser.add_argument(
+        '--max_length', 
+        type=int, 
+        default=2048, 
+        help='Maximum context length for the LLM during compression'
+    )
+    parser.add_argument(
+        '--max_whitening_samples', 
+        type=int, 
+        default=256, 
+        help='Number of calibration data samples for whitening.'
+    )
+    parser.add_argument(
+        '--batch_size', 
+        type=int, 
+        default=2, 
+        help='Batch size for data preprocessing and forward pass'
+    )
+    parser.add_argument(
+        '--seed',
+        type=int, 
+        default=6363, 
+        help='Seed for sampling the calibration data'
+    )
+    parser.add_argument(
+        '--device', 
+        type=str, 
+        default="cuda", 
+        help='device'
+    )
+    parser.add_argument(
+        '--save_path', 
+        type=str, 
+        default=None, 
+        help='Base path to save the whitening matrices and the compressed model checkpoints'
+    )
+    parser.add_argument(
+        '--whitening_mat_path', 
+        type=str, 
+        default=None, 
+        help='Local path to load the whitening matrices'
+    )
+    parser.add_argument(
+        '--use_compressed', 
+        action='store_true', 
+        help='Use compressed model for evaluation'
+    )
+    parser.add_argument(
+        '--compressed_model_path', 
+        type=str, 
+        default=None, 
+        help='Local path to load the compressed model - if you need to do evaluation only'
+    )
+    parser.add_argument(
+        '--compress_mlp', 
+        action='store_true', 
+        help='Compress MLP weights'
+    )
+    parser.add_argument(
+        '--compress_att_qkv', 
+        action='store_true', 
+        help='Compress attention qkv projection matrices'
+    )
+    parser.add_argument(
+        '--compress_att_out', 
+        action='store_true', 
+        help='Compress attention output projection matrix'
+    )
+    parser.add_argument(
+        '--het', 
+        action='store_true', 
+        help='Assign heterogeneous compression ratio'
+    )
+    parser.add_argument(
+        '--group_criterion', 
+        type=str, 
+        default="type", 
+        help='Criterion used to group weight matrices in heterogeneous setting. Possible values are "type", "global" and "decoder"'
+    )
+    parser.add_argument(
+        '--group_patterns', 
+        type=str, 
+        default="q_proj:self_attn.q_proj;k_proj:self_attn.k_proj;v_proj:self_attn.v_proj;o_proj:self_attn.o_proj;gate_proj:mlp.gate_proj;up_proj:mlp.up_proj;down_proj:mlp.down_proj", 
+        help='Group patterns used when grouping weight matrices by type, the pattern is "groupName1:weightType1,weightType2;groupName2:weightType1,weightType2;..."'
+    )
+    parser.add_argument(
+        '--hf_token', 
+        type=str, 
+        default=None, 
+        help='Huggingface token to download/upload models'
+    )
+    parser.add_argument(
+        '--evaluate', 
+        action='store_true', 
+        help='Evaluate the model on a set of tasks'
+    )
+    parser.add_argument(
+        '--eval_sampling', 
+        action='store_true', 
+        help='Use conditional sampling during evaluation'
+    )
+    parser.add_argument(
+        '--eval_batch_size', 
+        type=int, 
+        default=8, 
+        help='Evaluation batch size'
+    )
+    parser.add_argument(
+        '--eval_tasks', 
+        type=str, 
+        default='wikitext|0',
+        help='Evaluation tasks, the pattern is "taskName1,taskName2,...,taskNameK|numShots" or "taskName1,taskName2,...,taskNameK|numShots1,numShots2,...,numShotsK"'
+    )
+    parser.add_argument(
+        '--eval_max_length', 
+        type=int, 
+        default=4096, 
+        help='Maximum context length for the LLM during evaluation'
+    )
+    parser.add_argument(
+        '--eval_temperature', 
+        type=float, 
+        default=0.7,
+        help='Evaluation temperature (conditional sampling)'
+    )
+    parser.add_argument(
+        '--max_eval_tokens', 
+        type=int, 
+        default=256,
+        help='Maximum number of tokens to generate during evaluation'
+    )
 
     args = parser.parse_args()
 
@@ -56,12 +191,13 @@ if __name__ == "__main__":
         )
         # Avoid warning
         model.generation_config.pad_token_id = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
+        print(model)
         vram_usage("After loading original model")
     elif args.compressed_model_path:
         print("DEBUG: Loading compressed model from disk...")
         vram_usage("Before loading compressed model")
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.compressed_model_path, padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained("/".join(args.compressed_model_path.split("/")[:-1]), padding_side="left")
 
         # Load model config from HF and instantiate base model
         config = AutoConfig.from_pretrained(args.model)
@@ -70,7 +206,7 @@ if __name__ == "__main__":
         model.generation_config.pad_token_id = model.generation_config.eos_token_id
 
         # Load checkpoint
-        checkpoint = torch.load(args.compressed_model_path, map_location="cpu")
+        checkpoint = torch.load(args.compressed_model_path, map_location="cpu", weights_only=True)
         rank_map = checkpoint["rank_map"]
 
         # Replace compressed layers with LowRank modules
@@ -80,21 +216,31 @@ if __name__ == "__main__":
         # Load weights
         model.load_state_dict(checkpoint["state_dict"], strict=True)
         model=model.to(args.device, dtype=DtypeMap.get_dtype(args.dtype))
+        print(model)
         del checkpoint, rank_map
         gc.collect()
         torch.cuda.empty_cache()
         vram_usage("After loading compressed model")
     else:
         dataset_name = args.calibration_dataset.split(":")[0]
-        dataset_split = args.calibration_dataset.split(":")[1]
+        dataset_subset = args.calibration_dataset.split(":")[1]
+        dataset_split = args.calibration_dataset.split(":")[2]
+
+        group_patterns_list = list(map(lambda x: x.split(":"), args.group_patterns.split(";")))
+        group_patterns_dict = {}
+        for group in group_patterns_list:
+            group_patterns_dict[group[0]] = group[1].split(",")
+
         model, tokenizer = compress_svd_llm(
             model_name = args.model,
             ratio = round(args.compression_ratio, 2),
             dataset = {
-                "dataset_name": dataset_name, 
+                "name": dataset_name, 
+                "subset": dataset_subset,
                 "split": dataset_split, 
                 "max_samples": args.max_whitening_samples
             },
+            max_length = args.max_length,
             is_v2 = args.run_v2,
             dtype = args.dtype,
             batch_size = args.batch_size,
@@ -106,15 +252,21 @@ if __name__ == "__main__":
             compress_att_qkv = args.compress_att_qkv,
             compress_att_out = args.compress_att_out,
             heterogeneous = args.het,
+            group_criterion = args.group_criterion,
+            group_patterns = group_patterns_dict,
             hf_token = args.hf_token
         )
         model=model.to(args.device, dtype=DtypeMap.get_dtype(args.dtype))
+        print(model)
+
+        gc.collect()
+        torch.cuda.empty_cache()
         vram_usage("After loading compressed model")
         
     
     if args.evaluate:
-        # Don't return last KV cache
-        model.config.use_cache = False
+        # Set model into evaluation mode
+        model.eval()
 
         # Setup logging level
         setup_logging("DEBUG") # pyright: ignore[reportArgumentType]
@@ -149,7 +301,7 @@ if __name__ == "__main__":
             batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
             device = args.device, # pyright: ignore[reportCallIssue]
             dtype = args.dtype, # pyright: ignore[reportCallIssue]
-            max_length = args.max_length # pyright: ignore[reportCallIssue]
+            max_length = args.eval_max_length # pyright: ignore[reportCallIssue]
         )
 
 
@@ -166,9 +318,10 @@ if __name__ == "__main__":
             gen_kwargs={ # pyright: ignore[reportCallIssue]
                 "temperature": args.eval_temperature,
                 "do_sample": args.eval_sampling,
-                "max_gen_toks": args.max_eval_tokens
+                "max_gen_toks": args.max_eval_tokens,
+                "max_new_tokens": args.max_eval_tokens
             },
-            apply_chat_template=True,
+            apply_chat_template=False,
             random_seed=args.seed, # pyright: ignore[reportCallIssue]
             numpy_random_seed=args.seed, # pyright: ignore[reportCallIssue]
             torch_random_seed=args.seed, # pyright: ignore[reportCallIssue]
@@ -183,7 +336,10 @@ if __name__ == "__main__":
                          "/"
             model_name = args.model.replace("/", "_").replace("-", "_")
         elif args.compressed_model_path:
-            model_path = "/".join(args.compressed_model_path.split("/")[:-2]) + "/eval/"
+            model_path = args.save_path + \
+                         "/eval/" + \
+                         args.model.replace("/", "_").replace("-", "_") + \
+                         "/"
             model_name = args.compressed_model_path.split("/")[-1][:-3]
         else:
             model_path = args.save_path + \
@@ -205,7 +361,7 @@ if __name__ == "__main__":
                          v2_str + \
                          "compressed"
             
-        with open(model_path + "/" + model_name + ".json", "w") as f:
+        with open(model_path + model_name + ".json", "w") as f:
             json.dump(results, f, default=handle_non_serializable, indent=2)
 
         vram_usage("After evaluation")

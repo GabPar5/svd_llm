@@ -1,15 +1,20 @@
-from typing import Dict, Optional, List
-from enum import Enum
 import os
-from datasets import load_dataset, load_from_disk
-from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 import torch.nn as nn
 import torch
+from typing import Dict, Optional, List
+from enum import Enum
+from datasets import load_dataset, load_from_disk, Dataset
+from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
-class GroupBy(Enum):
+
+class GroupBy(str, Enum):
     GLOBAL="global"
     DECODER="decoder"
     TYPE="type"
+
+class ScoreMetric(str, Enum):
+    TRUNCATION="truncation"
+    ENTROPY="entropy"
 
 class DtypeMap(Enum):
     float32= torch.float32
@@ -36,74 +41,122 @@ def vram_usage(msg=""):
     torch.cuda.reset_peak_memory_stats()
     print(f"[VRAM] {msg} | allocated={alloc:.1f} MiB | reserved={reserved:.1f} MiB | peak={peak:.1f} MiB")
 
-def build_example(batch: Dict[str, List[str]]):
-    instructions = batch["instruction"]
-    inputs = batch["input"]
-    
-    # Combine instruction and input (if available)
-    out_examples = [
-        f"{instr}\n{inp}" if inp.strip() else instr
-        for instr, inp in zip(instructions, inputs)
-    ]
+def concatenate_text(batch):
+        if "instruction" in batch:
+            texts = [
+                f"{instr}\n{inp}" if inp.strip() else instr
+                for instr, inp in zip(batch["instruction"], batch["input"])
+            ]
+            return {"concatenated": ["\n\n".join(texts)]}
+        elif "text" in batch:
+            return {"concatenated": ["\n\n".join(batch["text"])]}
+        elif "page" in batch:
+            return {"concatenated": ["\n\n".join(batch["page"])]}
+        else:
+            raise ValueError(f"Unrecognized dataset format. Available columns: {list(batch.keys())}")
+        
+def tokenize_concatenated(batch, tokenizer: Qwen2TokenizerFast):
+        return tokenizer(
+            batch["concatenated"],
+            add_special_tokens=False,   # no BOS/EOS between chunks
+            truncation=False,           # we want the full token stream
+            padding=False,              # absolutely no padding
+            return_attention_mask=False # we'll create all-ones masks later
+        )
 
-    return {"final_input": out_examples}
-
-def tokenize_example(
-        batch: Dict[str, List[str]], 
-        tokenizer: Qwen2TokenizerFast
-):
-    # Build message with system prompt
-    messages = [
-        [{"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": example}]
-    for example in batch["final_input"]]
-
-    # Apply the chat template
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-
-    # Tokenize
-    tokenized_example = tokenizer(
-        text,  # pyright: ignore[reportArgumentType]
-        padding = True,
-        return_tensors = "pt"
-    )
-
-    return tokenized_example
+def generate_chunks(batch, max_length: int, max_samples: int):
+        # batch["token_stream"] is the full flat list of token IDs.
+        # We slice it into max_samples chunks of max_length tokens each.
+        token_stream = batch["token_stream"][0]
+        input_ids = [
+            token_stream[i * max_length : (i + 1) * max_length]
+            for i in range(max_samples)
+        ]
+        attention_mask = [[1] * max_length for _ in range(max_samples)]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        }
 
 def tokenize_dataset(
         name: str,
+        subset: str,
         split: str,
-        tokenizer: Qwen2TokenizerFast,
-        max_samples: int = 512,
+        tokenizer,
+        max_samples: int = 256,
         batch_size: int = 32,
+        max_length: int = 2048,
         seed: Optional[int] = None,
         save_path: Optional[str] = None
 ):
-    # Load train split, shuffle it and take samples
-    print(f"DEBUG: dataset name/path: {name}")
+    # Step 1: Load dataset
+    print(f"[DEBUG] Dataset name/path: {name}")
     if os.path.isdir(name):
-        print("DEBUG: Loading dataset from disk...")
+        print("[DEBUG] Loading dataset from disk...")
         df = load_from_disk(name + "/" + split)
     else:
-        print("DEBUG: Loading dataset from hub...")
-        df = load_dataset(name, split=split, num_proc=8)
+        print("[DEBUG] Loading dataset from hub...")
+        if subset is not None:
+            df = load_dataset(path=name, name=subset, split=split, num_proc=8)
+        else:
+            df = load_dataset(path=name, split=split, num_proc=8)
         if save_path and not os.path.exists(save_path + "/calibration_datasets/" + name + "/" + split):
-            print("DEBUG: Saving dataset to disk...")
-            df.save_to_disk(save_path + "/calibration_datasets/" + name + "/" + split)
-    shuffled_df = df.shuffle(seed)
-    df = shuffled_df.select(range(max_samples)).flatten_indices() # pyright: ignore[reportAttributeAccessIssue]
+            print("[DEBUG] Saving dataset to disk...")
+            df.save_to_disk(save_path + "/calibration_datasets/" + name + "/" + subset + "/" + split)
 
-    # Preprocess examples
-    preprocessed_df = df.map(build_example, batched = True, batch_size = batch_size, remove_columns = ["instruction", "input", "output", "text"], load_from_cache_file=False)
+    # Step 2: Shuffle
+    df = df.shuffle(seed=seed)
 
-    # Tokenize preprocessed examples
-    tokenized_df = preprocessed_df.map(tokenize_example, batched = True, batch_size = batch_size, fn_kwargs = {"tokenizer": tokenizer}, load_from_cache_file=False)
+    # Step 3: Concatenate all text into one long string
+    concatenated = df.map(
+        concatenate_text,
+        batched=True,
+        batch_size=len(df), # process entire dataset in one batch
+        remove_columns=df.column_names, # pyright: ignore[reportArgumentType]
+        load_from_cache_file=False,
+        desc="Concatenating text..."
+    )
 
-    return tokenized_df.with_format("torch")
+    # Step 4: Tokenize the single concatenated string
+    tokenized = concatenated.map(
+        tokenize_concatenated,
+        batched=True,
+        batch_size=1,
+        remove_columns=["concatenated"],
+        load_from_cache_file=False,
+        fn_kwargs={"tokenizer": tokenizer},
+        desc="Tokenizing concatenated text..."
+    )
+
+    # Step 5: Flatten into a single 1D list of token IDs
+    # After the map above, tokenized["input_ids"] is a list containing
+    # one element (since batch_size=1 above): a very long list of token IDs.
+    # We flatten it into a plain Python list.
+    all_token_ids = [tid for chunk in tokenized["input_ids"] for tid in chunk]
+    total_tokens = len(all_token_ids)
+    print(f"[DEBUG] Total tokens in concatenated stream: {total_tokens}")
+    print(f"[DEBUG] Requested samples: {max_samples} x {max_length} = {max_samples * max_length} tokens")
+
+    if total_tokens < max_samples * max_length:
+        actual_samples = total_tokens // max_length
+        print(f"[WARNING] Not enough tokens for {max_samples} samples. Reducing to {actual_samples}.")
+        max_samples = actual_samples
+
+    # Step 6: Slice into fixed-length non-overlapping chunks, no padding
+    # Wrap the flat token list into a temporary Dataset so we can use .map()
+    chunk_input = Dataset.from_dict({"token_stream": [all_token_ids]})
+
+    chunked = chunk_input.map(
+        generate_chunks,
+        batched=True,
+        batch_size=1,
+        remove_columns=["token_stream"],
+        load_from_cache_file=False,
+        fn_kwargs={"max_length": max_length, "max_samples": max_samples},
+        desc="Slicing into fixed-length chunks..."
+    )
+
+    return chunked.with_format("torch")
 
 def generate_paths(mlp: bool, qkv: bool, attention_output: bool, layers_number: int) -> list[str]:
     list_paths=[]
