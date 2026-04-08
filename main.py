@@ -3,7 +3,6 @@ from src.svd_llm import *
 import argparse
 import gc
 import json
-import time
 import torch
 import lm_eval
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -14,7 +13,6 @@ from lm_eval.utils import setup_logging, handle_non_serializable
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    # TODO - add score function argument
     parser.add_argument(
         '--model', 
         type=str, 
@@ -130,6 +128,12 @@ if __name__ == "__main__":
         help='Group patterns used when grouping weight matrices by type, the pattern is "groupName1:weightType1,weightType2;groupName2:weightType1,weightType2;..."'
     )
     parser.add_argument(
+        '--score_metric', 
+        type=str, 
+        default="truncation", 
+        help='Score metric to use for weight importance during heterogeneous ratio allocation. Possible values are "truncation" and "entropy"'
+    )
+    parser.add_argument(
         '--hf_token', 
         type=str, 
         default=None, 
@@ -181,13 +185,23 @@ if __name__ == "__main__":
     if not args.use_compressed:
         print("DEBUG: Loading original model from the hub...")
         vram_usage("Before loading original model")
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        model_eval_path = args.save_path + \
+                     "/eval/" + \
+                     args.model.replace("/", "_").replace("-", "_") + \
+                     "/"
+        model_name = args.model.replace("/", "_").replace("-", "_")
+        
+        if "llama-7b" in args.model:
+            tokenizer = LlamaTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             dtype=args.dtype,
             device_map=args.device,
             use_safetensors=True,
-            token=args.hf_token
+            token=args.hf_token, 
+            trust_remote_code=True
         )
         # Avoid warning
         model.generation_config.pad_token_id = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
@@ -196,17 +210,26 @@ if __name__ == "__main__":
     elif args.compressed_model_path:
         print("DEBUG: Loading compressed model from disk...")
         vram_usage("Before loading compressed model")
+        model_eval_path = args.save_path + \
+                     "/eval/" + \
+                     args.model.replace("/", "_").replace("-", "_") + \
+                     "/"
+        model_name = args.compressed_model_path.split("/")[-1][:-3]
+
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained("/".join(args.compressed_model_path.split("/")[:-1]))
+        if "llama-7b" in args.model:
+            tokenizer = LlamaTokenizer.from_pretrained("/".join(args.compressed_model_path.split("/")[:-1]), trust_remote_code=True)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained("/".join(args.compressed_model_path.split("/")[:-1]), trust_remote_code=True)
 
         # Load model config from HF and instantiate base model
-        config = AutoConfig.from_pretrained(args.model)
-        model = AutoModelForCausalLM.from_config(config)
+        config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
         # Avoid warning
         model.generation_config.pad_token_id = model.generation_config.eos_token_id
 
         # Load checkpoint
-        checkpoint = torch.load(args.compressed_model_path, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(args.compressed_model_path, map_location="cpu", weights_only=False)
         rank_map = checkpoint["rank_map"]
 
         # Replace compressed layers with LowRank modules
@@ -222,6 +245,28 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
         vram_usage("After loading compressed model")
     else:
+        model_eval_path = args.save_path + \
+                     "/eval/" + \
+                     args.model.replace("/", "_").replace("-", "_") + \
+                     "/"
+        compress_att_qkv_str = "_qkv" if args.compress_att_qkv else ""
+        compress_att_out_str = "_out" if args.compress_att_out else ""
+        compress_mlp_str = "_mlp" if args.compress_mlp else ""
+        heterogeneous_str = "_het" if args.het else ""
+        group_criterion_str = ("_" + args.group_criterion) if args.het else ""
+        score_metric_str = ("_" + args.score_metric) if args.het else ""
+        v2_str = "_v2" if args.run_v2 else ""
+        model_name = args.model.replace("/", "_").replace("-", "_") + \
+                     compress_att_qkv_str + \
+                     compress_att_out_str + \
+                     compress_mlp_str + \
+                     "_" + \
+                     str(round(args.compression_ratio, 2)) + \
+                     heterogeneous_str + \
+                     group_criterion_str + \
+                     score_metric_str + \
+                     v2_str
+
         dataset_name = args.calibration_dataset.split(":")[0]
         dataset_subset = args.calibration_dataset.split(":")[1]
         dataset_split = args.calibration_dataset.split(":")[2]
@@ -230,6 +275,14 @@ if __name__ == "__main__":
         group_patterns_dict = {}
         for group in group_patterns_list:
             group_patterns_dict[group[0]] = group[1].split(",")
+
+        # Initialize logger
+        model_log_path = args.save_path + "/logs/" + args.model.replace("/", "_").replace("-", "_") + "/"
+        if not os.path.isdir(model_log_path):
+            os.mkdir(model_log_path)
+        sys.stdout = Logger(
+            filename= model_log_path + model_name + ".log"
+        )
 
         model, tokenizer = compress_svd_llm(
             model_name = args.model,
@@ -251,6 +304,7 @@ if __name__ == "__main__":
             compress_mlp = args.compress_mlp,
             compress_att_qkv = args.compress_att_qkv,
             compress_att_out = args.compress_att_out,
+            score_metric=args.score_metric,
             heterogeneous = args.het,
             group_criterion = args.group_criterion,
             group_patterns = group_patterns_dict,
@@ -267,6 +321,7 @@ if __name__ == "__main__":
     if args.evaluate:
         # Set model into evaluation mode
         model.eval()
+        model.config.use_cache = False
 
         # Setup logging level
         setup_logging("DEBUG") # pyright: ignore[reportArgumentType]
@@ -364,50 +419,20 @@ if __name__ == "__main__":
                 fewshot_random_seed=args.seed # pyright: ignore[reportCallIssue]
             ) # pyright: ignore[reportCallIssue]
 
-        # Save results
-        if not args.use_compressed:
-            model_path = args.save_path + \
-                         "/eval/" + \
-                         args.model.replace("/", "_").replace("-", "_") + \
-                         "/"
-            model_name = args.model.replace("/", "_").replace("-", "_")
-        elif args.compressed_model_path:
-            model_path = args.save_path + \
-                         "/eval/" + \
-                         args.model.replace("/", "_").replace("-", "_") + \
-                         "/"
-            model_name = args.compressed_model_path.split("/")[-1][:-3]
-        else:
-            model_path = args.save_path + \
-                         "/eval/" + \
-                         args.model.replace("/", "_").replace("-", "_") + \
-                         "/"
-            compress_mlp_str = "mlp_" if args.compress_mlp else ""
-            compress_att_qkv_str = "qkv_" if args.compress_att_qkv else ""
-            compress_att_out_str = "out_" if args.compress_att_out else ""
-            heterogeneous_str = "het_" if args.het else ""
-            v2_str = "v2_" if args.run_v2 else ""
-            model_name = args.model.replace("/", "_").replace("-", "_") + \
-                         "_" + \
-                         compress_att_qkv_str + \
-                         compress_att_out_str + \
-                         compress_mlp_str + \
-                         str(round(args.compression_ratio, 2)) + "_" + \
-                         heterogeneous_str + \
-                         v2_str + \
-                         "compressed"
-            
-        if not os.path.isdir(model_path):
-            os.mkdir(model_path)
+        # SAVE RESULTS
+        if not os.path.isdir(model_eval_path):
+            os.mkdir(model_eval_path)
 
         if "results" not in results:  # pyright: ignore[reportOperatorIssue]
             results["results"] = {} # pyright: ignore[reportOptionalSubscript]
+
         if wikitext_ppl is not None:
             results["results"]["wikitext"] = { # pyright: ignore[reportOptionalSubscript]
                 "alias": "wikitext",
                 "token_perplexity,none": wikitext_ppl,
                 "token_perplexity_stderr,none": "N/A"
             }
+
         if c4_ppl is not None:
             results["results"]["c4"] = { # pyright: ignore[reportOptionalSubscript]
                 "alias": "c4",
@@ -415,7 +440,7 @@ if __name__ == "__main__":
                 "token_perplexity_stderr,none": "N/A"
             }
             
-        with open(model_path + model_name + ".json", "w") as f:
+        with open(model_eval_path + model_name + ".json", "w") as f:
             json.dump(results, f, default=handle_non_serializable, indent=2)
 
         vram_usage("After evaluation")

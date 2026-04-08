@@ -29,6 +29,7 @@ Here's a list of all available possible arguments:
 - `--het`: Assign heterogeneous compression ratio (default = `False`)
 - `--group_criterion`: Criterion used to group weight matrices in heterogeneous setting. Possible values are `type`, `global` and `decoder` (default = `type`)
 - `--group_patterns`: Groups used when grouping weight matrices by type, the pattern is "groupName1:weightType1,weightType2;groupName2:weightType1,weightType2;..." (default = `q_proj:self_attn.q_proj;k_proj:self_attn.k_proj;v_proj:self_attn.v_proj;o_proj:self_attn.o_proj;gate_proj:mlp.gate_proj;up_proj:mlp.up_proj;down_proj:mlp.down_proj`)
+- `--score_metric`: Score metric to use for weight importance during heterogeneous ratio allocation. Possible values are `truncation` and `entropy` (default = `truncation`)
 - `--hf_token`: Huggingface token used to download/upload models (default = `None`)
 - `--evaluate`: Evaluate the model on a set of tasks (default = `False`)
 - `--eval_sampling`: Use conditional sampling during evaluation (default = `False`)

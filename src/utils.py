@@ -1,7 +1,8 @@
 import os
 import torch.nn as nn
 import torch
-import numpy as np
+import random
+import sys
 from typing import Dict, Optional, List
 from tqdm import tqdm
 from enum import Enum
@@ -60,25 +61,28 @@ def concatenate_text(batch):
 def tokenize_concatenated(batch, tokenizer: Qwen2TokenizerFast):
         return tokenizer(
             batch["concatenated"],
-            add_special_tokens=False,   # no BOS/EOS between chunks
             truncation=False,           # we want the full token stream
             padding=False,              # absolutely no padding
             return_attention_mask=False # we'll create all-ones masks later
         )
 
-def generate_chunks(batch, max_length: int, max_samples: int):
-        # batch["token_stream"] is the full flat list of token IDs.
-        # We slice it into max_samples chunks of max_length tokens each.
-        token_stream = batch["token_stream"][0]
-        input_ids = [
-            token_stream[i * max_length : (i + 1) * max_length]
-            for i in range(max_samples)
-        ]
-        attention_mask = [[1] * max_length for _ in range(max_samples)]
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
-        }
+def sample_chunks(batch, max_length: int, max_samples: int, seed: Optional[int]):
+    rng = random.Random(seed)
+    token_stream = batch["token_stream"][0]
+    total_tokens = len(token_stream)
+
+    input_ids = []
+    attention_mask = []
+    for _ in range(max_samples):
+        i = rng.randint(0, total_tokens - max_length - 1)
+        j = i + max_length
+        input_ids.append(token_stream[i:j])
+        attention_mask.append([1] * max_length)
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask
+    }
 
 def tokenize_dataset(
         name: str,
@@ -106,10 +110,7 @@ def tokenize_dataset(
             print("[DEBUG] Saving dataset to disk...")
             df.save_to_disk(save_path + "/calibration_datasets/" + name + "/" + subset + "/" + split)
 
-    # Step 2: Shuffle
-    df = df.shuffle(seed=seed)
-
-    # Step 3: Concatenate all text into one long string
+    # Step 2: Concatenate all text into one long string
     concatenated = df.map(
         concatenate_text,
         batched=True,
@@ -119,7 +120,7 @@ def tokenize_dataset(
         desc="Concatenating text..."
     )
 
-    # Step 4: Tokenize the single concatenated string
+    # Step 3: Tokenize the single concatenated string
     tokenized = concatenated.map(
         tokenize_concatenated,
         batched=True,
@@ -130,7 +131,7 @@ def tokenize_dataset(
         desc="Tokenizing concatenated text..."
     )
 
-    # Step 5: Flatten into a single 1D list of token IDs
+    # Step 4: Flatten into a single 1D list of token IDs
     # After the map above, tokenized["input_ids"] is a list containing
     # one element (since batch_size=1 above): a very long list of token IDs.
     # We flatten it into a plain Python list.
@@ -139,26 +140,29 @@ def tokenize_dataset(
     print(f"[DEBUG] Total tokens in concatenated stream: {total_tokens}")
     print(f"[DEBUG] Requested samples: {max_samples} x {max_length} = {max_samples * max_length} tokens")
 
+    if total_tokens < max_length + 1:
+        raise ValueError(f"Not enough tokens ({total_tokens}) to sample even one chunk of length {max_length}.")
+
     if total_tokens < max_samples * max_length:
         actual_samples = total_tokens // max_length
         print(f"[WARNING] Not enough tokens for {max_samples} samples. Reducing to {actual_samples}.")
         max_samples = actual_samples
 
-    # Step 6: Slice into fixed-length non-overlapping chunks, no padding
+    # Step 5: Randomly sample overlapping fixed-length chunks
     # Wrap the flat token list into a temporary Dataset so we can use .map()
     chunk_input = Dataset.from_dict({"token_stream": [all_token_ids]})
 
     chunked = chunk_input.map(
-        generate_chunks,
+        sample_chunks,
         batched=True,
         batch_size=1,
         remove_columns=["token_stream"],
         load_from_cache_file=False,
-        fn_kwargs={"max_length": max_length, "max_samples": max_samples},
-        desc="Slicing into fixed-length chunks..."
+        fn_kwargs={"max_length": max_length, "max_samples": max_samples, "seed": seed},
+        desc="Sampling random chunks..."
     )
 
-    return chunked.with_format("torch")
+    return chunked.with_format("torch"), max_samples
 
 def generate_paths(mlp: bool, qkv: bool, attention_output: bool, layers_number: int) -> list[str]:
     list_paths=[]
@@ -230,7 +234,7 @@ def ppl_eval(
     # Concatenate all samples with "\n\n"
     data = load_dataset(path=dataset_name, name=subset, split=split, num_proc=8)
     text = "\n\n".join(data["text"])
-    encodings = tokenizer(text, return_tensors="pt")
+    encodings = tokenizer(text, truncation=False, padding=False, return_tensors="pt")
 
     # input_ids has shape [1, total_tokens]; we take [0] to get a 1D tensor
     # just like the original's `input_ids[0]`, then work with it as a 2D
@@ -283,3 +287,16 @@ def ppl_eval(
     ppl = torch.exp(torch.cat(nlls).mean()).item()
     print(f"[PPL EVAL] Perplexity: {ppl:.4f}")
     return ppl
+
+class Logger:
+    def __init__(self, filename="compression_run.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush() # Force to save immediately so we don't lose data on a crash
+
+    def flush(self):
+        self.terminal.flush()
