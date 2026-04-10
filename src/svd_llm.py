@@ -206,7 +206,6 @@ def allocate_ratios(
 
         # Scale so that the mean ratio across the group equals `target_ratio`,
         # preserving the global memory budget
-        print(f"Len(L_G): {inv_log_scores.shape[0]}")
         ratios = inv_log_scores.shape[0] * target_ratio * normalized
 
         print(f"  [GROUP: {group_name}] Redistributing over {len(keys)} layers:")
