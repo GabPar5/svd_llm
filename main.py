@@ -254,7 +254,8 @@ if __name__ == "__main__":
         compress_mlp_str = "_mlp" if args.compress_mlp else ""
         heterogeneous_str = "_het" if args.het else ""
         group_criterion_str = ("_" + args.group_criterion) if args.het else ""
-        score_metric_str = ("_" + args.score_metric) if args.het else ""
+        score_metric_substr = args.score_metric.replace("|", "") if len(args.score_metric.split("|")) > 1 else args.score_metric
+        score_metric_str = ("_" + score_metric_substr) if args.het else ""
         v2_str = "_v2" if args.run_v2 else ""
         model_name = args.model.replace("/", "_").replace("-", "_") + \
                      compress_att_qkv_str + \

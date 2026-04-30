@@ -39,7 +39,6 @@ def get_whitening_matrices(
         act_batch = torch.sum(act, dim=0) # Sum across batch dimension
         module.raw_xxt_matrix += act_batch
         del inp, act, act_batch
-        torch.cuda.empty_cache()
 
     # Inizialize empty X^T @ X matrices and register forward hooks
     for layer, attr in tqdm(zip(layers_list, attributes), total=len(layers_list), desc="Registering hooks..."):
@@ -68,7 +67,7 @@ def get_whitening_matrices(
             # Remove hook
             layer_attr._forward_hooks.clear()
 
-    # Empty cache and move model to CPU
+    # Empty VRAM cache and move model to cpu
     torch.cuda.empty_cache()
     model = model.cpu()
     print("[DEBUG] Cache emptied succesfully after model execution on calibration data")
@@ -99,8 +98,9 @@ def get_whitening_matrices(
                     whitening_matrices[layers_str[i]]=whitening_matrix.cpu()
                 whitening_matrix = raw_xxt_matrix = layer_attr.raw_xxt_matrix = None # pyright: ignore[reportArgumentType]
                 del whitening_matrix, raw_xxt_matrix, layer_attr.raw_xxt_matrix
-                torch.cuda.empty_cache()
 
+    torch.cuda.empty_cache()
+    gc.collect()
     return whitening_matrices
 
 def allocate_ratios(
@@ -251,7 +251,7 @@ def compress_svd_llm(
         compress_mlp: bool = False,
         compress_att_qkv: bool = False,
         compress_att_out: bool = False,
-        score_metric: Union[ScoreMetric, Literal["truncation", "entropy"]] = "truncation",
+        score_metric: Union[ScoreMetric, Literal["truncation", "entropy", "norm|p"]] = "truncation",
         heterogeneous: bool = False,
         group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]] = "type",
         group_patterns: Dict[str, List[str]] | None = None,
@@ -271,6 +271,7 @@ def compress_svd_llm(
         token=hf_token,
         trust_remote_code=True
     )
+    ram_usage("After loading original model")
     vram_usage("After loading original model")
     # Avoid warning
     model.generation_config.pad_token_id = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
@@ -300,6 +301,7 @@ def compress_svd_llm(
         batch_size=batch_size,
         shuffle=False
     )
+    ram_usage("After loading dataset")
     vram_usage("After loading dataset")
     print("=== FINAL DATASET STRUCTURE ===")
     print(calibration_dataset)
@@ -348,10 +350,10 @@ def compress_svd_llm(
                                            str(seed) +
                                            v2_str +
                                            '.pt')
+    ram_usage("After loading whitening matrices")
     vram_usage("After loading whitening matrices")
 
     print("=== LLM COMPRESSION ===")
-    vram_usage("Before performing layer replacement")
 
     rank_map = {}
     us_cache = {}  # caches (U_s, L_s) per layer — only populated when is_v2 and heterogeneous
@@ -399,9 +401,13 @@ def compress_svd_llm(
                 # Calculate svdvals only
                 L = torch.linalg.svdvals(D)
 
-                # Cache U_s and L_s on CPU to avoid computing SVD of S twice
+                # Cache U_s (downcasted to float32) and L_s on CPU to avoid computing SVD of S twice
                 # these are in_features × in_features, far smaller than caching the full SVD of D
-                us_cache[layers_str[i]] = (U_s.cpu(), L_s.cpu())
+                us_cache[layers_str[i]] = (U_s.to(torch.float32).cpu(), L_s.cpu())
+
+                # In the heterogenesous-v2 path the whitening matrices are no longer needed
+                whitening_matrices[layers_str[i]] = None
+                del whitening_matrices[layers_str[i]]
             else:
                 WS = torch.matmul(W, whitening_matrix)
                 L = torch.linalg.svdvals(WS)
@@ -417,8 +423,8 @@ def compress_svd_llm(
             # Calculate score metric
             match score_metric:
                 case "truncation":
-                    # After whitening, squared theoretical truncation loss equals the sum of squared singular values
-                    score_map[layers_str[i]] = torch.sqrt(torch.sum(L[rank:] ** 2)).item()
+                    # After whitening, theoretical truncation loss equals to the L2 norm of truncated singular values = 2-schatten norm = Frobenius norm
+                    score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=2).item()
                 case "entropy":
                     # After whitening, entropy loss equals the sum of normalized singular values of the tail
                     norm_spectrum = L/L.sum()
@@ -427,16 +433,25 @@ def compress_svd_llm(
 
                     # Shift the score to guarantee it is strictly > 1.0 before ratio allocation. Adding 1.5 provides a safe buffer away from the log(1) cliff.
                     score_map[layers_str[i]] = raw_entropy + 1.5
+                case s if s.startswith('norm'):
+                    if s.split("|")[1].startswith("-"):
+                        p_norm_value = -float(s.split("|")[1][1:])
+                    else:
+                        p_norm_value = float(s.split("|")[1])
+                    # After whitening, norm loss equals to the Lp norm of truncated singular values = p-schatten norm
+                    # WARNING: if `p_norm_value`=2 this is the same of `truncation` case
+                    score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=p_norm_value).item()
                     
 
             # Free up vram and ram
             W = whitening_matrix = WS = L = U_s = L_s = L_s_sqrt = D = None
             del W, whitening_matrix, WS, L, U_s, L_s, L_s_sqrt, D
-            torch.cuda.empty_cache()
 
         # Allocate compression ratios to each layer based on score metric
         ratio_map = allocate_ratios(group_criterion, score_map, layers_str, ratio, group_patterns)
+        torch.cuda.empty_cache()
         steps_counter += 1
+        ram_usage("After performing scores calculation")
         vram_usage("After performing scores calculation")
     else:
         ratio_map = {k: ratio for k in layers_str}
@@ -458,17 +473,16 @@ def compress_svd_llm(
         
         if is_v2:
             if layers_str[i] in us_cache:
-                # Heterogeneous mode - get cached U_s and L_s from pass 1
-                U_s, L_s = (t.to(device) for t in us_cache.pop(layers_str[i]))
+                # heterogeneous-v2 path - get cached U_s and L_s from pass 1
+                U_s, L_s = (t.to(device, dtype=torch.float64) for t in us_cache.pop(layers_str[i]))
             else:
-                # Homogeneous mode - perform SVD on normalized whitening matrix (S = XX^T)
+                # homogeneous-v2 path - perform SVD on normalized whitening matrix (S = XX^T)
                 whitening_matrix = whitening_matrices[layers_str[i]].to(device, dtype=torch.float64)
                 U_s, L_s, _ = torch.linalg.svd(whitening_matrix, full_matrices=False)
 
                 # Free whitening matrix as soon as U_s and L_s_sqrt are ready
-                whitening_matrix = None
-                del whitening_matrix
-                torch.cuda.empty_cache()
+                whitening_matrix = whitening_matrices[layers_str[i]] = None
+                del whitening_matrix, whitening_matrices[layers_str[i]]
 
             # Auxiliary matrix - 1e-6 acts as a proper regularization due to normalization
             L_s_sqrt = torch.sqrt(L_s.clamp(min=0.0) + 1e-6)
@@ -481,13 +495,11 @@ def compress_svd_llm(
             # Free W as soon as D is ready
             W = None
             del W
-            torch.cuda.empty_cache()
 
             U_ws, L_ws, V_wsT = torch.linalg.svd(D, full_matrices=False)
             # Free D as soon as U_ws, L_ws and V_wsT are ready
             D = None
             del D
-            torch.cuda.empty_cache()
 
             # Calculate sqrt(L_s) and U_s inverse matrices
             # 1e-6 acts as a proper regularization due to normalization
@@ -497,7 +509,6 @@ def compress_svd_llm(
             # Free U_s and L_s
             U_s = L_s = L_s_sqrt = None
             del U_s, L_s, L_s_sqrt
-            torch.cuda.empty_cache()
 
             # Calculate final rank and truncate matrices
             rank = max(1, min(rank, L_ws.shape[0] - 1))
@@ -509,7 +520,6 @@ def compress_svd_llm(
             # Free full-rank matrices as soon as truncated slices are built
             U_ws = L_ws = V_wsT = L_s_sqrt_inv = None
             del U_ws, L_ws, V_wsT, L_s_sqrt_inv
-            torch.cuda.empty_cache()
 
             # Compute approximate weight matrix, split in two matrices
             L_ws_r_sqrt = torch.sqrt(L_ws_r)
@@ -537,15 +547,13 @@ def compress_svd_llm(
             # Perform SVD on W x S
             WS = torch.matmul(W, whitening_matrix)
             # Free whitening_matrix and W as soon as WS is ready
-            W = whitening_matrix = None
-            del W, whitening_matrix
-            torch.cuda.empty_cache()
+            W = whitening_matrix = whitening_matrices[layers_str[i]] = None
+            del W, whitening_matrix, whitening_matrices[layers_str[i]]
 
             U, L, VT = torch.linalg.svd(WS, full_matrices=False)
             # Free WS as soon as U, L and VT are ready
             WS = None
             del WS
-            torch.cuda.empty_cache()
 
             # Calculate final rank and truncate matrices
             rank = max(1, min(rank, L.shape[0] - 1))
@@ -556,7 +564,6 @@ def compress_svd_llm(
             # Free full-rank matrices as soon as truncated slices are built
             U = L = VT = whitening_matrix_inv = None
             del U, L, VT, whitening_matrix_inv
-            torch.cuda.empty_cache()
 
             # Compute approximate weight matrix, split in two matrices
             W_u = (U_r * L_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
@@ -580,13 +587,13 @@ def compress_svd_llm(
         setattr(layer, attr, van)
 
         # Free ram and vram from all leftover matrices
-        W_u = W_v = whitening_matrices[layers_str[i]] = None
-        del W_u, W_v, whitening_matrices[layers_str[i]]
-        torch.cuda.empty_cache()
+        W_u = W_v = None
+        del W_u, W_v
     for name, param in model.named_parameters():
         if 'W_v' in name or 'W_u' in name:
             print(f"{name}: dtype={param.dtype}, device={param.device}, norm={param.norm():.4f}")
             break  # just check the first one
+    ram_usage("After performing layer compression")
     vram_usage("After performing layer compression")
 
     if save_path:
@@ -606,7 +613,8 @@ def compress_svd_llm(
         compress_mlp_str = "_mlp" if compress_mlp else ""
         heterogeneous_str = "_het" if heterogeneous else ""
         group_criterion_str = ("_" + group_criterion) if heterogeneous else ""
-        score_metric_str = ("_" + score_metric) if heterogeneous else ""
+        score_metric_substr = score_metric.replace("|", "") if len(score_metric.split("|")) > 1 else score_metric
+        score_metric_str = ("_" + score_metric_substr) if heterogeneous else ""
         v2_str = "_v2" if is_v2 else ""
         torch.save({
             "state_dict": model.state_dict(),
@@ -626,8 +634,8 @@ def compress_svd_llm(
 
     us_cache.clear()
     del us_cache
-    gc.collect()
     torch.cuda.empty_cache()
+    gc.collect()
     return model, tokenizer
 
 def apply_lowrank(model, rank_map):

@@ -1,8 +1,11 @@
 import os
+import psutil
 import torch.nn as nn
 import torch
 import random
 import sys
+import re
+import resource
 from typing import Dict, Optional, List
 from tqdm import tqdm
 from enum import Enum
@@ -18,6 +21,24 @@ class GroupBy(str, Enum):
 class ScoreMetric(str, Enum):
     TRUNCATION="truncation"
     ENTROPY="entropy"
+    
+    @classmethod
+    def _missing_(cls, value):
+        if not isinstance(value, str):
+            return None
+            
+        if re.fullmatch(r"norm\|(\d+|inf|-inf)", value):
+            obj = str.__new__(cls, value)
+            obj._value_ = value
+            # Standardize the name (e.g., "norm|-inf" becomes "NORM_INF_NEG")
+            name = value.upper().replace("|", "_").replace("-", "NEG_")
+            obj._name_ = name
+            
+            # Cache it to ensure ScoreMetric("norm|2") is ScoreMetric("norm|2")
+            cls._value2member_map_[value] = obj
+            return obj
+            
+        return super()._missing_(value)
 
 class DtypeMap(Enum):
     float32= torch.float32
@@ -43,6 +64,23 @@ def vram_usage(msg=""):
     peak = torch.cuda.max_memory_allocated() / 1024**2
     torch.cuda.reset_peak_memory_stats()
     print(f"[VRAM] {msg} | allocated={alloc:.1f} MiB | reserved={reserved:.1f} MiB | peak={peak:.1f} MiB")
+
+def ram_usage(msg=""):
+    # Get current Process RAM
+    process = psutil.Process(os.getpid())
+    process_ram = process.memory_info().rss / 1024**2 
+    
+    # Get Peak Process RAM
+    # ru_maxrss gives the maximum resident set size used by the process.
+    peak_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_ram = peak_usage / 1024
+        
+    # Overall System RAM
+    sys_mem = psutil.virtual_memory()
+    sys_used = sys_mem.used / 1024**2
+    sys_total = sys_mem.total / 1024**2
+    
+    print(f"[RAM] {msg} | process={process_ram:.1f} MiB | peak={peak_ram:.1f} MiB | system={sys_used:.1f}/{sys_total:.1f} MiB")
 
 def concatenate_text(batch):
         if "instruction" in batch:
