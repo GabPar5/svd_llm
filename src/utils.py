@@ -243,6 +243,27 @@ def get_group(
             return group_name
     return None
 
+def load_whitening_data(
+        whitening_matrix_paths: Dict[str, str],
+        key: str,
+        device: str,
+        keep: bool = False
+) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+    """
+    Loads whitening data (either wm tensor or (U_s, L_s) tuple) from disk.
+    If keep=False, removes the path so it can't be loaded again.
+    """
+    fpath = whitening_matrix_paths.get(key) if keep else whitening_matrix_paths.pop(key)
+    data = torch.load(fpath, map_location="cpu", weights_only=True) # pyright: ignore[reportArgumentType]
+    
+    if isinstance(data, tuple):
+        # V2 path
+        U_s, L_s = data
+        return U_s.to(device, dtype=torch.float64), L_s.to(device, dtype=torch.float64)
+    else:
+        # V1 path
+        return data.to(device, dtype=torch.float64)
+
 @torch.no_grad()
 def ppl_eval(
         model,
@@ -251,7 +272,7 @@ def ppl_eval(
         subset: str = "wikitext-2-raw-v1",
         split: str = "test",
         eval_max_length: int = 2048,
-        batch_size: int = 8,
+        batch_size: int | str = "auto",
         device: str = "cuda"
 ) -> float:
     """
@@ -290,11 +311,17 @@ def ppl_eval(
           f"({total_tokens - num_chunks * eval_max_length} tokens discarded from the tail)")
 
     # --- Step 3: compute NLL for each chunk ---
+    batch_size_ppl = batch_size
+    if not isinstance(batch_size, int):
+        batch_size_ppl = 4 # Fallback if batch size was set to auto
+
     nlls = []
-    for i in tqdm(range(0, num_chunks, batch_size), desc="Evaluating perplexity..."):
-        batch = input_ids[i : i + batch_size].to(device)  # [B, model_seq_len]
+    for i in tqdm(range(0, num_chunks, batch_size_ppl), desc="Evaluating perplexity..."): # pyright: ignore[reportArgumentType]
+        batch = input_ids[i : i + batch_size_ppl].to(device)  # pyright: ignore[reportOperatorIssue] # [B, model_seq_len]
         output = model(batch, use_cache=False)
         lm_logits = output.logits  # [B, model_seq_len, vocab_size]
+        output = None
+        del output
 
         # Skip batches with non-finite logits — this matches the original's
         # `if torch.isfinite(lm_logits).all()` guard and protects against
@@ -307,6 +334,8 @@ def ppl_eval(
         # so we shift logits and labels by one position.
         shift_logits = lm_logits[:, :-1, :].contiguous()   # [B, seq_len-1, vocab]
         shift_labels = batch[:, 1:].contiguous()            # [B, seq_len-1]
+        lm_logits = batch = None
+        del lm_logits, batch
 
         # reduction="none" gives us one loss value per token, which we
         # accumulate across batches before taking the mean — this ensures
@@ -318,6 +347,8 @@ def ppl_eval(
             shift_labels.reshape(-1)
         )
         nlls.append(loss.cpu())
+        loss = shift_logits = shift_labels = None
+        del loss, shift_logits, shift_labels
 
     # --- Step 4: compute final perplexity ---
     # exp(mean NLL over all tokens) matches the original's

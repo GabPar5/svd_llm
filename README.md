@@ -36,7 +36,6 @@ Here's a list of all available possible arguments:
 - `--eval_batch_size`: Evaluation batch size (default = `8`)
 - `--eval_tasks`: Evaluation tasks, the pattern is "taskName1,taskName2,...,taskNameK|numShots" or "taskName1,taskName2,...,taskNameK|numShots1,numShots2,...,numShotsK" (default = `wikitext|0`)
 - `--eval_max_length`: Maximum context length for the LLM during evaluation (default = `4096`)
-- `--eval_temperature`: Evaluation temperature (default = `0.7`)
 - `--max_eval_tokens`: Maximum number of tokens to generate during evaluation (default = `256`)  
 
 Two example scripts that can be used for evaluation of original and compressed model are available too (`eval-original.sh` and `eval-compressed.sh`).  

@@ -58,7 +58,7 @@ if __name__ == "__main__":
         '--batch_size', 
         type=int, 
         default=2, 
-        help='Batch size for data preprocessing and forward pass'
+        help='Batch size for data preprocessing and calibration forward pass'
     )
     parser.add_argument(
         '--seed',
@@ -151,8 +151,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--eval_batch_size', 
-        type=int, 
-        default=8, 
+        type=str, 
+        default="auto", 
         help='Evaluation batch size'
     )
     parser.add_argument(
@@ -166,12 +166,6 @@ if __name__ == "__main__":
         type=int, 
         default=4096, 
         help='Maximum context length for the LLM during evaluation'
-    )
-    parser.add_argument(
-        '--eval_temperature', 
-        type=float, 
-        default=0.7,
-        help='Evaluation temperature (conditional sampling)'
     )
     parser.add_argument(
         '--max_eval_tokens', 
@@ -191,10 +185,11 @@ if __name__ == "__main__":
                      "/"
         model_name = args.model.replace("/", "_").replace("-", "_")
         
-        if "llama-7b" in args.model:
-            tokenizer = LlamaTokenizer.from_pretrained(args.model, trust_remote_code=True)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             dtype=args.dtype,
@@ -217,10 +212,11 @@ if __name__ == "__main__":
         model_name = args.compressed_model_path.split("/")[-1][:-3]
 
         # Load tokenizer
-        if "llama-7b" in args.model:
-            tokenizer = LlamaTokenizer.from_pretrained("/".join(args.compressed_model_path.split("/")[:-1]), trust_remote_code=True)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained("/".join(args.compressed_model_path.split("/")[:-1]), trust_remote_code=True)
+        tokenizer_path = "/".join(args.compressed_model_path.split("/")[:-1])
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
         # Load model config from HF and instantiate base model
         config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
@@ -349,13 +345,13 @@ if __name__ == "__main__":
         print(f"[DEBUG] List of evaluation tasks: {tasks_list}")
         print(f"[DEBUG] Tasks dictionaries: {tasks_dict}")
         print(f"[DEBUG] HF model context length: {model.config.max_position_embeddings}")
-        print(f"[DEBUG] Evaluation context length: {args.eval_max_length}")
 
         # Clamp max model context
         max_length = min(
             args.eval_max_length,
-            model.config.max_position_embeddings
+            model.config.max_position_embeddings - args.max_eval_tokens
         )
+        print(f"[DEBUG] Evaluation context length: {max_length}")
 
         results = {}
         wikitext_ppl = None
@@ -371,6 +367,8 @@ if __name__ == "__main__":
                 batch_size=args.eval_batch_size,
                 device=args.device
             )
+            torch.cuda.empty_cache()
+            gc.collect()
         if "c4" in tasks_list:
             # TODO c4 task
             c4_ppl = ppl_eval(
@@ -383,13 +381,20 @@ if __name__ == "__main__":
                 batch_size=args.eval_batch_size,
                 device=args.device
             )
+            torch.cuda.empty_cache()
+            gc.collect()
 
         if tasks_dict is not None and len(tasks_dict) > 0:
+            model.config.use_cache = True
+            #model.generation_config.max_new_tokens = args.max_eval_tokens
+            model.generation_config.max_length = args.max_eval_tokens # pyright: ignore[reportOptionalMemberAccess]
+            model.generation_config.max_new_tokens = args.max_eval_tokens # pyright: ignore[reportOptionalMemberAccess]
             # WARNING - PyRight reports lots of issues when dealing with lm-eval-harness 
             eval_model = HFLM(
                 pretrained=model, # pyright: ignore[reportCallIssue]
                 tokenizer = tokenizer, # pyright: ignore[reportCallIssue]
                 batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
+                max_batch_size=128, # pyright: ignore[reportCallIssue]
                 device = args.device, # pyright: ignore[reportCallIssue]
                 dtype = args.dtype, # pyright: ignore[reportCallIssue]
                 max_length = max_length # pyright: ignore[reportCallIssue]
@@ -404,14 +409,14 @@ if __name__ == "__main__":
                 model=eval_model, # pyright: ignore[reportCallIssue]
                 tasks=tasks_dict,  # type: ignore
                 batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
+                max_batch_size=128, # pyright: ignore[reportCallIssue]
                 device=args.device, # pyright: ignore[reportCallIssue]
                 use_cache=None, # pyright: ignore[reportCallIssue]
                 log_samples=False, # pyright: ignore[reportCallIssue]
+                fewshot_as_multiturn=False, # pyright: ignore[reportCallIssue]
                 gen_kwargs={ # pyright: ignore[reportCallIssue]
-                    "temperature": args.eval_temperature,
                     "do_sample": args.eval_sampling,
-                    "max_gen_toks": args.max_eval_tokens,
-                    "max_new_tokens": args.max_eval_tokens
+                    "max_gen_toks": args.max_eval_tokens
                 },
                 apply_chat_template=False,
                 random_seed=args.seed, # pyright: ignore[reportCallIssue]
