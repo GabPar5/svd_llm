@@ -5,12 +5,15 @@ import gc
 import json
 import torch
 import lm_eval
+import multiprocessing as mp
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import setup_logging, handle_non_serializable
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -85,6 +88,20 @@ if __name__ == "__main__":
         help='Local path to load the whitening matrices'
     )
     parser.add_argument(
+        "--whitening_only", 
+        action="store_true"
+    )
+    parser.add_argument(
+        "--whitening_start_layer", 
+        type=int, 
+        default=0
+    )
+    parser.add_argument(
+        "--whitening_end_layer", 
+        type=int, 
+        default=None
+    )
+    parser.add_argument(
         '--use_compressed', 
         action='store_true', 
         help='Use compressed model for evaluation'
@@ -114,6 +131,18 @@ if __name__ == "__main__":
         '--het', 
         action='store_true', 
         help='Assign heterogeneous compression ratio'
+    )
+    parser.add_argument(
+        '--bypass_early_layers', 
+        type=int, 
+        default=2, 
+        help='Number of starting layers which bypass heterogeneous compression (or compression at all)'
+    )
+    parser.add_argument(
+        '--bypass_ratio', 
+        type=float, 
+        default=0.0, 
+        help='Compression ratio for the bypassed layers'
     )
     parser.add_argument(
         '--group_criterion', 
@@ -253,6 +282,7 @@ if __name__ == "__main__":
         score_metric_substr = args.score_metric.replace("|", "") if len(args.score_metric.split("|")) > 1 else args.score_metric
         score_metric_str = ("_" + score_metric_substr) if args.het else ""
         v2_str = "_v2" if args.run_v2 else ""
+        bypassed_layers_str = "_" + str(args.bypass_early_layers) if args.bypass_early_layers >= 0 else ""
         model_name = args.model.replace("/", "_").replace("-", "_") + \
                      compress_att_qkv_str + \
                      compress_att_out_str + \
@@ -262,6 +292,7 @@ if __name__ == "__main__":
                      heterogeneous_str + \
                      group_criterion_str + \
                      score_metric_str + \
+                     bypassed_layers_str + \
                      v2_str
 
         dataset_name = args.calibration_dataset.split(":")[0]
@@ -305,7 +336,12 @@ if __name__ == "__main__":
             heterogeneous = args.het,
             group_criterion = args.group_criterion,
             group_patterns = group_patterns_dict,
-            hf_token = args.hf_token
+            hf_token = args.hf_token,
+            whitening_only = args.whitening_only,
+            whitening_start_layer = args.whitening_start_layer,
+            whitening_end_layer = args.whitening_end_layer,
+            bypass_early_layers = args.bypass_early_layers,
+            bypass_ratio = args.bypass_ratio
         )
         model=model.to(args.device, dtype=DtypeMap.get_dtype(args.dtype))
         print(model)

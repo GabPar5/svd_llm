@@ -1,4 +1,5 @@
 import os
+import gc
 import psutil
 import torch.nn as nn
 import torch
@@ -12,6 +13,8 @@ from enum import Enum
 from datasets import load_dataset, load_from_disk, Dataset
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
+# Threshold above which cuSOLVER 32-bit indexing overflows
+SOLVER_GPU_MAX_DIM = 32000
 
 class GroupBy(str, Enum):
     GLOBAL="global"
@@ -57,6 +60,12 @@ class DtypeMap(Enum):
         else:
             raise TypeError(f"{type(_v).__name__}")
         
+def cuda_cleanup():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    gc.collect()
+
 def vram_usage(msg=""):
     torch.cuda.synchronize()
     alloc = torch.cuda.memory_allocated() / 1024**2
@@ -242,6 +251,118 @@ def get_group(
         if any(layer_path.endswith(p) for p in patterns):
             return group_name
     return None
+
+def get_submodule(root, path):
+    obj = root
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+def make_captured_meta(captured: List[Dict]) -> List[Dict]:
+        """
+        Store only reusable metadata, not the layer input tensor itself.
+        """
+        meta = []
+
+        for entry in captured:
+            meta.append({
+                "inp": None,
+                "attention_mask": entry.get("attention_mask", None),
+                "position_ids": entry.get("position_ids", None),
+                "position_embeddings": entry.get("position_embeddings", None),
+            })
+
+        return meta
+
+def save_activation_checkpoint(act_ckpt_dir: str, model_name: str, version_str: str, n_tokens: int, layer_idx: int, inps: List[torch.Tensor], captured: List[Dict]) -> str:
+        """
+        Saves CPU activations that are inputs to decoder layer `layer_idx`.
+        """
+        path_tmp = os.path.join(act_ckpt_dir, f"inputs_to_layer_{layer_idx}.pt") + ".tmp"
+        path_final = os.path.join(act_ckpt_dir, f"inputs_to_layer_{layer_idx}.pt")
+
+        cpu_inps = []
+        for x in inps:
+            if x is None:
+                raise RuntimeError(f"Cannot save activation checkpoint for layer {layer_idx}: found None input.")
+            cpu_inps.append(x.detach().cpu())
+
+        payload = {
+            "model_name": model_name,
+            "version": version_str,
+            "activation_layer": layer_idx,
+            "num_batches": len(cpu_inps),
+            "n_tokens": n_tokens,
+            "inps": cpu_inps,
+            "captured_meta": make_captured_meta(captured),
+        }
+
+        torch.save(payload, path_tmp)
+        os.replace(path_tmp, path_final)
+
+        print(f"[ACT-CKPT] Saved inputs to layer {layer_idx}: {path_final}")
+
+        del payload, cpu_inps
+        gc.collect()
+
+        return path_final
+
+def try_load_activation_checkpoint(act_ckpt_dir: str, model_name: str, version_str: str, n_tokens: int, layer_idx: int):
+        """
+        Returns:
+            loaded: bool
+            inps: List[Tensor] or None
+            captured: List[Dict] or None
+            path: str or None
+        """
+        path = os.path.join(act_ckpt_dir, f"inputs_to_layer_{layer_idx}.pt")
+
+        if layer_idx == 0:
+            return False, None, None, None
+
+        if not os.path.exists(path):
+            print(f"[ACT-CKPT] No checkpoint found for inputs to layer {layer_idx}: {path}")
+            return False, None, None, None
+
+        print(f"[ACT-CKPT] Loading inputs to layer {layer_idx}: {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        if payload.get("model_name") != model_name:
+            print("[ACT-CKPT][WARNING] Checkpoint model_name mismatch. Ignoring checkpoint.")
+            del payload
+            gc.collect()
+            return False, None, None, None
+
+        if payload.get("version") != version_str:
+            print("[ACT-CKPT][WARNING] Checkpoint version mismatch. Ignoring checkpoint.")
+            del payload
+            gc.collect()
+            return False, None, None, None
+        
+        if int(payload.get("n_tokens", -1)) != int(n_tokens):
+            print("[ACT-CKPT][WARNING] Checkpoint n_tokens mismatch. Ignoring checkpoint.")
+            del payload
+            gc.collect()
+            return False, None, None, None
+
+        if int(payload.get("activation_layer", -1)) != layer_idx:
+            print("[ACT-CKPT][WARNING] Checkpoint activation_layer mismatch. Ignoring checkpoint.")
+            del payload
+            gc.collect()
+            return False, None, None, None
+
+        inps = payload["inps"]
+        captured_meta = payload["captured_meta"]
+
+        if len(inps) != len(captured_meta):
+            print("[ACT-CKPT][WARNING] Checkpoint batch count mismatch. Ignoring checkpoint.")
+            del payload
+            gc.collect()
+            return False, None, None, None
+
+        print(f"[ACT-CKPT] Loaded {len(inps)} activation batches for layer {layer_idx}")
+
+        return True, inps, captured_meta, path
 
 def load_whitening_data(
         whitening_matrix_paths: Dict[str, str],
