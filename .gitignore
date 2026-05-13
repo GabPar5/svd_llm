@@ -1,6 +1,9 @@
 # Github token
 github_token.txt
 
+# Args folder
+args/
+
 # Output folder
 output/
 
