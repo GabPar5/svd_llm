@@ -201,6 +201,7 @@ def get_whitening_matrices(
                     "inp": inp.detach().cpu(),
                     "attention_mask": kwargs.get("attention_mask", None),
                     "position_ids": kwargs.get("position_ids", None),
+                    "cache_position": kwargs.get("cache_position", None),
                     "position_embeddings": (
                         pe[0].detach().cpu(),
                         pe[1].detach().cpu(),
@@ -214,6 +215,9 @@ def get_whitening_matrices(
 
                 if entry["position_ids"] is not None:
                     entry["position_ids"] = entry["position_ids"].detach().cpu()
+
+                if entry["cache_position"] is not None:
+                    entry["cache_position"] = entry["cache_position"].detach().cpu()
 
                 raise ValueError
 
@@ -229,7 +233,7 @@ def get_whitening_matrices(
                         for k, v in batch.items()
                         if k in ("input_ids", "attention_mask")
                     }
-                    model(**batch)
+                    model(**batch, use_cache=False)
                 except ValueError:
                     pass
                 finally:
@@ -312,6 +316,9 @@ def get_whitening_matrices(
                 if entry["position_ids"] is not None:
                     kwargs["position_ids"] = entry["position_ids"].to(device)
 
+                if entry.get("cache_position", None) is not None:
+                    kwargs["cache_position"] = entry["cache_position"].to(device)
+
                 if entry["position_embeddings"] is not None:
                     cos, sin = entry["position_embeddings"]
                     kwargs["position_embeddings"] = (
@@ -319,7 +326,7 @@ def get_whitening_matrices(
                         sin.to(device),
                     )
 
-                out = layer(inp_j, **kwargs)
+                out = layer(inp_j,  use_cache=False, **kwargs)
                 outs[j] = (out[0] if isinstance(out, tuple) else out).detach().cpu()
 
                 del inp_j, out, kwargs
@@ -516,15 +523,17 @@ def get_whitening_matrices(
     )
 
     return whitening_matrices_paths
-
+ 
 def allocate_ratios(
         group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]],
         score_map: Dict,
         layers_str: List[str],
         target_ratio: float,
+        param_count_map: Dict[str, int],
         group_patterns: Dict[str, List[str]] | None = None,
         bypass_early_layers: int = 2,
-        bypass_ratio: float = 0.0
+        bypass_ratio: float = 0.0,
+        max_ratio: float = 0.9,
 ) -> Dict[str, float]:
     """
     Redistributes compression budget within each weight group.
@@ -539,8 +548,10 @@ def allocate_ratios(
     In case some layers are bypassed, it still preserves
     the global target_ratio across the entire model, 
     giving a higher compression ratio to allowed layers.
+
+    For same-shape TYPE groups, this reduces to the usual V2 behavior.
+    For GLOBAL and DECODER groups, this preserves actual removed parameters.
     """
-    # Coerce to enum
     if isinstance(group_criterion, str):
         try:
             group_criterion = GroupBy(group_criterion)
@@ -549,75 +560,86 @@ def allocate_ratios(
                 f"Invalid `group_criterion`: '{group_criterion}'. "
                 f"Expected one of: {[e.value for e in GroupBy]}"
             )
-        
-    print(f"\n[BUDGET] Initializing redistribution using strategy: {group_criterion.value.upper()}")
-    print(f"[BUDGET] Bypassing first {bypass_early_layers} layers (assigning custom bypass_ratio: {bypass_ratio:.4f})")
 
-    # Group weight matrices by desired criterion
-    groups = defaultdict(list)
-    unmatched_keys = []
+    print(f"\n[BUDGET] Parameter-aware redistribution: {group_criterion.value.upper()}")
+    print(f"[BUDGET] Global target ratio: {target_ratio:.6f}")
+    print(f"[BUDGET] Bypassing first {bypass_early_layers} layers with ratio {bypass_ratio:.6f}")
+
+    ratio_map: Dict[str, float] = {}
+
+    total_params = sum(param_count_map[k] for k in layers_str)
+    target_removed = target_ratio * total_params
+
+    bypassed_keys = [
+        k for k in layers_str
+        if is_bypassed_key(k, bypass_early_layers)
+    ]
+
+    active_keys = [
+        k for k in layers_str
+        if not is_bypassed_key(k, bypass_early_layers)
+    ]
+
+    bypassed_removed = 0.0
+    for k in bypassed_keys:
+        ratio_map[k] = bypass_ratio
+        bypassed_removed += param_count_map[k] * bypass_ratio
+
+    active_params = sum(param_count_map[k] for k in active_keys)
+    active_budget = target_removed - bypassed_removed
+    active_capacity = active_params * max_ratio
+
+    if active_budget < 0:
+        print(
+            f"[BUDGET][WARNING] Bypass budget exceeds target. "
+            f"active_budget={active_budget:.2f}; setting active budget to 0."
+        )
+        active_budget = 0.0
+
+    if active_budget > active_capacity:
+        print(
+            f"[BUDGET][WARNING] Active budget exceeds max capacity. "
+            f"requested={active_budget:.2f}, capacity={active_capacity:.2f}. Clamping."
+        )
+        active_budget = active_capacity
+
+    active_target_ratio = active_budget / active_params if active_params > 0 else 0.0
+
+    print(f"[BUDGET] Total selected params:    {total_params:,}")
+    print(f"[BUDGET] Target removed params:   {target_removed:,.0f}")
+    print(f"[BUDGET] Bypassed matrices:       {len(bypassed_keys)}")
+    print(f"[BUDGET] Bypassed removed params: {bypassed_removed:,.0f}")
+    print(f"[BUDGET] Active matrices:         {len(active_keys)}")
+    print(f"[BUDGET] Active params:           {active_params:,}")
+    print(f"[BUDGET] Active budget:           {active_budget:,.0f}")
+    print(f"[BUDGET] Active target ratio:     {active_target_ratio:.6f}")
+
+    groups: Dict[str, List[str]] = defaultdict(list)
     missing_score_keys = []
-    ratio_map = {}
-
-    # Filter and bypass early layers
-    total_matrices = len(layers_str)
-    active_layers = []
-    bypassed_count = 0
-    
-    for key in layers_str:
-        match = re.search(r'\.layers\.(\d+)\.', key)
-        layer_idx = int(match.group(1)) if match else -1
-
-        if 0 <= layer_idx < bypass_early_layers:
-            ratio_map[key] = bypass_ratio
-            bypassed_count += 1
-        else:
-            active_layers.append(key)
-
-    active_count = len(active_layers)
-
-    # Calculate dynamic adjusted compression ratio
-    if active_count > 0:
-        # Shift the target ratio for the remaining active layers to preserve the global target
-        adjusted_target_ratio = ((total_matrices * target_ratio) - (bypassed_count * bypass_ratio)) / active_count
-        
-        # Guard against impossible mathematical boundaries
-        if adjusted_target_ratio < 0.0 or adjusted_target_ratio > 1.0:
-            print(f"[BUDGET][WARNING] Mathematical boundary exceeded! Adjusted target ratio for active layers is {adjusted_target_ratio:.4f}.")
-            adjusted_target_ratio = max(1e-2, min(adjusted_target_ratio, 0.9))
-            print(f"[BUDGET][WARNING] Clamped adjusted target ratio to {adjusted_target_ratio:.4f}")
-    else:
-        adjusted_target_ratio = target_ratio
-
-    print(f"[BUDGET] Total Matrices: {total_matrices} | Global Target Ratio: {target_ratio:.4f}")
-    print(f"[BUDGET] Bypassed Matrices: {bypassed_count} (Ratio: {bypass_ratio:.4f})")
-    print(f"[BUDGET] Active Matrices: {active_count} | Adjusted Target Ratio: {adjusted_target_ratio:.4f}")
+    unmatched_keys = []
 
     match group_criterion:
         case GroupBy.GLOBAL:
-            # Filter keys that have score data
-            valid_keys = []
-            for k in layers_str:
-                if k in score_map: valid_keys.append(k)
-                else: missing_score_keys.append(k)
-            # All weight matrices in a single bucket named "global"
-            groups["global"] = valid_keys
+            for key in active_keys:
+                if key in score_map:
+                    groups["global"].append(key)
+                else:
+                    missing_score_keys.append(key)
 
         case GroupBy.DECODER:
-            # Group by layer index (e.g., "layers.5")
-            # This regex looks for digits surrounded by dots or at the start/end
-            for key in layers_str:
+            for key in active_keys:
                 if key not in score_map:
                     missing_score_keys.append(key)
                     continue
-                match = re.search(r'\.layers\.(\d+)\.', key)
-                layer_idx = match.group(1) if match else "remainder"
+
+                layer_idx = get_layer_idx_from_key(key)
                 groups[f"layer_{layer_idx}"].append(key)
 
         case GroupBy.TYPE:
             if group_patterns is None:
                 raise ValueError("`group_patterns` required for GroupBy.TYPE")
-            for key in layers_str:
+
+            for key in active_keys:
                 if key not in score_map:
                     missing_score_keys.append(key)
                     continue
@@ -628,66 +650,90 @@ def allocate_ratios(
                         group_name = name
                         break
 
-                if group_name is not None:
-                    groups[group_name].append(key)
-                else:
+                if group_name is None:
                     unmatched_keys.append(key)
+                else:
+                    groups[group_name].append(key)
 
-    # Redistribute budget within each group
+    grouped_keys = set()
+    for keys in groups.values():
+        grouped_keys.update(keys)
+
+    fallback_keys = [k for k in active_keys if k not in grouped_keys]
+
+    # Fallback keys get the active target ratio.
+    fallback_removed = 0.0
+    for k in fallback_keys:
+        ratio_map[k] = active_target_ratio
+        fallback_removed += param_count_map[k] * active_target_ratio
+
+    remaining_budget = max(0.0, active_budget - fallback_removed)
+    grouped_params = sum(param_count_map[k] for k in grouped_keys)
+
+    print(f"[BUDGET] Grouped active params:    {grouped_params:,}")
+    print(f"[BUDGET] Fallback keys:            {len(fallback_keys)}")
+    print(f"[BUDGET] Remaining group budget:   {remaining_budget:,.0f}")
+
     for group_name, keys in groups.items():
         if not keys:
-            print(f"[WARNING] Group {group_name} is empty")
+            print(f"  [GROUP: {group_name}] Empty")
             continue
 
-        # Get scores within the group
-        scores = torch.tensor(
-            [score_map[k] for k in keys],
-            dtype=torch.float64
+        group_params = sum(param_count_map[k] for k in keys)
+
+        # Allocate the global active budget to groups proportional to params.
+        group_budget = (
+            remaining_budget * group_params / grouped_params
+            if grouped_params > 0
+            else 0.0
         )
 
-        if len(keys) == 1:
-            # Single-member group: no redistribution possible
-            print(f"  [GROUP: {group_name}] Single member detected. Assigning target_ratio {target_ratio:.4f} to {keys[0]}")
-            ratio_map[keys[0]] = adjusted_target_ratio
-            continue
+        group_ratio_map = allocate_param_weighted_group(
+            keys=keys,
+            score_map=score_map,
+            param_count_map=param_count_map,
+            group_budget=group_budget,
+            max_ratio=max_ratio,
+            offset=1.5
+        )
 
-        # Inverse-log normalization:
-        #   high score  -> 1/log(scores) is small -> less compression (matrix is information-dense)
-        #   low score   -> 1/log(scores) is large -> more compression (matrix is redundant)
-        log_scores = torch.log(scores)
-        inv_log_scores = 1.0 / log_scores
-        normalized = inv_log_scores / inv_log_scores.sum()
+        ratio_map.update(group_ratio_map)
 
-        # Scale so that the mean ratio across the group equals `target_ratio`,
-        # preserving the global memory budget
-        ratios = inv_log_scores.shape[0] * adjusted_target_ratio * normalized
+        actual_group_removed = sum(
+            param_count_map[k] * ratio_map[k]
+            for k in keys
+        )
 
-        print(f"  [GROUP: {group_name}] Redistributing over {len(keys)} layers (Mean target: {adjusted_target_ratio:.4f}):")
-        for key, r in zip(keys, ratios.tolist()):
-            # Clamp ratio to (0, 1) as a safety measure before refinement
-            ratio_map[key] = max(1e-2, min(r, 0.9))
-            print(f"    - {key:<50} | Ratio: {ratio_map[key]:.4f} | Score: {score_map[key]:.6f}")
+        print(
+            f"  [GROUP: {group_name}] "
+            f"matrices={len(keys):>3} | "
+            f"params={group_params:>14,} | "
+            f"budget={group_budget:>14,.0f} | "
+            f"actual_removed≈{actual_group_removed:>14,.0f}"
+        )
 
-    # Fallback for any unmatched layers
-    final_fallbacks = []
-    for key in active_layers:
-        if key not in ratio_map:
-            ratio_map[key] = adjusted_target_ratio
-            # Identify the reason for the fallback
-            reason = "Missing score data" if key in missing_score_keys else "No pattern match"
-            final_fallbacks.append((key, reason))
+        for k in keys:
+            print(
+                f"    - {k:<55} "
+                f"| params={param_count_map[k]:>12,} "
+                f"| ratio={ratio_map[k]:.6f} "
+                f"| score={score_map[k]:.6f}"
+            )
 
-    # --- Summary Report ---
-    print(f"\n[BUDGET] Allocation Summary:")
-    print(f"  - Protected Early Layers:           {bypassed_count} matrices (Fixed Ratio: {bypass_ratio:.4f})")
-    print(f"  - Successfully Redistributed:       {len(ratio_map) - bypassed_count - len(final_fallbacks)} matrices (Mean Ratio: {adjusted_target_ratio:.4f})")
-    print(f"  - Fallback (assigned adj_ratio):    {len(final_fallbacks)} matrices")
-    if final_fallbacks:
-        print(f"[BUDGET] Fallback Details:")
-        for key, reason in final_fallbacks:
-            print(f"  - {key:<50} | Reason: {reason}")
+    actual_removed = sum(
+        param_count_map[k] * ratio_map.get(k, 0.0)
+        for k in layers_str
+    )
 
+    print("\n[BUDGET] Allocation Summary:")
+    print(f"  - Target ratio:         {target_ratio:.6f}")
+    print(f"  - Actual ratio approx:  {actual_removed / total_params:.6f}")
+    print(f"  - Target removed:       {target_removed:,.0f}")
+    print(f"  - Actual removed:       {actual_removed:,.0f}")
+    print(f"  - Missing score keys:   {len(missing_score_keys)}")
+    print(f"  - Unmatched keys:       {len(unmatched_keys)}")
     print("-" * 80 + "\n")
+
     return ratio_map
 
 # Compress model with SVD-LLM
@@ -704,7 +750,9 @@ def compress_svd_llm(
         save_path: Optional[str] = None,
         whitening_mat_path: Optional[str] = None,
         compress_mlp: bool = False,
-        compress_att_qkv: bool = False,
+        compress_att_q: bool = False,
+        compress_att_k: bool = False,
+        compress_att_v: bool = False,
         compress_att_out: bool = False,
         score_metric: Union[ScoreMetric, Literal["truncation", "entropy", "norm|p"]] = "truncation",
         heterogeneous: bool = False,
@@ -735,7 +783,8 @@ def compress_svd_llm(
     ram_usage("After loading original model")
     vram_usage("After loading original model")
     # Avoid warning
-    model.generation_config.pad_token_id = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
+    eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
+    model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
     model.eval()
     model.config.use_cache = False
 
@@ -770,11 +819,21 @@ def compress_svd_llm(
     # Get list of layers of interest
     layers_str = generate_paths(
         compress_mlp, 
-        compress_att_qkv, 
+        compress_att_q,
+        compress_att_k,
+        compress_att_v,
         compress_att_out, 
         layers_number=model.config.num_hidden_layers
     )
     layers_list, attributes = get_layers(model, layers_str, True)
+
+    # Build parameters count map
+    param_count_map = build_param_count_map(
+        layers_str=layers_str,
+        layers_list=layers_list,
+        attributes=attributes,
+        include_bias=False,
+    )
 
     # Compute/load whitening matrices for each layer
     vram_usage("Before loading whitening matrices")
@@ -843,6 +902,15 @@ def compress_svd_llm(
 
         score_map = {}
         steps: int = 2
+        score_probe_ratio = compute_active_target_ratio(
+            layers_str=layers_str,
+            param_count_map=param_count_map,
+            target_ratio=ratio,
+            bypass_early_layers=bypass_early_layers,
+            bypass_ratio=bypass_ratio,
+            max_ratio=0.9,
+        )
+        print(f"[BUDGET] Score probe ratio for active layers: {score_probe_ratio:.6f}")
         for i, (layer, attr) in tqdm(
             enumerate(zip(layers_list, attributes)),
             total=len(layers_list),
@@ -862,11 +930,12 @@ def compress_svd_llm(
                 # Perform SVD on whitening matrix (S)
                 U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
 
-                # Auxiliary matrix - 1e-6 acts as a proper regularization due to normalization
-                L_s_sqrt = torch.sqrt(L_s + 1e-6)
+                # Auxiliary matrix
+                L_s_sqrt = torch.sqrt(torch.clamp(L_s, min=0.0))
 
                 # Perform SVD on W x U_s x sqrt(L_s)
-                D = torch.matmul(W, U_s * L_s_sqrt.unsqueeze(0))
+                D = torch.matmul(W, U_s)
+                D.mul_(L_s_sqrt.unsqueeze(0))
                 # Calculate svdvals only
                 L = torch.linalg.svdvals(D)
             else:
@@ -875,7 +944,10 @@ def compress_svd_llm(
                 L = torch.linalg.svdvals(WS)
 
             # Compute a tentative rank under the uniform target ratio.
-            rank = int((W.shape[0] * W.shape[1] * (1 - ratio)) / (W.shape[0] + W.shape[1]))
+            rank = int(
+                (W.shape[0] * W.shape[1] * (1.0 - score_probe_ratio))
+                / (W.shape[0] + W.shape[1])
+            )
             rank = max(1, min(rank, L.shape[0] - 1))
 
             # Multiply by sqrt(n_tokens) to recover the unnormalized singular values.
@@ -891,9 +963,6 @@ def compress_svd_llm(
                     # After whitening, entropy loss equals the sum of normalized singular values of the tail
                     norm_spectrum = L/L.sum()
                     raw_entropy = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:] + 1e-9)).sum().item()
-
-                    # Shift the score to guarantee it is strictly > 1.0 before ratio allocation. Adding 1.5 provides a safe buffer away from the log(1) cliff.
-                    score_map[layers_str[i]] = raw_entropy + 1.5
                 case s if s.startswith('norm'):
                     if s.split("|")[1].startswith("-"):
                         p_norm_value = -float(s.split("|")[1][1:])
@@ -910,38 +979,47 @@ def compress_svd_llm(
 
         # Allocate compression ratios to each layer based on score metric
         ratio_map = allocate_ratios(
-            group_criterion, score_map, layers_str, ratio,
-            group_patterns, bypass_early_layers, bypass_ratio
+            group_criterion=group_criterion,
+            score_map=score_map,
+            layers_str=layers_str,
+            target_ratio=ratio,
+            param_count_map=param_count_map,
+            group_patterns=group_patterns,
+            bypass_early_layers=bypass_early_layers,
+            bypass_ratio=bypass_ratio,
+            max_ratio=0.9,
         )
         torch.cuda.empty_cache()
         steps_counter += 1
         ram_usage("After performing scores calculation")
         vram_usage("After performing scores calculation")
     else:
-        # Replicate active ratio scaling for homogeneous path
-        total_matrices = len(layers_str)
-        bypassed_count = 0
-        for k in layers_str:
-            m = re.search(r'\.layers\.(\d+)\.', k)
-            if m and 0 <= int(m.group(1)) < bypass_early_layers:
-                bypassed_count += 1
+        active_target_ratio = compute_active_target_ratio(
+            layers_str=layers_str,
+            param_count_map=param_count_map,
+            target_ratio=ratio,
+            bypass_early_layers=bypass_early_layers,
+            bypass_ratio=bypass_ratio,
+        )
 
-        active_count = total_matrices - bypassed_count
-        
-        if active_count > 0:
-            adjusted_target_ratio = ((total_matrices * ratio) - (bypassed_count * bypass_ratio)) / active_count
-            adjusted_target_ratio = max(0.01, min(adjusted_target_ratio, 0.99))
-        else:
-            adjusted_target_ratio = ratio
-            
         ratio_map = {}
+
         for k in layers_str:
-            m = re.search(r'\.layers\.(\d+)\.', k)
-            layer_idx = int(m.group(1)) if m else -1
-            if 0 <= layer_idx < bypass_early_layers:
+            if is_bypassed_key(k, bypass_early_layers):
                 ratio_map[k] = bypass_ratio
             else:
-                ratio_map[k] = adjusted_target_ratio
+                ratio_map[k] = active_target_ratio
+
+        total_params = sum(param_count_map[k] for k in layers_str)
+        actual_removed = sum(param_count_map[k] * ratio_map[k] for k in layers_str)
+
+        print("\n[BUDGET] Homogeneous Allocation Summary:")
+        print(f"  - Target ratio:        {ratio:.6f}")
+        print(f"  - Active ratio:        {active_target_ratio:.6f}")
+        print(f"  - Actual ratio approx: {actual_removed / total_params:.6f}")
+        print(f"  - Target removed:      {ratio * total_params:,.0f}")
+        print(f"  - Actual removed:      {actual_removed:,.0f}")
+        print("-" * 80 + "\n")
 
     # Compress layers using the calculated compression ratios
     vram_usage("Before performing layer compression")
@@ -965,15 +1043,14 @@ def compress_svd_llm(
         if is_v2:
             # heterogeneous-v2 path - stream U_s and L_s calculated while generating the whitening matrices
             U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=False)
+            L_s_clean = torch.clamp(L_s, min=0.0)
 
-            # Auxiliary matrix - 1e-6 acts as a proper regularization due to normalization
-            L_s_sqrt = torch.sqrt(L_s + 1e-6)
+            # Auxiliary matrix
+            L_s_sqrt = torch.sqrt(L_s_clean)
 
             # Perform SVD on W x U_s x sqrt(L_s)
-            D = torch.matmul(
-                W, 
-                U_s * L_s_sqrt.unsqueeze(0)
-            )
+            D = torch.matmul(W, U_s)
+            D.mul_(L_s_sqrt.unsqueeze(0))
             # Free W as soon as D is ready
             W = None
             del W
@@ -984,8 +1061,13 @@ def compress_svd_llm(
             del D
 
             # Calculate sqrt(L_s) and U_s inverse matrices
-            # 1e-6 acts as a proper regularization due to normalization
-            L_s_sqrt_inv = (1.0 / (L_s_sqrt + 1e-6))
+            eig_max = float(L_s_clean.max())
+            tau = max(eig_max * 1e-12, 1e-30)
+            L_s_sqrt_inv = torch.where(
+                L_s_clean > tau,
+                torch.rsqrt(L_s_clean),
+                torch.zeros_like(L_s_clean),
+            )
             U_s_inv_L_s_sqrt_inv = (U_s * L_s_sqrt_inv.unsqueeze(0)).T
 
             # Free U_s and L_s
@@ -1004,7 +1086,7 @@ def compress_svd_llm(
             del U_ws, L_ws, V_wsT, L_s_sqrt_inv
 
             # Compute approximate weight matrix, split in two matrices
-            L_ws_r_sqrt = torch.sqrt(L_ws_r)
+            L_ws_r_sqrt = torch.sqrt(L_ws_r) # TODO add regularization here?
             W_u = (U_ws_r * L_ws_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
             W_v = torch.matmul(L_ws_r_sqrt.unsqueeze(1) * V_wsT_r, U_s_inv_L_s_sqrt_inv).cpu().to(layer_attr.weight.dtype)
             # Free low-rank matrices, leave only W_u and W_v
@@ -1041,7 +1123,7 @@ def compress_svd_llm(
             rank = max(1, min(rank, L.shape[0] - 1))
             rank_map[layers_str[i]] = rank
             U_r = U[:, :rank]
-            L_r_sqrt = torch.sqrt(L[:rank])
+            L_r_sqrt = torch.sqrt(L[:rank]) # TODO add regularization here too?
             VT_r = torch.matmul(VT[:rank, :], whitening_matrix_inv)
             # Free full-rank matrices as soon as truncated slices are built
             U = L = VT = whitening_matrix_inv = None
@@ -1060,11 +1142,12 @@ def compress_svd_llm(
             layer_attr.out_features,
             rank,
             layer_attr.bias is not None
-        )
-        van.W_u.weight.data = W_u
-        van.W_v.weight.data = W_v
-        if layer_attr.bias is not None:
-            van.W_u.bias.data = layer_attr.bias.data
+        ).to(device="cpu", dtype=layer_attr.weight.dtype)
+        with torch.no_grad():
+            van.W_u.weight.copy_(W_u)
+            van.W_v.weight.copy_(W_v)
+            if layer_attr.bias is not None:
+                van.W_u.bias.copy_(layer_attr.bias.detach().to(van.W_u.bias.dtype))
 
         setattr(layer, attr, van)
 
@@ -1090,10 +1173,12 @@ def compress_svd_llm(
         # Save tokenizer
         tokenizer.save_pretrained(save_path_model)
         # Save model weights
-        compress_att_qkv_str = "_qkv" if compress_att_qkv else ""
+        compress_att_q_str = "_q" if compress_att_q else ""
+        compress_att_k_str = "_k" if compress_att_k else ""
+        compress_att_v_str = "_v" if compress_att_v else ""
         compress_att_out_str = "_out" if compress_att_out else ""
         compress_mlp_str = "_mlp" if compress_mlp else ""
-        heterogeneous_str = "_het" if heterogeneous else ""
+        heterogeneous_str = "_het" if heterogeneous else "_hom"
         group_criterion_str = ("_" + group_criterion) if heterogeneous else ""
         score_metric_substr = score_metric.replace("|", "") if len(score_metric.split("|")) > 1 else score_metric
         score_metric_str = ("_" + score_metric_substr) if heterogeneous else ""
@@ -1104,7 +1189,9 @@ def compress_svd_llm(
             "rank_map": rank_map,
         }, save_path_model + 
            model_name.replace("/", "_").replace("-", "_") + 
-           compress_att_qkv_str + 
+           compress_att_q_str +
+           compress_att_k_str +
+           compress_att_v_str + 
            compress_att_out_str + 
            compress_mlp_str + "_" +
            str(round(ratio, 2)) +
@@ -1125,24 +1212,21 @@ def apply_lowrank(model, rank_map):
     Replace MLP linear layers with LowRank modules.
     rank_map: dict with keys like 'model.layers.0.mlp.down_proj', 'model.layers.0.mlp.gate_proj', etc.
     """
-
     for layer_name, rank in rank_map.items():
-        # Get the old layer
-        layer_path = layer_name.split('.')[:-1]
-        layer = model
-        for sub_layer in layer_path:
-            layer = getattr(layer, sub_layer)
+        layer_path = layer_name.split(".")[:-1]
+        attr_name = layer_name.split(".")[-1]
 
-        # Update the layer
-        attr_name = layer_name.split('.')[-1]
-        attr = getattr(layer, attr_name)
-        setattr(
-            layer,
-            attr_name,
-            LowRank(
-                in_features=attr.in_features,
-                out_features=attr.out_features,
-                rank=rank,
-                bias=attr.bias is not None
-            )
-        )
+        parent = model
+        for sub_layer in layer_path:
+            parent = getattr(parent, sub_layer)
+
+        old = getattr(parent, attr_name)
+
+        lowrank = LowRank(
+            in_features=old.in_features,
+            out_features=old.out_features,
+            rank=rank,
+            bias=old.bias is not None,
+        ).to(device=old.weight.device, dtype=old.weight.dtype)
+
+        setattr(parent, attr_name, lowrank)

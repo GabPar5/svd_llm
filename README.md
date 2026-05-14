@@ -13,7 +13,7 @@ Here's a list of all available possible arguments:
 - `--run_v2`: Run SVD-LLM V2 (default = `False`)
 - `--dtype`: Weights dtype for original and compressed models (default = `float32`)
 - `--compression_ratio`: Target compression ratio, 0.2 means removing about 20% of the params (default = `0.2`)
-- `--calibration_dataset`: Calibration dataset, format is "datasetNameOrPath:split" (default = `tatsu-lab/alpaca:train`)
+- `--calibration_dataset`: Calibration dataset, format is "datasetNameOrPath:split" (default = `EleutherAI/wikitext_document_level:wikitext-2-raw-v1:train`)
 - `--max_length`: Maximum context length for the LLM during compression (default = `2048`)
 - `--max_whitening_samples`: Number of calibration data samples used to calculate the whitening matrices. Please note that each sample is a concatenation of samples, until it reaches a length of `max_length` tokens (default = `256`)
 - `--batch_size`: Batch size for data preprocessing and forward pass (default = `2`)
