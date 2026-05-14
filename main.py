@@ -42,7 +42,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--calibration_dataset', 
         type=str, 
-        default='tatsu-lab/alpaca:train',
+        default='EleutherAI/wikitext_document_level:wikitext-2-raw-v1:train',
         help='Calibration dataset, format is "datasetNameOrPath:subset:split"'
     )
     parser.add_argument(
@@ -118,9 +118,19 @@ if __name__ == "__main__":
         help='Compress MLP weights'
     )
     parser.add_argument(
-        '--compress_att_qkv', 
+        '--compress_att_q', 
         action='store_true', 
-        help='Compress attention qkv projection matrices'
+        help='Compress attention query projection matrices'
+    )
+    parser.add_argument(
+        '--compress_att_k', 
+        action='store_true', 
+        help='Compress attention key projection matrices'
+    )
+    parser.add_argument(
+        '--compress_att_v', 
+        action='store_true', 
+        help='Compress attention value projection matrices'
     )
     parser.add_argument(
         '--compress_att_out', 
@@ -228,8 +238,8 @@ if __name__ == "__main__":
             trust_remote_code=True
         )
         # Avoid warning
-        model.generation_config.pad_token_id = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
-        print(model)
+        eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
+        model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
         vram_usage("After loading original model")
     elif args.compressed_model_path:
         print("DEBUG: Loading compressed model from disk...")
@@ -248,10 +258,11 @@ if __name__ == "__main__":
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
         # Load model config from HF and instantiate base model
-        config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(args.model, trust_remote_code=True, dtype=DtypeMap.get_dtype(args.dtype))
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, dtype=DtypeMap.get_dtype(args.dtype))
         # Avoid warning
-        model.generation_config.pad_token_id = model.generation_config.eos_token_id
+        eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
+        model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
 
         # Load checkpoint
         checkpoint = torch.load(args.compressed_model_path, map_location="cpu", weights_only=False)
@@ -259,12 +270,10 @@ if __name__ == "__main__":
 
         # Replace compressed layers with LowRank modules
         apply_lowrank(model, rank_map)
-        print(model)
 
         # Load weights
         model.load_state_dict(checkpoint["state_dict"], strict=True)
-        model=model.to(args.device, dtype=DtypeMap.get_dtype(args.dtype))
-        print(model)
+        model=model.to(args.device)
         del checkpoint, rank_map
         gc.collect()
         torch.cuda.empty_cache()
@@ -274,17 +283,21 @@ if __name__ == "__main__":
                      "/eval/" + \
                      args.model.replace("/", "_").replace("-", "_") + \
                      "/"
-        compress_att_qkv_str = "_qkv" if args.compress_att_qkv else ""
+        compress_att_q_str = "_q" if args.compress_att_q else ""
+        compress_att_k_str = "_k" if args.compress_att_k else ""
+        compress_att_v_str = "_v" if args.compress_att_v else ""
         compress_att_out_str = "_out" if args.compress_att_out else ""
         compress_mlp_str = "_mlp" if args.compress_mlp else ""
-        heterogeneous_str = "_het" if args.het else ""
+        heterogeneous_str = "_het" if args.het else "_hom"
         group_criterion_str = ("_" + args.group_criterion) if args.het else ""
         score_metric_substr = args.score_metric.replace("|", "") if len(args.score_metric.split("|")) > 1 else args.score_metric
         score_metric_str = ("_" + score_metric_substr) if args.het else ""
         v2_str = "_v2" if args.run_v2 else ""
         bypassed_layers_str = "_" + str(args.bypass_early_layers) if args.bypass_early_layers >= 0 else ""
         model_name = args.model.replace("/", "_").replace("-", "_") + \
-                     compress_att_qkv_str + \
+                     compress_att_q_str + \
+                     compress_att_k_str + \
+                     compress_att_v_str + \
                      compress_att_out_str + \
                      compress_mlp_str + \
                      "_" + \
@@ -330,7 +343,9 @@ if __name__ == "__main__":
             save_path = args.save_path,
             whitening_mat_path = args.whitening_mat_path,
             compress_mlp = args.compress_mlp,
-            compress_att_qkv = args.compress_att_qkv,
+            compress_att_q = args.compress_att_q,
+            compress_att_k = args.compress_att_k,
+            compress_att_v = args.compress_att_v,
             compress_att_out = args.compress_att_out,
             score_metric=args.score_metric,
             heterogeneous = args.het,
@@ -355,6 +370,8 @@ if __name__ == "__main__":
         # Set model into evaluation mode
         model.eval()
         model.config.use_cache = False
+        # Set tokenizer padding
+        tokenizer.padding_side = "left"
 
         # Setup logging level
         setup_logging("DEBUG") # pyright: ignore[reportArgumentType]

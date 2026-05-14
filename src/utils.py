@@ -211,16 +211,18 @@ def tokenize_dataset(
 
     return chunked.with_format("torch"), max_samples
 
-def generate_paths(mlp: bool, qkv: bool, attention_output: bool, layers_number: int) -> list[str]:
+def generate_paths(mlp: bool, q: bool, k: bool, v: bool, attention_output: bool, layers_number: int) -> list[str]:
     list_paths=[]
     if layers_number >= 0:
         if mlp:
             list_paths += [f'model.layers.{layers_number - 1 - i}.mlp.gate_proj' for i in range(layers_number)]
             list_paths += [f'model.layers.{layers_number - 1 - i}.mlp.up_proj' for i in range(layers_number)]
             list_paths += [f'model.layers.{layers_number - 1 - i}.mlp.down_proj' for i in range(layers_number)]
-        if qkv:
+        if q:
             list_paths += [f'model.layers.{layers_number - 1 - i}.self_attn.q_proj' for i in range(layers_number)]
+        if k:
             list_paths += [f'model.layers.{layers_number - 1 - i}.self_attn.k_proj' for i in range(layers_number)]
+        if v:
             list_paths += [f'model.layers.{layers_number - 1 - i}.self_attn.v_proj' for i in range(layers_number)]
         if attention_output:
             list_paths += [f'model.layers.{layers_number - 1 - i}.self_attn.o_proj' for i in range(layers_number)]
@@ -269,6 +271,7 @@ def make_captured_meta(captured: List[Dict]) -> List[Dict]:
                 "inp": None,
                 "attention_mask": entry.get("attention_mask", None),
                 "position_ids": entry.get("position_ids", None),
+                "cache_position": entry.get("cache_position", None),
                 "position_embeddings": entry.get("position_embeddings", None),
             })
 
@@ -384,6 +387,164 @@ def load_whitening_data(
     else:
         # V1 path
         return data.to(device, dtype=torch.float64)
+
+def get_layer_idx_from_key(key: str) -> int:
+    m = re.search(r"\.layers\.(\d+)\.", key)
+    return int(m.group(1)) if m else -1
+
+
+def is_bypassed_key(key: str, bypass_early_layers: int) -> bool:
+    idx = get_layer_idx_from_key(key)
+    return 0 <= idx < bypass_early_layers
+
+
+def build_param_count_map(
+    layers_str: List[str],
+    layers_list: List[nn.Module],
+    attributes: List[str],
+    include_bias: bool = False,
+) -> Dict[str, int]:
+    """
+    Counts parameters affected by compression.
+
+    Default include_bias=False because your low-rank ratio formula compresses
+    only weight params. Bias is preserved unchanged.
+    """
+    param_count_map = {}
+
+    for key, layer, attr in zip(layers_str, layers_list, attributes):
+        linear = getattr(layer, attr)
+        n = linear.weight.numel()
+
+        if include_bias and linear.bias is not None:
+            n += linear.bias.numel()
+
+        param_count_map[key] = int(n)
+
+    return param_count_map
+
+
+def compute_active_target_ratio(
+    layers_str: List[str],
+    param_count_map: Dict[str, int],
+    target_ratio: float,
+    bypass_early_layers: int,
+    bypass_ratio: float,
+    max_ratio: float = 0.9,
+) -> float:
+    total_params = sum(param_count_map[k] for k in layers_str)
+    target_removed = target_ratio * total_params
+
+    bypassed_removed = 0.0
+    active_params = 0
+
+    for k in layers_str:
+        p = param_count_map[k]
+        if is_bypassed_key(k, bypass_early_layers):
+            bypassed_removed += p * bypass_ratio
+        else:
+            active_params += p
+
+    if active_params <= 0:
+        return target_ratio
+
+    active_budget = target_removed - bypassed_removed
+    active_budget = max(0.0, min(active_budget, active_params * max_ratio))
+
+    return active_budget / active_params
+
+
+def _redundancy_from_scores(scores: torch.Tensor, offset: float = 1.5) -> torch.Tensor:
+    """
+    High truncation score = important / less redundant = lower compression.
+    Low truncation score = redundant = higher compression.
+
+    So redundancy weight is 1 / log(score).
+    """
+    scores = scores.to(torch.float64)
+    scores = torch.nan_to_num(
+        scores,
+        nan=1.0 + 1e-6,
+        posinf=1e30,
+        neginf=1.0 + 1e-6,
+    )
+    scores = torch.clamp(scores, min=0.0)
+
+    if offset <= 1.0:
+        raise ValueError("`offset` must be > 1.0")
+
+    # Shift the score to guarantee it is strictly > 1.0 before ratio allocation. Adding 1.5 provides a safe buffer away from the log(1) cliff.
+    weights = 1.0 / torch.log(scores + offset)
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if weights.sum() <= 0:
+        weights = torch.ones_like(weights)
+
+    return weights
+
+
+def allocate_param_weighted_group(
+    keys: List[str],
+    score_map: Dict[str, float],
+    param_count_map: Dict[str, int],
+    group_budget: float,
+    max_ratio: float = 0.9,
+    offset: float = 1.5
+) -> Dict[str, float]:
+    """
+    Allocates removal budget inside one group.
+
+    This preserves:
+        sum_i param_i * ratio_i = group_budget
+
+    instead of:
+        mean_i ratio_i = target_ratio
+    """
+    if not keys:
+        return {}
+
+    scores = torch.tensor([score_map[k] for k in keys], dtype=torch.float64)
+    weights = _redundancy_from_scores(scores, offset)
+
+    params = torch.tensor([param_count_map[k] for k in keys], dtype=torch.float64)
+
+    group_capacity = float((params * max_ratio).sum().item())
+    remaining_budget = max(0.0, min(float(group_budget), group_capacity))
+
+    ratios = torch.zeros(len(keys), dtype=torch.float64)
+    active = torch.ones(len(keys), dtype=torch.bool)
+
+    # Water-fill with per-matrix max_ratio cap.
+    while remaining_budget > 1e-6 and bool(active.any()):
+        idx = torch.nonzero(active, as_tuple=False).flatten()
+
+        p = params[idx]
+        w = weights[idx]
+
+        denom = (p * w).sum()
+
+        if denom <= 0:
+            w = torch.ones_like(w)
+            denom = (p * w).sum()
+
+        proposed = remaining_budget * w / denom
+        cap_left = max_ratio - ratios[idx]
+
+        clipped = proposed >= cap_left
+
+        if not bool(clipped.any()):
+            ratios[idx] += proposed
+            remaining_budget = 0.0
+            break
+
+        clipped_idx = idx[clipped]
+        spend = float((params[clipped_idx] * cap_left[clipped]).sum().item())
+
+        ratios[clipped_idx] = max_ratio
+        remaining_budget -= spend
+        active[clipped_idx] = False
+
+    return {k: float(r) for k, r in zip(keys, ratios.tolist())}
 
 @torch.no_grad()
 def ppl_eval(
