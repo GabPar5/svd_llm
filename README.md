@@ -1,43 +1,109 @@
 # svd_llm
-Implementation of svd_llm for Qwen-like models (tested on Qwen 2.5 only).  
-To compress, save and evaluate a model (for instance, Qwen 2.5 1.5B), you can run:
-```
-python main.py --model "Qwen/Qwen2.5-1.5B" --save_path "./output" --compress_mlp --compress_att_qkv --compress_att_out --compression_ratio 0.2 --batch_size 16 --max_whitening_samples 2048 --evaluate --eval_batch_size 16 --eval_tasks "wikitext|0"
-```
-You can also load an already compressed model for evaluation, so that you don't have to wait for another compression round:
-```
-python main.py --model "Qwen/Qwen2.5-1.5B" --save_path "./output" --compressed_model_path "./output/models/Qwen_Qwen2.5_1.5B/Qwen_Qwen2.5_1.5B_qkv_out_mlp_0.2_compressed.pt" --evaluate --eval_batch_size 16 --eval_tasks "wikitext|0"
-```
-Here's a list of all available possible arguments:  
-- `--model`: LLM to load from huggingface (default = `Qwen/Qwen2.5-1.5B`)
-- `--run_v2`: Run SVD-LLM V2 (default = `False`)
-- `--dtype`: Weights dtype for original and compressed models (default = `float32`)
-- `--compression_ratio`: Target compression ratio, 0.2 means removing about 20% of the params (default = `0.2`)
-- `--calibration_dataset`: Calibration dataset, format is "datasetNameOrPath:split" (default = `EleutherAI/wikitext_document_level:wikitext-2-raw-v1:train`)
-- `--max_length`: Maximum context length for the LLM during compression (default = `2048`)
-- `--max_whitening_samples`: Number of calibration data samples used to calculate the whitening matrices. Please note that each sample is a concatenation of samples, until it reaches a length of `max_length` tokens (default = `256`)
-- `--batch_size`: Batch size for data preprocessing and forward pass (default = `2`)
-- `--seed`: Seed used while sampling the calibration data (default = `6363`)
-- `--device`: Device used to load the model during forward pass and after compression (default = `cuda`)
-- `--save_path`: Base path to save the whitening matrices and the compressed model checkpoints (default = `None`)
-- `--whitening_mat_path`: Local path used to load the whitening matrices (default = `None`)
-- `--use_compressed`: Use compressed model for evaluation (default = `False`)
-- `--compressed_model_path`: Path to load an already compressed model (default = `None`)
-- `--compress_mlp`: Compress MLP weights (default = `False`)
-- `--compress_att_qkv`: Compress attention qkv projection matrices (default = `False`)
-- `--compress_att_out`: Compress attention output projection matrices (default = `False`)
-- `--het`: Assign heterogeneous compression ratio (default = `False`)
-- `--group_criterion`: Criterion used to group weight matrices in heterogeneous setting. Possible values are `type`, `global` and `decoder` (default = `type`)
-- `--group_patterns`: Groups used when grouping weight matrices by type, the pattern is "groupName1:weightType1,weightType2;groupName2:weightType1,weightType2;..." (default = `q_proj:self_attn.q_proj;k_proj:self_attn.k_proj;v_proj:self_attn.v_proj;o_proj:self_attn.o_proj;gate_proj:mlp.gate_proj;up_proj:mlp.up_proj;down_proj:mlp.down_proj`)
-- `--score_metric`: Score metric to use for weight importance during heterogeneous ratio allocation. Possible values are `truncation`, `entropy` and `norm|p`, where `p` must be an integer or float (default = `truncation`)
-- `--hf_token`: Huggingface token used to download/upload models (default = `None`)
-- `--evaluate`: Evaluate the model on a set of tasks (default = `False`)
-- `--eval_sampling`: Use conditional sampling during evaluation (default = `False`)
-- `--eval_batch_size`: Evaluation batch size (default = `8`)
-- `--eval_tasks`: Evaluation tasks, the pattern is "taskName1,taskName2,...,taskNameK|numShots" or "taskName1,taskName2,...,taskNameK|numShots1,numShots2,...,numShotsK" (default = `wikitext|0`)
-- `--eval_max_length`: Maximum context length for the LLM during evaluation (default = `4096`)
-- `--max_eval_tokens`: Maximum number of tokens to generate during evaluation (default = `256`)  
 
-Two example scripts that can be used for evaluation of original and compressed model are available too (`eval-original.sh` and `eval-compressed.sh`).  
+Implementation of **SVD-LLM** for Qwen-like models (tested primarily on Qwen 2.5 and LLama). This tool allows for post-training compression of Large Language Models using Singular Value Decomposition with whitening.
 
-**WARNING**: Please note that the current implementation is not the most efficient in terms of VRAM usage. Thus, be careful increasing the batch size.
+---
+
+## Quick Start
+
+### Compress and Evaluate
+
+To compress a model (e.g., Qwen 2.5 7B), save the results, and run an immediate evaluation:
+
+```bash
+python main.py \
+    --model "Qwen/Qwen2.5-7B" \
+    --save_path "./output" \
+    --compress_mlp \
+    --compress_att_q \
+    --compress_att_k \
+    --compress_att_v \
+    --compress_att_out \
+    --compression_ratio 0.2 \
+    --batch_size 16 \
+    --max_whitening_samples 2048 \
+    --evaluate \
+    --eval_batch_size "auto" \
+    --eval_tasks "wikitext|0"
+
+```
+
+### Evaluate a Compressed Model
+
+If you have already compressed a model and saved the `.pt` checkpoint, you can bypass the compression stage:
+
+```bash
+python main.py \
+    --model "Qwen/Qwen2.5-1.5B" \
+    --compressed_model_path "./output/models/compressed_model.pt" \
+    --evaluate \
+    --eval_batch_size "auto" \
+    --eval_tasks "wikitext|0"
+
+```
+
+---
+
+## Arguments Reference
+
+### Core Configuration
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--model` | `str` | `Qwen/Qwen2.5-1.5B` | HF model identifier. |
+| `--run_v2` | `flag` | `False` | Enable SVD-LLM V2. |
+| `--dtype` | `str` | `float32` | Weights datatype for original/compressed models. |
+| `--device` | `str` | `cuda` | Computing device. |
+| `--hf_token` | `str` | `None` | Hugging Face token for restricted models. |
+
+### Compression Settings
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--compression_ratio` | `float` | `0.2` | Target ratio (e.g., 0.2 removes ~20% of params). |
+| `--ratio_scope` | `str` | `selected` | `selected`: ratio applies to chosen modules; `all`: ratio applies to the whole model (if only a subset of modules was chosen, they will have a higher average compression ratio). |
+| `--compress_mlp` | `flag` | `False` | Compress MLP weights. |
+| `--compress_att_q` | `flag` | `False` | Compress Attention Query projection. |
+| `--compress_att_k` | `flag` | `False` | Compress Attention Key projection. |
+| `--compress_att_v` | `flag` | `False` | Compress Attention Value projection. |
+| `--compress_att_out` | `flag` | `False` | Compress Attention Output projection. |
+
+### Whitening & Calibration
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--calibration_dataset` | `str` | `EleutherAI/wikitext_document_level:wikitext-2-raw-v1:train` | Format: `dataset:subset:split`. |
+| `--max_length` | `int` | `2048` | Max context length during compression. |
+| `--max_whitening_samples` | `int` | `256` | Number of samples for whitening matrix calculation. |
+| `--batch_size` | `int` | `2` | Batch size for calibration forward pass. |
+| `--whitening_only` | `flag` | `False` | Only calculate and save whitening matrices. |
+| `--whitening_start_layer` | `int` | `0` | Start layer index for whitening. |
+| `--whitening_end_layer` | `int` | `None` | End layer index for whitening. |
+
+### Heterogeneous Compression
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--het` | `flag` | `False` | Enable heterogeneous compression ratio allocation. |
+| `--score_metric` | `str` | `truncation` | Metric for weight importance (`truncation`, `entropy`). |
+| `--group_criterion` | `str` | `type` | Grouping logic: `type`, `global`, or `decoder`. |
+| `--bypass_early_layers` | `int` | `2` | Number of initial layers to exempt from compression. |
+| `--bypass_ratio` | `float` | `0.0` | Compression ratio used for bypassed layers. |
+
+### Evaluation
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--evaluate` | `flag` | `False` | Run evaluation tasks after loading/compressing. |
+| `--eval_tasks` | `str` | `wikitext|0` | Task pattern: `task1,task2|shots`. |
+| `--eval_batch_size` | `str` | `auto` | Batch size for evaluation. |
+| `--eval_max_length` | `int` | `4096` | Max context length during evaluation. |
+| `--max_eval_tokens` | `int` | `256` | Max tokens to generate during eval. |
+
+---
+
+> [!TIP]
+> Use `generate_tables.py` to quickly generate latex/markdown tables with the evaluation results inside a folder.
+
+> [!TIP]
+> Use `generate_text.py` to quickly generate text with one or all models inside a directory (sequentially), using a predefined prompt. You can generate text with the original model too.
