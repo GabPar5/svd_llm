@@ -34,7 +34,7 @@ If you have already compressed a model and saved the `.pt` checkpoint, you can b
 
 ```bash
 python main.py \
-    --model "Qwen/Qwen2.5-1.5B" \
+    --model "Qwen/Qwen2.5-7B" \
     --compressed_model_path "./output/models/compressed_model.pt" \
     --evaluate \
     --eval_batch_size "auto" \
