@@ -86,6 +86,11 @@ SCHEME_TOKENS = {
     "homogeneous": "hom",
 }
 
+DENOMINATOR_TOKENS = {
+    "all": "all",
+    "selected": "selected",
+}
+
 PREFERRED_METRICS = [
     "acc_norm,none",
     "acc,none",
@@ -213,19 +218,23 @@ def parse_filename(path: Path) -> Dict[str, Any]:
     Original / uncompressed:
         Qwen_Qwen2.5_32B.json
 
-    Heterogeneous compression:
+    Heterogeneous compression with denominator token:
+        Qwen_Qwen2.5_32B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_8_v2.json
+        Qwen_Qwen2.5_32B_q_k_v_out_mlp_selected_0.2_het_decoder_truncation_8_v2.json
+
+    Homogeneous compression with denominator token:
+        huggyllama_llama_7b_q_k_v_out_mlp_all_0.2_hom_8_v2.json
+        huggyllama_llama_7b_q_k_v_out_mlp_selected_0.2_hom_8_v2.json
+
+    Older format without denominator token is also supported:
         Qwen_Qwen2.5_32B_q_k_v_out_mlp_0.2_het_decoder_truncation_8_v2.json
 
-    Homogeneous compression:
-        huggyllama_llama_7b_q_k_v_out_mlp_0.2_hom_8_v2.json
+    Meaning of denominator:
+        all:
+            the whole parameter count was used as denominator for the compression ratio.
 
-    Heterogeneous format:
-        model_matrices_ratio_het_grouping_scoring_bypass_version
-
-    Homogeneous format:
-        model_matrices_ratio_hom_bypass_version
-
-    In homogeneous compression, grouping and scoring are not present.
+        selected:
+            only the parameter count of the selected matrix types was used as denominator.
     """
 
     tokens = normalize_filename_stem(path)
@@ -234,10 +243,9 @@ def parse_filename(path: Path) -> Dict[str, Any]:
     if tokens and re.fullmatch(r"v\d+", tokens[-1]):
         version = tokens.pop()
 
-    # Original model case: no ratio, no matrix tokens, no compression metadata.
-    # Example: Qwen_Qwen2.5_32B.json
     has_ratio = any(is_float_token(tok) for tok in tokens)
 
+    # Original model case.
     if not has_ratio:
         model_name = "_".join(tokens)
         return {
@@ -245,6 +253,7 @@ def parse_filename(path: Path) -> Dict[str, Any]:
             "model": model_name,
             "is_original": True,
             "matrices": "none",
+            "compression_denominator": "original",
             "compression_ratio": 0.0,
             "scheme": "original",
             "grouping": "original",
@@ -283,7 +292,21 @@ def parse_filename(path: Path) -> Dict[str, Any]:
 
     model_name = "_".join(tokens[:model_end])
 
-    scheme = "unknown"
+    compression_denominator = "--"
+
+    # New format: denominator token appears after matrix tokens and before ratio.
+    # Example:
+    #   ..._q_k_v_out_mlp_all_0.2_...
+    #   ..._q_k_v_out_mlp_selected_0.2_...
+    if ratio_idx is not None and ratio_idx - 1 >= 0:
+        maybe_denominator = tokens[ratio_idx - 1]
+        if maybe_denominator in DENOMINATOR_TOKENS:
+            compression_denominator = DENOMINATOR_TOKENS[maybe_denominator]
+        # If it wasn't catched during compression, this case = "all" denominator always
+        if all(matrix in matrices for matrix in ["q","k","v","out","mlp"]):
+            compression_denominator = "all"
+
+    scheme = "--"
     scheme_idx = None
 
     for i, tok in enumerate(tokens):
@@ -298,7 +321,7 @@ def parse_filename(path: Path) -> Dict[str, Any]:
 
     if scheme == "het":
         # Heterogeneous format:
-        # ... ratio het grouping scoring bypass version
+        # ... matrices denominator ratio het grouping scoring bypass version
         for tok in tokens:
             if tok in GROUPING_TOKENS:
                 grouping = GROUPING_TOKENS[tok]
@@ -312,7 +335,7 @@ def parse_filename(path: Path) -> Dict[str, Any]:
 
     elif scheme == "hom":
         # Homogeneous format:
-        # ... ratio hom bypass version
+        # ... matrices denominator ratio hom bypass version
         grouping = "--"
         scoring = "--"
 
@@ -323,8 +346,8 @@ def parse_filename(path: Path) -> Dict[str, Any]:
 
     else:
         # Fallback for older or malformed names.
-        grouping = "unknown"
-        scoring = "unknown"
+        grouping = "--"
+        scoring = "--"
 
         for tok in tokens:
             if tok in GROUPING_TOKENS:
@@ -342,6 +365,7 @@ def parse_filename(path: Path) -> Dict[str, Any]:
         "model": model_name,
         "is_original": False,
         "matrices": "+".join(matrices) if matrices else "unknown",
+        "compression_denominator": compression_denominator,
         "compression_ratio": compression_ratio,
         "scheme": scheme,
         "grouping": grouping,
@@ -412,6 +436,7 @@ def sort_rows_hierarchical(row: Dict[str, Any]):
         ratio_sort,
         row.get("bypassed_layers", 0),
         row.get("scheme", ""),
+        row.get("compression_denominator", ""),
         row.get("grouping", ""),
         row.get("scoring", ""),
         row.get("matrices", ""),
@@ -502,6 +527,7 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
         "Grouping",
         "Scoring",
         "Scheme",
+        "Denom.",
         "Matrices",
     ]
 
@@ -519,9 +545,10 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
             row_cells = [
                 markdown_faded("0%"),
                 markdown_faded("--"),
-                markdown_faded("Original"),
-                markdown_faded("Original"),
-                markdown_faded("Original"),
+                markdown_faded("--"),
+                markdown_faded("--"),
+                markdown_faded("--"),
+                markdown_faded("--"),
                 markdown_faded("--"),
             ]
 
@@ -555,6 +582,7 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
                 row_cells.append(row.get("grouping", "--"))
                 row_cells.append(row.get("scoring", "--"))
                 row_cells.append(row.get("scheme", "--"))
+                row_cells.append(row.get("compression_denominator", "--"))
                 row_cells.append(row.get("matrices", "--"))
 
                 for benchmark in BENCHMARK_ORDER:
@@ -615,22 +643,22 @@ def make_latex_table_for_model(
     if use_resizebox:
         lines.append(r"\resizebox{\textwidth}{!}{%")
 
-    colspec = r"ll llll | rrrrrrr r"
+    colspec = r"ll lllll | rrrrrrr r"
     lines.append(rf"\begin{{tabular}}{{{colspec}}}")
     lines.append(r"\toprule")
 
     lines.append(
         r"\multicolumn{2}{c}{Compression} & "
-        r"\multicolumn{4}{c}{Configuration} & "
+        r"\multicolumn{5}{c}{Configuration} & "
         r"\multicolumn{7}{c}{Benchmarks} & "
         r"\multicolumn{1}{c}{Summary} \\"
     )
 
     lines.append(
         r"\cmidrule(lr){1-2}"
-        r"\cmidrule(lr){3-6}"
-        r"\cmidrule(lr){7-13}"
-        r"\cmidrule(lr){14-14}"
+        r"\cmidrule(lr){3-7}"
+        r"\cmidrule(lr){8-14}"
+        r"\cmidrule(lr){15-15}"
     )
 
     header = [
@@ -639,6 +667,7 @@ def make_latex_table_for_model(
         "Group",
         "Score",
         "Scheme",
+        "Denom.",
         "Matrices",
     ]
 
@@ -654,6 +683,7 @@ def make_latex_table_for_model(
         for row in original_rows:
             cells = [
                 r"\textcolor{black!45}{0\%}",
+                r"\textcolor{black!45}{--}",
                 r"\textcolor{black!45}{--}",
                 r"\textcolor{black!45}{--}",
                 r"\textcolor{black!45}{--}",
@@ -709,6 +739,7 @@ def make_latex_table_for_model(
                 cells.append(latex_escape(row.get("grouping", "--")))
                 cells.append(latex_escape(row.get("scoring", "--")))
                 cells.append(latex_escape(row.get("scheme", "--")))
+                cells.append(latex_escape(row.get("compression_denominator", "--")))
                 cells.append(latex_escape(row.get("matrices", "--")))
 
                 for benchmark in BENCHMARK_ORDER:
@@ -719,7 +750,7 @@ def make_latex_table_for_model(
                 lines.append(" & ".join(cells) + r" \\")
 
             if bypass_idx != len(bypass_groups) - 1:
-                lines.append(r"\cmidrule(lr){2-14}")
+                lines.append(r"\cmidrule(lr){2-15}")
 
         if ratio_idx != len(sorted_ratios) - 1:
             lines.append(r"\midrule")

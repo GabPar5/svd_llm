@@ -431,15 +431,21 @@ def compute_active_target_ratio(
     bypass_early_layers: int,
     bypass_ratio: float,
     max_ratio: float = 0.9,
+    target_total_params: Optional[int] = None
 ) -> float:
-    total_params = sum(param_count_map[k] for k in layers_str)
-    target_removed = target_ratio * total_params
+    selected_total_params = sum(param_count_map[k] for k in layers_str)
+
+    if target_total_params is None:
+        target_total_params = selected_total_params
+
+    target_removed = target_ratio * target_total_params
 
     bypassed_removed = 0.0
     active_params = 0
 
     for k in layers_str:
         p = param_count_map[k]
+
         if is_bypassed_key(k, bypass_early_layers):
             bypassed_removed += p * bypass_ratio
         else:
@@ -449,10 +455,24 @@ def compute_active_target_ratio(
         return target_ratio
 
     active_budget = target_removed - bypassed_removed
-    active_budget = max(0.0, min(active_budget, active_params * max_ratio))
+    active_capacity = active_params * max_ratio
+
+    if active_budget < 0:
+        print(
+            f"[BUDGET][WARNING] Bypassed layers already remove more than target. "
+            f"active_budget={active_budget:.2f}; clamping to 0."
+        )
+        active_budget = 0.0
+
+    if active_budget > active_capacity:
+        print(
+            f"[BUDGET][WARNING] Requested active budget exceeds selected active capacity. "
+            f"requested={active_budget:,.0f}, capacity={active_capacity:,.0f}. "
+            f"Clamping. Actual overall compression will be lower than target."
+        )
+        active_budget = active_capacity
 
     return active_budget / active_params
-
 
 def _redundancy_from_scores(scores: torch.Tensor, offset: float = 1.5) -> torch.Tensor:
     """
