@@ -534,6 +534,7 @@ def allocate_ratios(
         bypass_early_layers: int = 2,
         bypass_ratio: float = 0.0,
         max_ratio: float = 0.9,
+        target_total_params: Optional[int] = None
 ) -> Dict[str, float]:
     """
     Redistributes compression budget within each weight group.
@@ -567,8 +568,12 @@ def allocate_ratios(
 
     ratio_map: Dict[str, float] = {}
 
-    total_params = sum(param_count_map[k] for k in layers_str)
-    target_removed = target_ratio * total_params
+    selected_total_params = sum(param_count_map[k] for k in layers_str)
+
+    if target_total_params is None:
+        target_total_params = selected_total_params
+
+    target_removed = target_ratio * target_total_params
 
     bypassed_keys = [
         k for k in layers_str
@@ -605,14 +610,15 @@ def allocate_ratios(
 
     active_target_ratio = active_budget / active_params if active_params > 0 else 0.0
 
-    print(f"[BUDGET] Total selected params:    {total_params:,}")
-    print(f"[BUDGET] Target removed params:   {target_removed:,.0f}")
-    print(f"[BUDGET] Bypassed matrices:       {len(bypassed_keys)}")
-    print(f"[BUDGET] Bypassed removed params: {bypassed_removed:,.0f}")
-    print(f"[BUDGET] Active matrices:         {len(active_keys)}")
-    print(f"[BUDGET] Active params:           {active_params:,}")
-    print(f"[BUDGET] Active budget:           {active_budget:,.0f}")
-    print(f"[BUDGET] Active target ratio:     {active_target_ratio:.6f}")
+    print(f"[BUDGET] Selected params:           {selected_total_params:,}")
+    print(f"[BUDGET] Target denominator params: {target_total_params:,}")
+    print(f"[BUDGET] Target removed params:     {target_removed:,.0f}")
+    print(f"[BUDGET] Bypassed matrices:         {len(bypassed_keys)}")
+    print(f"[BUDGET] Bypassed removed params:   {bypassed_removed:,.0f}")
+    print(f"[BUDGET] Active matrices:           {len(active_keys)}")
+    print(f"[BUDGET] Active params:             {active_params:,}")
+    print(f"[BUDGET] Active budget:             {active_budget:,.0f}")
+    print(f"[BUDGET] Active target ratio:       {active_target_ratio:.6f}")
 
     groups: Dict[str, List[str]] = defaultdict(list)
     missing_score_keys = []
@@ -726,12 +732,13 @@ def allocate_ratios(
     )
 
     print("\n[BUDGET] Allocation Summary:")
-    print(f"  - Target ratio:         {target_ratio:.6f}")
-    print(f"  - Actual ratio approx:  {actual_removed / total_params:.6f}")
-    print(f"  - Target removed:       {target_removed:,.0f}")
-    print(f"  - Actual removed:       {actual_removed:,.0f}")
-    print(f"  - Missing score keys:   {len(missing_score_keys)}")
-    print(f"  - Unmatched keys:       {len(unmatched_keys)}")
+    print(f"  - Target overall ratio:                 {target_ratio:.6f}")
+    print(f"  - Actual selected ratio approx: {actual_removed / selected_total_params:.6f}")
+    print(f"  - Actual overall ratio approx:  {actual_removed / target_total_params:.6f}")
+    print(f"  - Target removed:               {target_removed:,.0f}")
+    print(f"  - Actual removed:               {actual_removed:,.0f}")
+    print(f"  - Missing score keys:           {len(missing_score_keys)}")
+    print(f"  - Unmatched keys:               {len(unmatched_keys)}")
     print("-" * 80 + "\n")
 
     return ratio_map
@@ -763,7 +770,8 @@ def compress_svd_llm(
         whitening_start_layer: int = 0,
         whitening_end_layer: Optional[int] = None,
         bypass_early_layers: int = 2,
-        bypass_ratio: float = 0.0
+        bypass_ratio: float = 0.0,
+        ratio_scope: Literal["selected", "all"] = "selected"
 ):
     # Load model and tokenizer
     vram_usage("Before loading original model")
@@ -834,6 +842,48 @@ def compress_svd_llm(
         attributes=attributes,
         include_bias=False,
     )
+
+    if len(layers_str) == 0:
+        raise ValueError("No layers selected for compression.")
+
+    selected_total_params = sum(param_count_map[k] for k in layers_str)
+
+    if ratio_scope == "all":
+        # Denominator includes all projection matrices we conceptually care about:
+        # MLP + q/k/v + o.
+        budget_layers_str = generate_paths(
+            mlp=True,
+            q=True,
+            k=True,
+            v=True,
+            attention_output=True,
+            layers_number=model.config.num_hidden_layers,
+        )
+        budget_layers_list, budget_attributes = get_layers(model, budget_layers_str, True)
+
+        budget_param_count_map = build_param_count_map(
+            layers_str=budget_layers_str,
+            layers_list=budget_layers_list,
+            attributes=budget_attributes,
+            include_bias=False,
+        )
+
+        target_total_params = sum(budget_param_count_map[k] for k in budget_layers_str)
+
+        print("\n[BUDGET] Ratio scope: ALL_TARGETABLE")
+        print(f"[BUDGET] Selected compressible params: {selected_total_params:,}")
+        print(f"[BUDGET] Target denominator params:    {target_total_params:,}")
+        print(f"[BUDGET] Selected fraction:           {selected_total_params / target_total_params:.6f}")
+        print(
+            f"[BUDGET] If homogeneous over selected only, needed selected ratio would be "
+            f"{(ratio * target_total_params / selected_total_params):.6f}"
+        )
+    else:
+        target_total_params = selected_total_params
+
+        print("\n[BUDGET] Ratio scope: SELECTED")
+        print(f"[BUDGET] Selected compressible params: {selected_total_params:,}")
+        print(f"[BUDGET] Target denominator params:    {target_total_params:,}")
 
     # Compute/load whitening matrices for each layer
     vram_usage("Before loading whitening matrices")
@@ -909,6 +959,7 @@ def compress_svd_llm(
             bypass_early_layers=bypass_early_layers,
             bypass_ratio=bypass_ratio,
             max_ratio=0.9,
+            target_total_params=target_total_params
         )
         print(f"[BUDGET] Score probe ratio for active layers: {score_probe_ratio:.6f}")
         for i, (layer, attr) in tqdm(
@@ -988,6 +1039,7 @@ def compress_svd_llm(
             bypass_early_layers=bypass_early_layers,
             bypass_ratio=bypass_ratio,
             max_ratio=0.9,
+            target_total_params=target_total_params
         )
         torch.cuda.empty_cache()
         steps_counter += 1
@@ -1000,6 +1052,8 @@ def compress_svd_llm(
             target_ratio=ratio,
             bypass_early_layers=bypass_early_layers,
             bypass_ratio=bypass_ratio,
+            max_ratio=0.9,
+            target_total_params=target_total_params
         )
 
         ratio_map = {}
@@ -1010,15 +1064,16 @@ def compress_svd_llm(
             else:
                 ratio_map[k] = active_target_ratio
 
-        total_params = sum(param_count_map[k] for k in layers_str)
+        selected_total_params = sum(param_count_map[k] for k in layers_str)
         actual_removed = sum(param_count_map[k] * ratio_map[k] for k in layers_str)
 
         print("\n[BUDGET] Homogeneous Allocation Summary:")
-        print(f"  - Target ratio:        {ratio:.6f}")
-        print(f"  - Active ratio:        {active_target_ratio:.6f}")
-        print(f"  - Actual ratio approx: {actual_removed / total_params:.6f}")
-        print(f"  - Target removed:      {ratio * total_params:,.0f}")
-        print(f"  - Actual removed:      {actual_removed:,.0f}")
+        print(f"  - Target overall ratio:          {ratio:.6f}")
+        print(f"  - Active selected ratio:         {active_target_ratio:.6f}")
+        print(f"  - Actual selected ratio approx:  {actual_removed / selected_total_params:.6f}")
+        print(f"  - Actual overall ratio approx:   {actual_removed / target_total_params:.6f}")
+        print(f"  - Target removed:                {ratio * target_total_params:,.0f}")
+        print(f"  - Actual removed:                {actual_removed:,.0f}")
         print("-" * 80 + "\n")
 
     # Compress layers using the calculated compression ratios
@@ -1178,6 +1233,7 @@ def compress_svd_llm(
         compress_att_v_str = "_v" if compress_att_v else ""
         compress_att_out_str = "_out" if compress_att_out else ""
         compress_mlp_str = "_mlp" if compress_mlp else ""
+        ratio_scope_str = ratio_scope_str = "_all" if compress_att_q and compress_att_k and compress_att_v and compress_att_out and compress_mlp else "_" + str(ratio_scope)
         heterogeneous_str = "_het" if heterogeneous else "_hom"
         group_criterion_str = ("_" + group_criterion) if heterogeneous else ""
         score_metric_substr = score_metric.replace("|", "") if len(score_metric.split("|")) > 1 else score_metric
@@ -1193,7 +1249,8 @@ def compress_svd_llm(
            compress_att_k_str +
            compress_att_v_str + 
            compress_att_out_str + 
-           compress_mlp_str + "_" +
+           compress_mlp_str + 
+           ratio_scope_str + "_" +
            str(round(ratio, 2)) +
            heterogeneous_str + 
            group_criterion_str +

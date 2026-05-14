@@ -40,6 +40,17 @@ if __name__ == "__main__":
         help='Target compression ratio,(0,1), default=0.2, means removing about 20%% of the params.'
     )
     parser.add_argument(
+        "--ratio_scope",
+        type=str,
+        default="selected",
+        choices=["selected", "all"],
+        help=(
+            "selected: compression_ratio applies only to selected matrices. "
+            "all: compression_ratio applies to all targetable projection matrices "
+            "(MLP + q/k/v/o), even if only a subset is selected for compression."
+        ),
+    )
+    parser.add_argument(
         '--calibration_dataset', 
         type=str, 
         default='EleutherAI/wikitext_document_level:wikitext-2-raw-v1:train',
@@ -288,18 +299,20 @@ if __name__ == "__main__":
         compress_att_v_str = "_v" if args.compress_att_v else ""
         compress_att_out_str = "_out" if args.compress_att_out else ""
         compress_mlp_str = "_mlp" if args.compress_mlp else ""
+        ratio_scope_str = "_all" if args.compress_att_q and args.compress_att_k and args.compress_att_v and args.compress_att_out and args.compress_mlp else "_" + str(args.ratio_scope)
         heterogeneous_str = "_het" if args.het else "_hom"
         group_criterion_str = ("_" + args.group_criterion) if args.het else ""
         score_metric_substr = args.score_metric.replace("|", "") if len(args.score_metric.split("|")) > 1 else args.score_metric
         score_metric_str = ("_" + score_metric_substr) if args.het else ""
-        v2_str = "_v2" if args.run_v2 else ""
         bypassed_layers_str = "_" + str(args.bypass_early_layers) if args.bypass_early_layers >= 0 else ""
+        v2_str = "_v2" if args.run_v2 else ""
         model_name = args.model.replace("/", "_").replace("-", "_") + \
                      compress_att_q_str + \
                      compress_att_k_str + \
                      compress_att_v_str + \
                      compress_att_out_str + \
                      compress_mlp_str + \
+                     ratio_scope_str + \
                      "_" + \
                      str(round(args.compression_ratio, 2)) + \
                      heterogeneous_str + \
@@ -356,7 +369,8 @@ if __name__ == "__main__":
             whitening_start_layer = args.whitening_start_layer,
             whitening_end_layer = args.whitening_end_layer,
             bypass_early_layers = args.bypass_early_layers,
-            bypass_ratio = args.bypass_ratio
+            bypass_ratio = args.bypass_ratio,
+            ratio_scope=args.ratio_scope
         )
         model=model.to(args.device, dtype=DtypeMap.get_dtype(args.dtype))
         print(model)
