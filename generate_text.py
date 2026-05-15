@@ -6,7 +6,7 @@ import sys
 import torch
 
 from typing import List
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig
 
 from src.svd_llm import apply_lowrank
 from src.utils import DtypeMap
@@ -30,6 +30,9 @@ def safe_pad_token_setup(tokenizer, model):
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     eos = model.generation_config.eos_token_id
+    if eos is None:
+        eos = tokenizer.eos_token_id
+        model.generation_config.eos_token_id = eos
     pad_id = eos[0] if isinstance(eos, (list, tuple)) else eos
 
     model.generation_config.pad_token_id = pad_id
@@ -101,9 +104,16 @@ def load_compressed_model(
         trust_remote_code=True,
         token=hf_token,
     )
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     print(f"[LOAD] Loading compressed checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
 
     rank_map = checkpoint["rank_map"]
     state_dict = checkpoint["state_dict"]
@@ -116,17 +126,37 @@ def load_compressed_model(
     )
 
     print("[LOAD] Instantiating base model architecture...")
-    model = AutoModelForCausalLM.from_config(
-        config,
-        trust_remote_code=True,
-        dtype=torch_dtype,
-    )
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(
+            config,
+            trust_remote_code=True,
+            dtype=torch_dtype,
+        )
+    try:
+        model.generation_config = GenerationConfig.from_pretrained(
+            base_model_name,
+            trust_remote_code=True,
+            token=hf_token,
+        )
+    except Exception as e:
+        print(f"[WARNING] Could not load generation_config for {base_model_name}: {e}")
+        model.generation_config = GenerationConfig.from_model_config(config)
+    eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
+    if eos is None:
+        eos = tokenizer.eos_token_id
+        model.generation_config.eos_token_id = eos # pyright: ignore[reportOptionalMemberAccess]
+    model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
 
     print("[LOAD] Applying LowRank module structure...")
     apply_lowrank(model, rank_map)
+    model.to_empty(device=device)
 
     print("[LOAD] Loading compressed state dict...")
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(
+        state_dict, 
+        strict=False, 
+        assign=True
+    )
 
     if missing:
         print(f"[WARNING] Missing keys: {len(missing)}")
@@ -145,7 +175,6 @@ def load_compressed_model(
     del checkpoint, state_dict, rank_map
     cuda_cleanup()
 
-    model.to(device=device, dtype=torch_dtype)
     model.eval()
     model.config.use_cache = True
 
@@ -206,6 +235,7 @@ def generate_text(
         "max_new_tokens": max_new_tokens,
         "do_sample": do_sample,
         "repetition_penalty": repetition_penalty,
+        "eos_token_id": model.generation_config.eos_token_id,
         "pad_token_id": tokenizer.pad_token_id,
         "use_cache": True,
     }
@@ -304,7 +334,7 @@ def save_result(
 ):
     os.makedirs(output_dir, exist_ok=True)
 
-    filename = safe_filename(model_label) + ".txt"
+    filename = safe_filename(model_label) + ".md"
     path = os.path.join(output_dir, filename)
 
     with open(path, "w", encoding="utf-8") as f:
@@ -404,7 +434,7 @@ def main():
         "--output_dir",
         type=str,
         default="./output/text_generation/",
-        help="Folder where .txt generations are saved.",
+        help="Folder where .md generations are saved.",
     )
 
     parser.add_argument(
