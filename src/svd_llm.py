@@ -20,6 +20,10 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from torch.utils.data import DataLoader
 from .utils import *
 
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision("highest")
+
 class LowRank(torch.nn.Module):
     def __init__(self, in_features, out_features, rank, bias):
         super().__init__()
@@ -292,7 +296,6 @@ def get_whitening_matrices(
             la = get_submodule(layer, local_path)
 
             if isinstance(la, nn.Linear):
-                #acc_dtype = torch.float32 if la.in_features > SOLVER_GPU_MAX_DIM else torch.float64
 
                 la.raw_xxt_matrix = torch.zeros(
                     la.in_features,
@@ -348,12 +351,10 @@ def get_whitening_matrices(
             if not (isinstance(la, nn.Linear) and hasattr(la, "raw_xxt_matrix")):
                 continue
 
-            raw_acc = la.raw_xxt_matrix
-            raw_xxt_cpu = (raw_acc / n_tokens).detach().to(torch.float64).cpu()
+            raw_xxt_cpu = la.raw_xxt_matrix.detach().to(torch.float64).cpu()
 
             la.raw_xxt_matrix = None  # pyright: ignore[reportArgumentType]
             del la.raw_xxt_matrix
-            del raw_acc
 
             pending_xxt.append((lstr, raw_xxt_cpu))
 
@@ -376,9 +377,11 @@ def get_whitening_matrices(
                         f"routing eigh to in-process JAX GPU..."
                     )
 
+                    raw_xxt_cpu = 0.5 * (raw_xxt_cpu + raw_xxt_cpu.T)
                     L_s, U_s = eigh_jax_gpu_from_cpu(raw_xxt_cpu)
 
                 else:
+                    raw_xxt_cpu = 0.5 * (raw_xxt_cpu + raw_xxt_cpu.T)
                     raw_xxt_gpu = raw_xxt_cpu.to(device)
 
                     L_s, U_s = torch.linalg.eigh(raw_xxt_gpu)
@@ -391,7 +394,7 @@ def get_whitening_matrices(
                 L_s = L_s.flip(0).clamp(min=0.0)
                 U_s = U_s.flip(1)
 
-                wm = (U_s.to(torch.float32), L_s)
+                wm = (U_s, L_s)
 
                 del U_s, L_s
 
@@ -905,7 +908,20 @@ def compress_svd_llm(
                     + "\n".join(missing[:5]) + ("..." if len(missing) > 5 else "")
                 )
         else:
-            raise FileNotFoundError(f"[ERROR] Whitening matrices for this model do not exist in this path: {whitening_mat_actual_path}")
+            print(f"[WARNING] Whitening matrices for this model do not exist in this path: {whitening_mat_actual_path}. Generating in place...")
+            print("=== WHITENING MATRICES GENERATION ===")
+            whitening_matrices = get_whitening_matrices(
+                model, # pyright: ignore[reportArgumentType]
+                model_name,
+                calibration_dataloader,
+                layers_str,
+                max(max_length * dataset["max_samples"], 1),
+                device,
+                is_v2,
+                save_path or "./tmp",
+                whitening_start_layer,
+                whitening_end_layer
+            )
     else:
         print("=== WHITENING MATRICES GENERATION ===")
         whitening_matrices = get_whitening_matrices(
@@ -1001,10 +1017,6 @@ def compress_svd_llm(
             )
             rank = max(1, min(rank, L.shape[0] - 1))
 
-            # Multiply by sqrt(n_tokens) to recover the unnormalized singular values.
-            # This pushes the scores into the hundreds/thousands
-            L = L * math.sqrt(max(max_length * dataset["max_samples"], 1))
-
             # Calculate score metric
             match score_metric:
                 case "truncation":
@@ -1013,7 +1025,7 @@ def compress_svd_llm(
                 case "entropy":
                     # After whitening, entropy loss equals the sum of normalized singular values of the tail
                     norm_spectrum = L/L.sum()
-                    raw_entropy = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:] + 1e-9)).sum().item()
+                    score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:] + 1e-9)).sum().item()
                 case s if s.startswith('norm'):
                     if s.split("|")[1].startswith("-"):
                         p_norm_value = -float(s.split("|")[1][1:])
@@ -1101,7 +1113,7 @@ def compress_svd_llm(
             L_s_clean = torch.clamp(L_s, min=0.0)
 
             # Auxiliary matrix
-            L_s_sqrt = torch.sqrt(L_s_clean)
+            L_s_sqrt = torch.sqrt(L_s_clean)            
 
             # Perform SVD on W x U_s x sqrt(L_s)
             D = torch.matmul(W, U_s)
@@ -1117,7 +1129,7 @@ def compress_svd_llm(
 
             # Calculate sqrt(L_s) and U_s inverse matrices
             eig_max = float(L_s_clean.max())
-            tau = max(eig_max * 1e-12, 1e-30)
+            tau = max(eig_max * 1e-6, 1e-20)
             L_s_sqrt_inv = torch.where(
                 L_s_clean > tau,
                 torch.rsqrt(L_s_clean),
@@ -1141,7 +1153,7 @@ def compress_svd_llm(
             del U_ws, L_ws, V_wsT, L_s_sqrt_inv
 
             # Compute approximate weight matrix, split in two matrices
-            L_ws_r_sqrt = torch.sqrt(L_ws_r) # TODO add regularization here?
+            L_ws_r_sqrt = torch.sqrt(L_ws_r)
             W_u = (U_ws_r * L_ws_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
             W_v = torch.matmul(L_ws_r_sqrt.unsqueeze(1) * V_wsT_r, U_s_inv_L_s_sqrt_inv).cpu().to(layer_attr.weight.dtype)
             # Free low-rank matrices, leave only W_u and W_v
@@ -1178,7 +1190,7 @@ def compress_svd_llm(
             rank = max(1, min(rank, L.shape[0] - 1))
             rank_map[layers_str[i]] = rank
             U_r = U[:, :rank]
-            L_r_sqrt = torch.sqrt(L[:rank]) # TODO add regularization here too?
+            L_r_sqrt = torch.sqrt(L[:rank])
             VT_r = torch.matmul(VT[:rank, :], whitening_matrix_inv)
             # Free full-rank matrices as soon as truncated slices are built
             U = L = VT = whitening_matrix_inv = None

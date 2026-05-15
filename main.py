@@ -6,7 +6,7 @@ import json
 import torch
 import lm_eval
 import multiprocessing as mp
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, GenerationConfig
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import setup_logging, handle_non_serializable
 
@@ -268,26 +268,76 @@ if __name__ == "__main__":
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+        # Load checkpoint
+        checkpoint = torch.load(
+            args.compressed_model_path,
+            map_location=args.device,
+            weights_only=False,
+        )
+
+        rank_map = checkpoint["rank_map"]
+        state_dict = checkpoint["state_dict"]
+
         # Load model config from HF and instantiate base model
-        config = AutoConfig.from_pretrained(args.model, trust_remote_code=True, dtype=DtypeMap.get_dtype(args.dtype))
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, dtype=DtypeMap.get_dtype(args.dtype))
+        config = AutoConfig.from_pretrained(
+            args.model,
+            trust_remote_code=True,
+            token=args.hf_token,
+            dtype=DtypeMap.get_dtype(args.dtype)
+        )
+
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=True,
+                dtype=DtypeMap.get_dtype(args.dtype),
+            )
         # Avoid warning
         eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
         model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
-
-        # Load checkpoint
-        checkpoint = torch.load(args.compressed_model_path, map_location="cpu", weights_only=False)
-        rank_map = checkpoint["rank_map"]
+        try:
+            model.generation_config = GenerationConfig.from_pretrained(
+                args.model,
+                trust_remote_code=True,
+                token=args.hf_token,
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not load generation_config for {args.model}: {e}")
+            model.generation_config = GenerationConfig.from_model_config(config)
+        eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
+        if eos is None:
+            eos = tokenizer.eos_token_id
+            model.generation_config.eos_token_id = eos # pyright: ignore[reportOptionalMemberAccess]
+        model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
 
         # Replace compressed layers with LowRank modules
         apply_lowrank(model, rank_map)
+        model.to_empty(device=args.device)
 
-        # Load weights
-        model.load_state_dict(checkpoint["state_dict"], strict=True)
-        model=model.to(args.device)
-        del checkpoint, rank_map
+        missing, unexpected = model.load_state_dict(
+            state_dict, 
+            strict=False, 
+            assign=True
+        )
+
+        if missing:
+            print(f"[WARNING] Missing keys: {len(missing)}")
+            print(missing[:20])
+
+        if unexpected:
+            print(f"[WARNING] Unexpected keys: {len(unexpected)}")
+            print(unexpected[:20])
+
+        if missing or unexpected:
+            raise RuntimeError(
+                "State dict mismatch. The compressed checkpoint may not match "
+                "the base model or rank_map."
+            )
+
+        # Clean memory
+        del checkpoint, state_dict, rank_map
+        cuda_cleanup()
         gc.collect()
-        torch.cuda.empty_cache()
         vram_usage("After loading compressed model")
     else:
         model_eval_path = args.save_path + \
