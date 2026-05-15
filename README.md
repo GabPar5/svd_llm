@@ -50,7 +50,7 @@ python main.py \
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--model` | `str` | `Qwen/Qwen2.5-1.5B` | HF model identifier. |
+| `--model` | `str` | `Qwen/Qwen2.5-7B` | HF model identifier. |
 | `--run_v2` | `flag` | `False` | Enable SVD-LLM V2. |
 | `--dtype` | `str` | `float32` | Weights datatype for original/compressed models. |
 | `--device` | `str` | `cuda` | Computing device. |

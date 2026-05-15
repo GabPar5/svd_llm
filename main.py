@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--model', 
         type=str, 
-        default='Qwen/Qwen2.5-1.5B', 
+        default='Qwen/Qwen2.5-7B', 
         help='LLM to load from huggingface'
     )
     parser.add_argument(
