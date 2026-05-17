@@ -1,5 +1,4 @@
 import re
-import math
 import gc
 import os
 import torch
@@ -133,6 +132,7 @@ def get_whitening_matrices(
     print(f"[WHITENING] Streaming whitening matrices to: {wm_dir}")
     print(f"[WHITENING] Activation checkpoint dir: {act_ckpt_dir}")
 
+    # Set start and end decoder layers for whitening matrices generation
     decoder_layers = model.model.layers
     num_decoder_layers = len(decoder_layers)
 
@@ -151,7 +151,6 @@ def get_whitening_matrices(
 
     # Group target weight matrices by decoder layer index.
     decoder_groups: Dict[int, List[tuple[str, str]]] = defaultdict(list)
-
     for lstr in layers_str:
         m = re.search(r"model\.layers\.(\d+)\.(.*)", lstr)
         if m is None:
@@ -160,33 +159,28 @@ def get_whitening_matrices(
         local_path = m.group(2)
         decoder_groups[idx].append((local_path, lstr))
 
-    # ---------------------------------------------------------------------
     # Try loading activation checkpoint for start_layer.
-    # ---------------------------------------------------------------------
-
-    loaded_ckpt, loaded_inps, loaded_captured, loaded_ckpt_path = try_load_activation_checkpoint(act_ckpt_dir, model_name, version_str, n_tokens, start_layer)
+    loaded_ckpt, loaded_inps, loaded_captured, loaded_ckpt_path = try_load_activation_checkpoint(
+        act_ckpt_dir, model_name, version_str, n_tokens, start_layer
+    )
 
     if loaded_ckpt:
-        inps: List[torch.Tensor] = loaded_inps  # type: ignore[assignment]
-        captured: List[Dict] = loaded_captured  # type: ignore[assignment]
+        inps: List[torch.Tensor] = loaded_inps # type: ignore[assignment]
+        captured: List[Dict] = loaded_captured # type: ignore[assignment]
         loop_start_layer = start_layer
-
         print(f"[WHITENING] Starting directly from decoder layer {start_layer} using activation checkpoint.")
-
     else:
-        # -----------------------------------------------------------------
         # PHASE 1: Capture layer_0 inputs.
-        # -----------------------------------------------------------------
-
         print("[WHITENING] No usable activation checkpoint. Capturing layer_0 inputs...")
 
+        # Move modules executed prior to the decoders on the device
         model.model.embed_tokens = model.model.embed_tokens.to(device)
-
         if hasattr(model.model, "rotary_emb"):
             model.model.rotary_emb = model.model.rotary_emb.to(device)
 
         captured: List[Dict] = []
 
+        # Catch the layer_0 inputs
         class Catcher(nn.Module):
             def __init__(self, module):
                 super().__init__()
@@ -199,17 +193,13 @@ def get_whitening_matrices(
                     return getattr(self.module, name)
 
             def forward(self, inp, **kwargs):
-                pe = kwargs.get("position_embeddings", None)
-
                 captured.append({
                     "inp": inp.detach().cpu(),
                     "attention_mask": kwargs.get("attention_mask", None),
                     "position_ids": kwargs.get("position_ids", None),
                     "cache_position": kwargs.get("cache_position", None),
-                    "position_embeddings": (
-                        pe[0].detach().cpu(),
-                        pe[1].detach().cpu(),
-                    ) if pe is not None else None,
+                    "position_embeddings": kwargs.get("position_embeddings", None),
+                    "past_key_values": kwargs.get("past_key_values", None),
                 })
 
                 entry = captured[-1]
@@ -223,12 +213,23 @@ def get_whitening_matrices(
                 if entry["cache_position"] is not None:
                     entry["cache_position"] = entry["cache_position"].detach().cpu()
 
+                if entry["position_embeddings"] is not None:
+                    entry["position_embeddings"] = (
+                        entry["position_embeddings"][0].detach().cpu(), 
+                        entry["position_embeddings"][1].detach().cpu()
+                    )
+
+                if entry["past_key_values"] is not None:
+                    entry["past_key_values"] = entry["past_key_values"].detach().cpu()
+
                 raise ValueError
 
+        # Move layer_0 to device and replace it with catcher
         decoder_layers[0] = decoder_layers[0].to(device)
         original_layer0 = decoder_layers[0]
         decoder_layers[0] = Catcher(original_layer0)
 
+        # Catch inputs
         with torch.inference_mode():
             for batch in tqdm(loader, desc="Capturing layer_0 inputs"):
                 try:
@@ -238,16 +239,18 @@ def get_whitening_matrices(
                         if k in ("input_ids", "attention_mask")
                     }
                     model(**batch, use_cache=False)
-                except ValueError:
+                except ValueError as e:
+                    print(f"[WARNING] ValueError during calibration inference: {e}")
                     pass
                 finally:
                     del batch
 
+        # Move layer_0 back to cpu
         decoder_layers[0] = original_layer0
         decoder_layers[0] = decoder_layers[0].cpu()
 
+        # Move modules executed prior to the decoders back to cpu
         model.model.embed_tokens = model.model.embed_tokens.cpu()
-
         if hasattr(model.model, "rotary_emb"):
             model.model.rotary_emb = model.model.rotary_emb.cpu()
 
@@ -256,19 +259,17 @@ def get_whitening_matrices(
         print(f"[WHITENING] Captured layer_0 inputs for {len(captured)} batches.")
         vram_usage("After layer 0 capture")
 
+        # Move inputs to a dedicated list and empty the `entry["inp"]` tensors
         inps = [entry["inp"] for entry in captured]
-
         for entry in captured:
             entry["inp"] = None
 
         loop_start_layer = 0
 
+    # Prepare outputs tensors list
     outs: List[Optional[torch.Tensor]] = [None] * len(inps)
 
-    # ---------------------------------------------------------------------
-    # Hook definition.
-    # ---------------------------------------------------------------------
-
+    # Hook definition to accumulate XX^T for the desired sublayers
     def hook(module, input, output):
         inp = input[0].detach().to(dtype=module.raw_xxt_matrix.dtype)
         act = torch.einsum("bsi,bsj->ij", inp, inp)
@@ -277,33 +278,28 @@ def get_whitening_matrices(
 
     whitening_matrices_paths: Dict[str, str] = {}
 
-    # ---------------------------------------------------------------------
     # PHASE 2: Replay decoder layers.
-    # ---------------------------------------------------------------------
-
     for idx in tqdm(range(loop_start_layer, end_layer), desc="Computing whitening matrices..."):
         should_save_this_layer = start_layer <= idx < end_layer
 
         print(f"[WHITENING] Processing decoder layer {idx} | save={should_save_this_layer}")
-
+        
+        # Move the decoder layer to device and get the desired sublayers
         layer = decoder_layers[idx].to(device)
-
         group = decoder_groups.get(idx, []) if should_save_this_layer else []
 
+        # Initialize empty accumulation matrices and register forward hooks
         handles = []
-
         for local_path, lstr in group:
             la = get_submodule(layer, local_path)
 
             if isinstance(la, nn.Linear):
-
                 la.raw_xxt_matrix = torch.zeros(
                     la.in_features,
                     la.in_features,
                     dtype=torch.float32,
                     device=device,
                 )
-
                 handles.append(la.register_forward_hook(hook))
 
         # Replay every calibration batch through this decoder layer.
@@ -311,15 +307,15 @@ def get_whitening_matrices(
             for j, entry in enumerate(captured):
                 inp_j = inps[j].to(device)
 
+                # Recover kwargs captured from layer_0
                 kwargs = {}
-
                 if entry["attention_mask"] is not None:
                     kwargs["attention_mask"] = entry["attention_mask"].to(device)
 
                 if entry["position_ids"] is not None:
                     kwargs["position_ids"] = entry["position_ids"].to(device)
 
-                if entry.get("cache_position", None) is not None:
+                if entry["cache_position"] is not None:
                     kwargs["cache_position"] = entry["cache_position"].to(device)
 
                 if entry["position_embeddings"] is not None:
@@ -329,29 +325,31 @@ def get_whitening_matrices(
                         sin.to(device),
                     )
 
-                out = layer(inp_j,  use_cache=False, **kwargs)
+                if entry["past_key_values"] is not None:
+                    kwargs["past_key_values"] = entry["past_key_values"].to(device)
+
+                # Run sample through the decoder layer and save output
+                out = layer(inp_j, use_cache=False, **kwargs)
                 outs[j] = (out[0] if isinstance(out, tuple) else out).detach().cpu()
 
                 del inp_j, out, kwargs
 
             torch.cuda.synchronize()
 
+        # Remove registered forward hooks from decoder layer
         for h in handles:
             h.remove()
 
-        # -----------------------------------------------------------------
         # Move accumulated XXT matrices to CPU immediately.
-        # -----------------------------------------------------------------
-
         pending_xxt = []
-
         for local_path, lstr in group:
             la = get_submodule(layer, local_path)
 
-            if not (isinstance(la, nn.Linear) and hasattr(la, "raw_xxt_matrix")):
+            if not(isinstance(la, nn.Linear) and hasattr(la, "raw_xxt_matrix")):
                 continue
-
-            raw_xxt_cpu = la.raw_xxt_matrix.detach().to(torch.float64).cpu()
+            
+            # Detach XXT matrix from graph, cast it to higher precision and move it to cpu
+            raw_xxt_cpu = la.raw_xxt_matrix.detach().to(torch.float64).cpu() # pyright: ignore[reportCallIssue]
 
             la.raw_xxt_matrix = None  # pyright: ignore[reportArgumentType]
             del la.raw_xxt_matrix
@@ -361,44 +359,56 @@ def get_whitening_matrices(
         # Move decoder layer itself back to CPU before eig/Cholesky work.
         decoder_layers[idx] = layer.cpu()
         del layer
-
         cuda_cleanup()
+
         vram_usage(f"After layer {idx} forward and CPU offload")
 
-        # -----------------------------------------------------------------
         # Process whitening matrices one at a time.
-        # -----------------------------------------------------------------
-
         for lstr, raw_xxt_cpu in pending_xxt:
             if is_v2:
+                # Check for unexpected asymmetries, since we're going to use `eigh`
+                skew = (raw_xxt_cpu - raw_xxt_cpu.T).abs().max()
+                scale = raw_xxt_cpu.abs().max().clamp_min(1e-12)
+                rel_skew = skew / scale
+                if rel_skew > 1e-5:
+                    print(f"[WARNING] XXT has unexpected asymmetry: rel_skew={rel_skew:.2e}")
+
+                # Route to jax if the matrix is too large (pytorch fails due to a cuSolver index error)
                 if raw_xxt_cpu.shape[0] > SOLVER_GPU_MAX_DIM:
                     print(
                         f"[WHITENING] Large matrix detected for {lstr}, "
                         f"routing eigh to in-process JAX GPU..."
                     )
-
-                    raw_xxt_cpu = 0.5 * (raw_xxt_cpu + raw_xxt_cpu.T)
                     L_s, U_s = eigh_jax_gpu_from_cpu(raw_xxt_cpu)
-
                 else:
-                    raw_xxt_cpu = 0.5 * (raw_xxt_cpu + raw_xxt_cpu.T)
+                    # Move XXT to device
                     raw_xxt_gpu = raw_xxt_cpu.to(device)
 
+                    # Peform eigenvalue decomposition using `eigh` and move results to CPU
                     L_s, U_s = torch.linalg.eigh(raw_xxt_gpu)
                     L_s = L_s.cpu()
                     U_s = U_s.cpu()
 
                     del raw_xxt_gpu
-                    cuda_cleanup()
+                
+                # Eigenvalues/singular values diagnostics
+                neg = L_s[L_s < 0]
+                if neg.numel() > 0:
+                    rel_neg = neg.abs().max() / L_s.abs().max().clamp_min(1e-30)
+                    print(
+                        f"[V2][XXT] negative eigvals: {neg.numel()}/{L_s.numel()}, "
+                        f"min={L_s.min().item():.3e}, rel_min={rel_neg.item():.3e}"
+                    )
 
-                L_s = L_s.flip(0).clamp(min=0.0)
+                # Order eigenvalues/singular values in a descending order, then put outputs into a tuple
+                L_s = L_s.flip(0)
                 U_s = U_s.flip(1)
-
                 wm = (U_s, L_s)
 
                 del U_s, L_s
 
             else:
+                # Route to scipy on CPU if the matrix is too large (pytorch fails due to a cuSolver index error)
                 if raw_xxt_cpu.shape[0] > SOLVER_GPU_MAX_DIM:
                     print(
                         f"[WHITENING] Large matrix ({raw_xxt_cpu.shape[0]}x{raw_xxt_cpu.shape[0]}) "
@@ -407,6 +417,7 @@ def get_whitening_matrices(
 
                     raw_xxt_np = raw_xxt_cpu.numpy()
 
+                    # Perform cholesky decomposition with safeguards (cholesky works only for PD matrices)
                     try:
                         wm = torch.from_numpy(
                             scipy.linalg.cholesky(
@@ -442,8 +453,10 @@ def get_whitening_matrices(
                     del raw_xxt_np
 
                 else:
+                    # Move XXT to device
                     raw_xxt_gpu = raw_xxt_cpu.to(device)
 
+                    # Perform cholesky decomposition with safeguards (cholesky works only for PD matrices)
                     try:
                         wm = torch.linalg.cholesky(raw_xxt_gpu).cpu()
                     except Exception:
@@ -462,7 +475,6 @@ def get_whitening_matrices(
                         del eigvals
 
                     del raw_xxt_gpu
-                    cuda_cleanup()
 
             fname = lstr.replace(".", "_") + ".pt"
             fpath = os.path.join(wm_dir, fname)
@@ -473,8 +485,7 @@ def get_whitening_matrices(
 
             del wm
             del raw_xxt_cpu
-
-            gc.collect()
+            cuda_cleanup()
             vram_usage(f"After saving whitening matrix for layer {lstr}")
 
         del pending_xxt
@@ -485,10 +496,7 @@ def get_whitening_matrices(
         # Thread activations forward.
         inps, outs = outs, inps  # pyright: ignore[reportAssignmentType]
 
-    # ---------------------------------------------------------------------
     # Save checkpoint for inputs to end_layer, unless end_layer is final.
-    # ---------------------------------------------------------------------
-
     if end_layer < num_decoder_layers:
         saved_ckpt_path = save_activation_checkpoint(act_ckpt_dir, model_name, version_str, n_tokens, end_layer, inps, captured)
 
@@ -517,7 +525,6 @@ def get_whitening_matrices(
             pass
 
     del inps, outs, captured
-
     cuda_cleanup()
 
     print(
@@ -697,6 +704,7 @@ def allocate_ratios(
             else 0.0
         )
 
+        # TODO understand well how it works
         group_ratio_map = allocate_param_weighted_group(
             keys=keys,
             score_map=score_map,
@@ -782,10 +790,12 @@ def compress_svd_llm(
     if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    model = AutoModelForCausalLM.from_pretrained(
+    model: Qwen2ForCausalLM = AutoModelForCausalLM.from_pretrained(
         model_name,
         dtype=dtype,
         device_map=None,
+        max_position_embeddings=max_length, # Set desired max model length
+        use_cache=False, # Disable kv cache (not needed here)
         low_cpu_mem_usage=True,
         use_safetensors=True,
         token=hf_token,
@@ -793,11 +803,9 @@ def compress_svd_llm(
     )
     ram_usage("After loading original model")
     vram_usage("After loading original model")
-    # Avoid warning
-    eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
-    model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
+
+    # Set model to evaluation mode
     model.eval()
-    model.config.use_cache = False
 
     # Preprocess calibration dataset
     print("=== DATASET PREPROCESSING ===")
@@ -813,10 +821,6 @@ def compress_svd_llm(
         seed,
         save_path
     )
-    print(calibration_dataset)
-    print(calibration_dataset["input_ids"])
-    print(calibration_dataset["input_ids"][0])
-    print(len(calibration_dataset["input_ids"][0]))
     calibration_dataloader = DataLoader(
         calibration_dataset, # pyright: ignore[reportArgumentType]
         batch_size=batch_size,
@@ -827,7 +831,7 @@ def compress_svd_llm(
     print("=== FINAL DATASET STRUCTURE ===")
     print(calibration_dataset)
 
-    # Get list of layers of interest
+    # Get list of sublayers that we want to compress
     layers_str = generate_paths(
         compress_mlp, 
         compress_att_q,
@@ -836,6 +840,8 @@ def compress_svd_llm(
         compress_att_out, 
         layers_number=model.config.num_hidden_layers
     )
+    if len(layers_str) == 0:
+        raise ValueError("No layers selected for compression.")
     layers_list, attributes = get_layers(model, layers_str, True)
 
     # Build parameters count map
@@ -846,14 +852,14 @@ def compress_svd_llm(
         include_bias=False,
     )
 
-    if len(layers_str) == 0:
-        raise ValueError("No layers selected for compression.")
-
+    # Overall count of parameters of sublayers that we want to compress
     selected_total_params = sum(param_count_map[k] for k in layers_str)
 
     if ratio_scope == "all":
         # Denominator includes all projection matrices we conceptually care about:
         # MLP + q/k/v + o.
+        # We repeat the same process used to get the count of parameters
+        # of sublayers that we want to compress, but we select all sublayers
         budget_layers_str = generate_paths(
             mlp=True,
             q=True,
@@ -871,14 +877,15 @@ def compress_svd_llm(
             include_bias=False,
         )
 
+        # Count of parameters of all targetable sublayers
         target_total_params = sum(budget_param_count_map[k] for k in budget_layers_str)
 
-        print("\n[BUDGET] Ratio scope: ALL_TARGETABLE")
+        print("\n[BUDGET] Ratio scope: ALL")
         print(f"[BUDGET] Selected compressible params: {selected_total_params:,}")
         print(f"[BUDGET] Target denominator params:    {target_total_params:,}")
         print(f"[BUDGET] Selected fraction:           {selected_total_params / target_total_params:.6f}")
         print(
-            f"[BUDGET] If homogeneous over selected only, needed selected ratio would be "
+            f"[BUDGET] If homogeneous over selected only, needed selected ratio to reach the desired overall compression ratio of {ratio} would be "
             f"{(ratio * target_total_params / selected_total_params):.6f}"
         )
     else:
@@ -911,11 +918,11 @@ def compress_svd_llm(
             print(f"[WARNING] Whitening matrices for this model do not exist in this path: {whitening_mat_actual_path}. Generating in place...")
             print("=== WHITENING MATRICES GENERATION ===")
             whitening_matrices = get_whitening_matrices(
-                model, # pyright: ignore[reportArgumentType]
+                model,
                 model_name,
                 calibration_dataloader,
                 layers_str,
-                max(max_length * dataset["max_samples"], 1),
+                max(max_length * dataset["max_samples"], 1), # overall count of tokens of the calibration dataset
                 device,
                 is_v2,
                 save_path or "./tmp",
@@ -925,11 +932,11 @@ def compress_svd_llm(
     else:
         print("=== WHITENING MATRICES GENERATION ===")
         whitening_matrices = get_whitening_matrices(
-            model, # pyright: ignore[reportArgumentType]
+            model,
             model_name,
             calibration_dataloader,
             layers_str,
-            max(max_length * dataset["max_samples"], 1),
+            max(max_length * dataset["max_samples"], 1), # overall count of tokens of the calibration dataset
             device,
             is_v2,
             save_path or "./tmp",
@@ -943,8 +950,8 @@ def compress_svd_llm(
         print("[DEBUG] Whitening-only run complete. Exiting before compression/evaluation.")
         raise SystemExit(0)
 
-    print("=== LLM COMPRESSION ===")
 
+    print("=== LLM COMPRESSION ===")
     rank_map = {}
     steps: int = 1
     steps_counter: int = 1
@@ -978,67 +985,70 @@ def compress_svd_llm(
             target_total_params=target_total_params
         )
         print(f"[BUDGET] Score probe ratio for active layers: {score_probe_ratio:.6f}")
-        for i, (layer, attr) in tqdm(
-            enumerate(zip(layers_list, attributes)),
-            total=len(layers_list),
-            desc=f"Step {steps_counter}/{steps}: Computing scores..."
-        ):
-            # Skip scoring phase for bypassed layers
-            match = re.search(r'\.layers\.(\d+)\.', layers_str[i])
-            layer_idx = int(match.group(1)) if match else -1
-            if 0 <= layer_idx < bypass_early_layers:
-                continue
+        with torch.inference_mode():
+            for i, (layer, attr) in tqdm(
+                enumerate(zip(layers_list, attributes)),
+                total=len(layers_list),
+                desc=f"Step {steps_counter}/{steps}: Computing scores..."
+            ):
+                # Skip scoring phase for bypassed layers
+                match = re.search(r'\.layers\.(\d+)\.', layers_str[i])
+                layer_idx = int(match.group(1)) if match else -1
+                if 0 <= layer_idx < bypass_early_layers:
+                    continue
 
-            # Get weight and normalized whitening matrix
-            layer_attr = getattr(layer, attr)
-            W = layer_attr.weight.data.to(device, dtype=torch.float64)
+                # Get weight and normalized whitening matrix
+                layer_attr = getattr(layer, attr)
+                W = layer_attr.weight.detach().to(device, dtype=torch.float64)
 
-            if is_v2:
-                # Perform SVD on whitening matrix (S)
-                U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
+                if is_v2:
+                    # Perform SVD on whitening matrix (S)
+                    U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
 
-                # Auxiliary matrix
-                L_s_sqrt = torch.sqrt(torch.clamp(L_s, min=0.0))
+                    # Auxiliary matrix
+                    L_s_sqrt = torch.sqrt(torch.clamp(L_s, min=0.0))
 
-                # Perform SVD on W x U_s x sqrt(L_s)
-                D = torch.matmul(W, U_s)
-                D.mul_(L_s_sqrt.unsqueeze(0))
-                # Calculate svdvals only
-                L = torch.linalg.svdvals(D)
-            else:
-                whitening_matrix = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
-                WS = torch.matmul(W, whitening_matrix) # pyright: ignore[reportArgumentType]
-                L = torch.linalg.svdvals(WS)
+                    # Perform SVD on W x U_s x sqrt(L_s)
+                    D = torch.matmul(W, U_s)
+                    D.mul_(L_s_sqrt.unsqueeze(0))
+                    # Calculate singular values only
+                    L = torch.linalg.svdvals(D)
+                else:
+                    whitening_matrix = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
+                    # Perform SVD on W x Chol(XXT)
+                    WS = torch.matmul(W, whitening_matrix) # pyright: ignore[reportArgumentType]
+                    # Calculate singular values only
+                    L = torch.linalg.svdvals(WS)
 
-            # Compute a tentative rank under the uniform target ratio.
-            rank = int(
-                (W.shape[0] * W.shape[1] * (1.0 - score_probe_ratio))
-                / (W.shape[0] + W.shape[1])
-            )
-            rank = max(1, min(rank, L.shape[0] - 1))
+                # Compute a tentative rank under the uniform target ratio.
+                rank = int(
+                    (W.shape[0] * W.shape[1] * (1.0 - score_probe_ratio))
+                    / (W.shape[0] + W.shape[1])
+                )
+                rank = max(1, min(rank, L.shape[0] - 1))
 
-            # Calculate score metric
-            match score_metric:
-                case "truncation":
-                    # After whitening, theoretical truncation loss equals to the L2 norm of truncated singular values = 2-schatten norm = Frobenius norm
-                    score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=2).item()
-                case "entropy":
-                    # After whitening, entropy loss equals the sum of normalized singular values of the tail
-                    norm_spectrum = L/L.sum()
-                    score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:] + 1e-9)).sum().item()
-                case s if s.startswith('norm'):
-                    if s.split("|")[1].startswith("-"):
-                        p_norm_value = -float(s.split("|")[1][1:])
-                    else:
-                        p_norm_value = float(s.split("|")[1])
-                    # After whitening, norm loss equals to the Lp norm of truncated singular values = p-schatten norm
-                    # WARNING: if `p_norm_value`=2 this is the same of `truncation` case
-                    score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=p_norm_value).item()
-                    
+                # Calculate score metric
+                match score_metric:
+                    case "truncation":
+                        # After whitening, theoretical truncation loss equals to the L2 norm of truncated singular values = 2-schatten norm = Frobenius norm
+                        score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=2).item()
+                    case "entropy":
+                        # After whitening, entropy loss equals the sum of normalized singular values of the tail - TODO what if we don't normalize?
+                        norm_spectrum = L/L.sum()
+                        score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:] + 1e-9)).sum().item()
+                    case s if s.startswith('norm'):
+                        if s.split("|")[1].startswith("-"):
+                            p_norm_value = -float(s.split("|")[1][1:])
+                        else:
+                            p_norm_value = float(s.split("|")[1])
+                        # After whitening, norm loss equals to the Lp norm of truncated singular values = p-schatten norm
+                        # WARNING: if `p_norm_value`=2 this is the same of `truncation` case
+                        score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=p_norm_value).item()
+                        
 
-            # Free up vram and ram
-            W = whitening_matrix = WS = L = U_s = L_s = L_s_sqrt = D = None
-            del W, whitening_matrix, WS, L, U_s, L_s, L_s_sqrt, D
+                # Free up vram and ram
+                W = whitening_matrix = WS = L = U_s = L_s = L_s_sqrt = D = None
+                del W, whitening_matrix, WS, L, U_s, L_s, L_s_sqrt, D
 
         # Allocate compression ratios to each layer based on score metric
         ratio_map = allocate_ratios(
@@ -1090,143 +1100,143 @@ def compress_svd_llm(
 
     # Compress layers using the calculated compression ratios
     vram_usage("Before performing layer compression")
-    for i, (layer, attr) in tqdm(
-        enumerate(zip(layers_list, attributes)),
-        total=len(layers_list),
-        desc=f"Step {steps_counter}/{steps}: Compressing layers..."
-    ):
-        layer_ratio = ratio_map[layers_str[i]]
-        # If the assigned ratio is exactly 0.0, skip SVD and preserve full-rank
-        if layer_ratio == 0.0:
-            continue
+    with torch.inference_mode():
+        for i, (layer, attr) in tqdm(
+            enumerate(zip(layers_list, attributes)),
+            total=len(layers_list),
+            desc=f"Step {steps_counter}/{steps}: Compressing layers..."
+        ):
+            layer_ratio = ratio_map[layers_str[i]]
+            # If the assigned ratio is exactly 0.0, skip SVD and preserve full-rank
+            if layer_ratio == 0.0:
+                continue
 
-        # Get weight matrix
-        layer_attr = getattr(layer, attr)
-        W = layer_attr.weight.data.to(device, dtype=torch.float64)
-        
-        # Compute rank from compression ratio
-        rank = int((W.shape[0] * W.shape[1] * (1 - layer_ratio)) / (W.shape[0] + W.shape[1]))
-        
-        if is_v2:
-            # heterogeneous-v2 path - stream U_s and L_s calculated while generating the whitening matrices
-            U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=False)
-            L_s_clean = torch.clamp(L_s, min=0.0)
+            # Get weight matrix
+            layer_attr = getattr(layer, attr)
+            W = layer_attr.weight.detach().to(device, dtype=torch.float64)
+            
+            # Compute rank from compression ratio
+            rank = int((W.shape[0] * W.shape[1] * (1 - layer_ratio)) / (W.shape[0] + W.shape[1]))
+            
+            if is_v2:
+                # heterogeneous-v2 path - stream U_s and L_s calculated during the previous steps
+                U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=False)
+                L_s_clean = torch.clamp(L_s, min=0.0)
 
-            # Auxiliary matrix
-            L_s_sqrt = torch.sqrt(L_s_clean)            
+                # Auxiliary matrix
+                L_s_sqrt = torch.sqrt(L_s_clean)            
 
-            # Perform SVD on W x U_s x sqrt(L_s)
-            D = torch.matmul(W, U_s)
-            D.mul_(L_s_sqrt.unsqueeze(0))
-            # Free W as soon as D is ready
-            W = None
-            del W
+                # Perform SVD on W x U_s x sqrt(L_s)
+                D = torch.matmul(W, U_s)
+                D.mul_(L_s_sqrt.unsqueeze(0))
+                # Free W as soon as D is ready
+                W = None
+                del W
 
-            U_ws, L_ws, V_wsT = torch.linalg.svd(D, full_matrices=False)
-            # Free D as soon as U_ws, L_ws and V_wsT are ready
-            D = None
-            del D
+                U_ws, L_ws, V_wsT = torch.linalg.svd(D, full_matrices=False)
+                # Free D as soon as U_ws, L_ws and V_wsT are ready
+                D = None
+                del D
 
-            # Calculate sqrt(L_s) and U_s inverse matrices
-            eig_max = float(L_s_clean.max())
-            tau = max(eig_max * 1e-6, 1e-20)
-            L_s_sqrt_inv = torch.where(
-                L_s_clean > tau,
-                torch.rsqrt(L_s_clean),
-                torch.zeros_like(L_s_clean),
-            )
-            U_s_inv_L_s_sqrt_inv = (U_s * L_s_sqrt_inv.unsqueeze(0)).T
+                # Calculate 1/sqrt(L_s) and U_s inverse matrices
+                L_s_sqrt_inv = torch.rsqrt(L_s_clean)
+                U_s_inv_L_s_sqrt_inv = (U_s * L_s_sqrt_inv.unsqueeze(0)).T
 
-            # Free U_s and L_s
-            U_s = L_s = L_s_sqrt = None
-            del U_s, L_s, L_s_sqrt
+                # Free U_s and L_s
+                U_s = L_s = L_s_sqrt = None
+                del U_s, L_s, L_s_sqrt
 
-            # Calculate final rank and truncate matrices
-            rank = max(1, min(rank, L_ws.shape[0] - 1))
-            rank_map[layers_str[i]] = rank
-            U_ws_r = U_ws[:, :rank]
-            L_ws_r = L_ws[:rank]
-            V_wsT_r = V_wsT[:rank, :]
+                # Calculate final rank and truncate matrices
+                rank = max(1, min(rank, L_ws.shape[0] - 1))
+                rank_map[layers_str[i]] = rank
+                U_ws_r = U_ws[:, :rank].contiguous()
+                L_ws_r = L_ws[:rank].clone()
+                V_wsT_r = V_wsT[:rank, :].contiguous()
 
-            # Free full-rank matrices as soon as truncated slices are built
-            U_ws = L_ws = V_wsT = L_s_sqrt_inv = None
-            del U_ws, L_ws, V_wsT, L_s_sqrt_inv
+                # Free full-rank matrices as soon as truncated slices are built
+                U_ws = L_ws = V_wsT = L_s_sqrt_inv = None
+                del U_ws, L_ws, V_wsT, L_s_sqrt_inv
 
-            # Compute approximate weight matrix, split in two matrices
-            L_ws_r_sqrt = torch.sqrt(L_ws_r)
-            W_u = (U_ws_r * L_ws_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
-            W_v = torch.matmul(L_ws_r_sqrt.unsqueeze(1) * V_wsT_r, U_s_inv_L_s_sqrt_inv).cpu().to(layer_attr.weight.dtype)
-            # Free low-rank matrices, leave only W_u and W_v
-            U_ws_r = L_ws_r = V_wsT_r = L_ws_r_sqrt = U_s_inv_L_s_sqrt_inv = None
-            del U_ws_r, L_ws_r, V_wsT_r, L_ws_r_sqrt, U_s_inv_L_s_sqrt_inv
-        else:
-            # Get normalized whitening matrix
-            whitening_matrix = load_whitening_data(whitening_matrices, layers_str[i], device, keep=False)
+                # Compute approximate weight matrix, split in two matrices
+                L_ws_r_sqrt = torch.sqrt(L_ws_r)
+                W_u = (U_ws_r * L_ws_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
+                W_v = torch.matmul(L_ws_r_sqrt.unsqueeze(1) * V_wsT_r, U_s_inv_L_s_sqrt_inv).cpu().to(layer_attr.weight.dtype)
+                # Free low-rank matrices, leave only W_u and W_v
+                U_ws_r = L_ws_r = V_wsT_r = L_ws_r_sqrt = U_s_inv_L_s_sqrt_inv = None
+                del U_ws_r, L_ws_r, V_wsT_r, L_ws_r_sqrt, U_s_inv_L_s_sqrt_inv
+            else:
+                # Get normalized whitening matrix
+                whitening_matrix = load_whitening_data(whitening_matrices, layers_str[i], device, keep=False)
 
-            # Compute the inverse of the normalized whitening matrix
-            try:
-                whitening_matrix_inv = torch.linalg.inv(whitening_matrix)
-            except Exception as e:
-                print("[WARNING] whitening_matrix is not full rank!")
-                # Because the matrix is normalized, 1e-6 * eye is statistically relevant
-                whitening_matrix += 1e-6 * torch.eye(
-                    whitening_matrix.shape[0], # type: ignore
-                    dtype=whitening_matrix.dtype # pyright: ignore[reportAttributeAccessIssue]
-                ).to(device)
-                whitening_matrix_inv = torch.linalg.inv(whitening_matrix)
+                # Compute the inverse of the normalized whitening matrix
+                try:
+                    whitening_matrix_inv = torch.linalg.inv(whitening_matrix)
+                except Exception as e:
+                    print("[WARNING] whitening_matrix is not full rank!")
+                    # Because the matrix is normalized, 1e-6 * eye is statistically relevant
+                    whitening_matrix += 1e-6 * torch.eye(
+                        whitening_matrix.shape[0], # type: ignore
+                        dtype=whitening_matrix.dtype # pyright: ignore[reportAttributeAccessIssue]
+                    ).to(device)
+                    whitening_matrix_inv = torch.linalg.inv(whitening_matrix)
 
-            # Perform SVD on W x S
-            WS = torch.matmul(W, whitening_matrix)  # pyright: ignore[reportArgumentType]
-            # Free whitening_matrix and W as soon as WS is ready
-            W = whitening_matrix = None # pyright: ignore[reportArgumentType]
-            del W, whitening_matrix
+                # Perform SVD on W x S
+                WS = torch.matmul(W, whitening_matrix)  # pyright: ignore[reportArgumentType]
+                # Free whitening_matrix and W as soon as WS is ready
+                W = whitening_matrix = None # pyright: ignore[reportArgumentType]
+                del W, whitening_matrix
 
-            U, L, VT = torch.linalg.svd(WS, full_matrices=False)
-            # Free WS as soon as U, L and VT are ready
-            WS = None
-            del WS
+                U, L, VT = torch.linalg.svd(WS, full_matrices=False)
+                # Free WS as soon as U, L and VT are ready
+                WS = None
+                del WS
 
-            # Calculate final rank and truncate matrices
-            rank = max(1, min(rank, L.shape[0] - 1))
-            rank_map[layers_str[i]] = rank
-            U_r = U[:, :rank]
-            L_r_sqrt = torch.sqrt(L[:rank])
-            VT_r = torch.matmul(VT[:rank, :], whitening_matrix_inv)
-            # Free full-rank matrices as soon as truncated slices are built
-            U = L = VT = whitening_matrix_inv = None
-            del U, L, VT, whitening_matrix_inv
+                # Calculate final rank and truncate matrices
+                rank = max(1, min(rank, L.shape[0] - 1))
+                rank_map[layers_str[i]] = rank
+                U_r = U[:, :rank].contiguous()
+                L_r_sqrt = torch.sqrt(L[:rank].clone())
+                VT_r = torch.matmul(VT[:rank, :].contiguous(), whitening_matrix_inv)
+                # Free full-rank matrices as soon as truncated slices are built
+                U = L = VT = whitening_matrix_inv = None
+                del U, L, VT, whitening_matrix_inv
 
-            # Compute approximate weight matrix, split in two matrices
-            W_u = (U_r * L_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
-            W_v = (VT_r * L_r_sqrt.unsqueeze(1)).cpu().to(layer_attr.weight.dtype)
-            # Free low-rank matrices, leave only W_u and W_v
-            U_r = VT_r = L_r_sqrt = None
-            del U_r, VT_r, L_r_sqrt
+                # Compute approximate weight matrix, split in two matrices
+                W_u = (U_r * L_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
+                W_v = (VT_r * L_r_sqrt.unsqueeze(1)).cpu().to(layer_attr.weight.dtype)
+                # Free low-rank matrices, leave only W_u and W_v
+                U_r = VT_r = L_r_sqrt = None
+                del U_r, VT_r, L_r_sqrt
 
-        # Replace the original nn.Linear with the LowRank module, which implements the forward pass as W_u(W_v(x)).
-        van = LowRank(
-            layer_attr.in_features,
-            layer_attr.out_features,
-            rank,
-            layer_attr.bias is not None
-        ).to(device="cpu", dtype=layer_attr.weight.dtype)
-        with torch.no_grad():
+            # Replace the original nn.Linear with the LowRank module, which implements the forward pass as W_u(W_v(x)).
+            van = LowRank(
+                layer_attr.in_features,
+                layer_attr.out_features,
+                rank,
+                layer_attr.bias is not None
+            ).to(device="cpu", dtype=layer_attr.weight.dtype)
+            van.requires_grad_(False)
+
             van.W_u.weight.copy_(W_u)
             van.W_v.weight.copy_(W_v)
             if layer_attr.bias is not None:
                 van.W_u.bias.copy_(layer_attr.bias.detach().to(van.W_u.bias.dtype))
 
-        setattr(layer, attr, van)
+            setattr(layer, attr, van)
 
-        # Free ram and vram from all leftover matrices
-        W_u = W_v = None
-        del W_u, W_v
+            # Free ram and vram from all leftover matrices
+            W_u = W_v = None
+            del W_u, W_v
+
     for name, param in model.named_parameters():
         if 'W_v' in name or 'W_u' in name:
-            print(f"{name}: dtype={param.dtype}, device={param.device}, norm={param.norm():.4f}")
+            print(f"{name}: dtype={param.dtype}, device={param.device}, norm={param.detach().norm():.4f}")
             break  # just check the first one
     ram_usage("After performing layer compression")
     vram_usage("After performing layer compression")
+
+    model.requires_grad_(False) # No fine tuning is needed
+    model.eval()
 
     if save_path:
         print("[DEBUG] Saving compressed model to disk...")
@@ -1272,10 +1282,10 @@ def compress_svd_llm(
            ".pt")
         print("[DEBUG] Compressed model saved succesfully")
 
-    torch.cuda.empty_cache()
-    gc.collect()
+    cuda_cleanup()
     return model, tokenizer
 
+# TODO - define transformers model and (possibly) save to huggingface. This would reduce exposure to bugs during compressed model loading
 def apply_lowrank(model, rank_map):
     """
     Replace MLP linear layers with LowRank modules.
@@ -1297,5 +1307,6 @@ def apply_lowrank(model, rank_map):
             rank=rank,
             bias=old.bias is not None,
         ).to(device=old.weight.device, dtype=old.weight.dtype)
+        lowrank.requires_grad_(False)
 
         setattr(parent, attr_name, lowrank)

@@ -6,7 +6,8 @@ import json
 import torch
 import lm_eval
 import multiprocessing as mp
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers.models import GenerationConfig
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import setup_logging, handle_non_serializable
 
@@ -503,8 +504,6 @@ if __name__ == "__main__":
 
         if tasks_dict is not None and len(tasks_dict) > 0:
             model.config.use_cache = True
-            #model.generation_config.max_new_tokens = args.max_eval_tokens
-            model.generation_config.max_length = args.max_eval_tokens # pyright: ignore[reportOptionalMemberAccess]
             model.generation_config.max_new_tokens = args.max_eval_tokens # pyright: ignore[reportOptionalMemberAccess]
             # WARNING - PyRight reports lots of issues when dealing with lm-eval-harness 
             eval_model = HFLM(
@@ -550,14 +549,14 @@ if __name__ == "__main__":
             results["results"] = {} # pyright: ignore[reportOptionalSubscript]
 
         if wikitext_ppl is not None:
-            results["results"]["wikitext"] = { # pyright: ignore[reportOptionalSubscript]
+            results["results"]["wikitext"] = { # pyright: ignore
                 "alias": "wikitext",
                 "token_perplexity,none": wikitext_ppl,
                 "token_perplexity_stderr,none": "N/A"
             }
 
         if c4_ppl is not None:
-            results["results"]["c4"] = { # pyright: ignore[reportOptionalSubscript]
+            results["results"]["c4"] = { # pyright: ignore
                 "alias": "c4",
                 "token_perplexity,none": c4_ppl,
                 "token_perplexity_stderr,none": "N/A"

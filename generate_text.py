@@ -2,21 +2,13 @@ import argparse
 import gc
 import os
 import re
-import sys
 import torch
-
 from typing import List
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig
-
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers.models import GenerationConfig
 from src.svd_llm import apply_lowrank
-from src.utils import DtypeMap
+from src.utils import DtypeMap, cuda_cleanup
 
-
-def cuda_cleanup():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
 def safe_filename(name: str) -> str:
     name = os.path.basename(name)
@@ -29,13 +21,6 @@ def safe_pad_token_setup(tokenizer, model):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    eos = model.generation_config.eos_token_id
-    if eos is None:
-        eos = tokenizer.eos_token_id
-        model.generation_config.eos_token_id = eos
-    pad_id = eos[0] if isinstance(eos, (list, tuple)) else eos
-
-    model.generation_config.pad_token_id = pad_id
     tokenizer.padding_side = "left"
 
 
@@ -141,11 +126,6 @@ def load_compressed_model(
     except Exception as e:
         print(f"[WARNING] Could not load generation_config for {base_model_name}: {e}")
         model.generation_config = GenerationConfig.from_model_config(config)
-    eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
-    if eos is None:
-        eos = tokenizer.eos_token_id
-        model.generation_config.eos_token_id = eos # pyright: ignore[reportOptionalMemberAccess]
-    model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
 
     print("[LOAD] Applying LowRank module structure...")
     apply_lowrank(model, rank_map)
@@ -259,7 +239,7 @@ def generate_text(
 
     text = tokenizer.decode(
         generated_ids,
-        skip_special_tokens=True,
+        skip_special_tokens=False,
         clean_up_tokenization_spaces=True,
     )
 

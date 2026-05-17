@@ -10,7 +10,7 @@ import resource
 from typing import Dict, Optional, List
 from tqdm import tqdm
 from enum import Enum
-from datasets import load_dataset, load_from_disk, Dataset
+from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, DatasetInfo
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
 # Threshold above which cuSOLVER 32-bit indexing overflows
@@ -108,8 +108,8 @@ def concatenate_text(batch):
 def tokenize_concatenated(batch, tokenizer: Qwen2TokenizerFast):
         return tokenizer(
             batch["concatenated"],
-            truncation=False,           # we want the full token stream
-            padding=False,              # absolutely no padding
+            truncation=False, # we want the full token stream
+            padding=False, # no padding
             return_attention_mask=False # we'll create all-ones masks later
         )
 
@@ -146,13 +146,13 @@ def tokenize_dataset(
     print(f"[DEBUG] Dataset name/path: {name}")
     if os.path.isdir(name):
         print("[DEBUG] Loading dataset from disk...")
-        df = load_from_disk(name + "/" + split)
+        df: Dataset = load_from_disk(name + "/" + split) # pyright: ignore[reportAssignmentType]
     else:
         print("[DEBUG] Loading dataset from hub...")
         if subset is not None:
-            df = load_dataset(path=name, name=subset, split=split, num_proc=8)
+            df: Dataset = load_dataset(path=name, name=subset, split=split, num_proc=8) # pyright: ignore[reportAssignmentType]
         else:
-            df = load_dataset(path=name, split=split, num_proc=8)
+            df: Dataset = load_dataset(path=name, split=split, num_proc=8)
         if save_path and not os.path.exists(save_path + "/calibration_datasets/" + name + "/" + split):
             print("[DEBUG] Saving dataset to disk...")
             df.save_to_disk(save_path + "/calibration_datasets/" + name + "/" + subset + "/" + split)
@@ -162,7 +162,7 @@ def tokenize_dataset(
         concatenate_text,
         batched=True,
         batch_size=len(df), # process entire dataset in one batch
-        remove_columns=df.column_names, # pyright: ignore[reportArgumentType]
+        remove_columns=df.column_names,
         load_from_cache_file=False,
         desc="Concatenating text..."
     )
@@ -198,7 +198,6 @@ def tokenize_dataset(
     # Step 5: Randomly sample overlapping fixed-length chunks
     # Wrap the flat token list into a temporary Dataset so we can use .map()
     chunk_input = Dataset.from_dict({"token_stream": [all_token_ids]})
-
     chunked = chunk_input.map(
         sample_chunks,
         batched=True,
@@ -273,6 +272,7 @@ def make_captured_meta(captured: List[Dict]) -> List[Dict]:
                 "position_ids": entry.get("position_ids", None),
                 "cache_position": entry.get("cache_position", None),
                 "position_embeddings": entry.get("position_embeddings", None),
+                "past_key_values": entry.get("past_key_values", None),
             })
 
         return meta
@@ -354,8 +354,8 @@ def try_load_activation_checkpoint(act_ckpt_dir: str, model_name: str, version_s
             gc.collect()
             return False, None, None, None
 
-        inps = payload["inps"]
-        captured_meta = payload["captured_meta"]
+        inps: List[torch.Tensor] = payload["inps"]
+        captured_meta: List[Dict] = payload["captured_meta"]
 
         if len(inps) != len(captured_meta):
             print("[ACT-CKPT][WARNING] Checkpoint batch count mismatch. Ignoring checkpoint.")
@@ -407,7 +407,7 @@ def build_param_count_map(
     """
     Counts parameters affected by compression.
 
-    Default include_bias=False because your low-rank ratio formula compresses
+    Default include_bias=False because our low-rank ratio formula compresses
     only weight params. Bias is preserved unchanged.
     """
     param_count_map = {}
@@ -481,22 +481,27 @@ def _redundancy_from_scores(scores: torch.Tensor, offset: float = 1.5) -> torch.
 
     So redundancy weight is 1 / log(score).
     """
+    # TODO - print a warning when fallback is triggered
     scores = scores.to(torch.float64)
+    # Handle nan and infinite values (fallback)
     scores = torch.nan_to_num(
         scores,
         nan=1.0 + 1e-6,
         posinf=1e30,
         neginf=1.0 + 1e-6,
     )
+    # Handle negative values (fallback)
     scores = torch.clamp(scores, min=0.0)
 
     if offset <= 1.0:
         raise ValueError("`offset` must be > 1.0")
 
-    # Shift the score to guarantee it is strictly > 1.0 before ratio allocation. Adding 1.5 provides a safe buffer away from the log(1) cliff.
+    # Shift the score to guarantee it is strictly > 1.0 before ratio allocation.
     weights = 1.0 / torch.log(scores + offset)
+    # Handle nan and infinite values (fallback)
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # TODO - understand this fallback ???
     if weights.sum() <= 0:
         weights = torch.ones_like(weights)
 
@@ -543,6 +548,7 @@ def allocate_param_weighted_group(
 
         denom = (p * w).sum()
 
+        # TODO - log when fallback is used
         if denom <= 0:
             w = torch.ones_like(w)
             denom = (p * w).sum()
@@ -594,7 +600,7 @@ def ppl_eval(
     """
     # Concatenate all samples with "\n\n"
     data = load_dataset(path=dataset_name, name=subset, split=split, num_proc=8)
-    text = "\n\n".join(data["text"])
+    text = "\n\n".join(data["text"]) # pyright: ignore
     encodings = tokenizer(text, truncation=False, padding=False, return_tensors="pt")
 
     # input_ids has shape [1, total_tokens]; we take [0] to get a 1D tensor
