@@ -6,8 +6,7 @@ import json
 import torch
 import lm_eval
 import multiprocessing as mp
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from transformers.models import GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, GenerationConfig
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import setup_logging, handle_non_serializable
 

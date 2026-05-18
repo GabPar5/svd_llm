@@ -10,11 +10,14 @@ import resource
 from typing import Dict, Optional, List
 from tqdm import tqdm
 from enum import Enum
-from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, DatasetInfo
+from datasets import load_dataset, load_from_disk, Dataset
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
 # Threshold above which cuSOLVER 32-bit indexing overflows
 SOLVER_GPU_MAX_DIM = 32000
+
+class CatcherExit(Exception):
+    pass
 
 class GroupBy(str, Enum):
     GLOBAL="global"
