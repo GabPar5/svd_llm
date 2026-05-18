@@ -222,7 +222,7 @@ def get_whitening_matrices(
                 if entry["past_key_values"] is not None:
                     entry["past_key_values"] = entry["past_key_values"].detach().cpu()
 
-                raise ValueError
+                raise CatcherExit(Exception)
 
         # Move layer_0 to device and replace it with catcher
         decoder_layers[0] = decoder_layers[0].to(device)
@@ -230,7 +230,7 @@ def get_whitening_matrices(
         decoder_layers[0] = Catcher(original_layer0)
 
         # Catch inputs
-        with torch.inference_mode():
+        with torch.no_grad():
             for batch in tqdm(loader, desc="Capturing layer_0 inputs"):
                 try:
                     batch = {
@@ -239,8 +239,7 @@ def get_whitening_matrices(
                         if k in ("input_ids", "attention_mask")
                     }
                     model(**batch, use_cache=False)
-                except ValueError as e:
-                    print(f"[WARNING] ValueError during calibration inference: {e}")
+                except CatcherExit as e:
                     pass
                 finally:
                     del batch
@@ -303,7 +302,7 @@ def get_whitening_matrices(
                 handles.append(la.register_forward_hook(hook))
 
         # Replay every calibration batch through this decoder layer.
-        with torch.inference_mode():
+        with torch.no_grad():
             for j, entry in enumerate(captured):
                 inp_j = inps[j].to(device)
 
@@ -800,7 +799,7 @@ def compress_svd_llm(
         use_safetensors=True,
         token=hf_token,
         trust_remote_code=True
-    )
+    ) # type: ignore
     ram_usage("After loading original model")
     vram_usage("After loading original model")
 
@@ -985,7 +984,7 @@ def compress_svd_llm(
             target_total_params=target_total_params
         )
         print(f"[BUDGET] Score probe ratio for active layers: {score_probe_ratio:.6f}")
-        with torch.inference_mode():
+        with torch.no_grad():
             for i, (layer, attr) in tqdm(
                 enumerate(zip(layers_list, attributes)),
                 total=len(layers_list),
@@ -1100,7 +1099,7 @@ def compress_svd_llm(
 
     # Compress layers using the calculated compression ratios
     vram_usage("Before performing layer compression")
-    with torch.inference_mode():
+    with torch.no_grad():
         for i, (layer, attr) in tqdm(
             enumerate(zip(layers_list, attributes)),
             total=len(layers_list),

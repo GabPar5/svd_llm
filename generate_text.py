@@ -1,11 +1,9 @@
 import argparse
-import gc
 import os
 import re
 import torch
 from typing import List
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from transformers.models import GenerationConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig
 from src.svd_llm import apply_lowrank
 from src.utils import DtypeMap, cuda_cleanup
 
@@ -189,7 +187,7 @@ def build_prompt(
     )
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def generate_text(
     model,
     tokenizer,
