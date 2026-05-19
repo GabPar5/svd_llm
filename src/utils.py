@@ -2,6 +2,7 @@ import os
 import gc
 import psutil
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 import random
 import sys
@@ -574,6 +575,70 @@ def allocate_param_weighted_group(
         active[clipped_idx] = False
 
     return {k: float(r) for k, r in zip(keys, ratios.tolist())}
+
+@torch.no_grad()
+def check_lowrank_equivalence(layer_name, layer_attr, van, device="cuda", dtype=torch.bfloat16):
+    x = torch.randn(
+        2, 8, layer_attr.in_features,
+        device=device,
+        dtype=layer_attr.weight.dtype,
+    )
+
+    W_hat = van.W_u.weight.to(device, dtype=dtype) @ van.W_v.weight.to(device, dtype=dtype)
+    b = van.W_u.bias.to(device, dtype=dtype) if van.W_u.bias is not None else None
+
+    y_dense_hat = F.linear(x, W_hat, b)
+    y_lowrank = van.to(device, dtype=dtype)(x)
+
+    rel = (y_dense_hat - y_lowrank).norm() / y_dense_hat.norm().clamp_min(1e-12)
+    print(f"[CHECK] {layer_name}: lowrank-vs-dense relerr={rel.item():.3e}")
+
+    if not torch.isfinite(y_lowrank).all():
+        raise RuntimeError(f"{layer_name}: LowRank output has NaN/Inf")
+
+    van.cpu()
+
+@torch.no_grad()
+def check_layer_activation_error(name, old_linear, lowrank, in_features, device="cuda", dtype=torch.bfloat16):
+    x = torch.randn(2, 128, in_features, device=device, dtype=dtype)
+
+    old_linear = old_linear.to(device, dtype=dtype).eval()
+    lowrank = lowrank.to(device, dtype=dtype).eval()
+
+    y0 = old_linear(x)
+    y1 = lowrank(x)
+
+    rel = (y0.float() - y1.float()).norm() / y0.float().norm().clamp_min(1e-12)
+    max_abs = (y0.float() - y1.float()).abs().max()
+
+    print(
+        f"[APPROX-ACT] {name}: "
+        f"rel_act_err={rel.item():.6e}, "
+        f"max_abs={max_abs.item():.6e}, "
+        f"y0_norm={y0.float().norm().item():.6e}, "
+        f"y1_norm={y1.float().norm().item():.6e}"
+    )
+
+    lowrank.cpu()
+    old_linear.cpu()
+
+@torch.no_grad()
+def logits_debug(model, tokenizer, text, device="cuda"):
+    model.eval()
+    inputs = tokenizer(text, return_tensors="pt").to(device)
+
+    out = model(**inputs, use_cache=False)
+    logits = out.logits[:, -1, :].float()
+
+    print("finite logits:", torch.isfinite(logits).all().item())
+    print("logits norm:", logits.norm().item())
+    print("logits min/max:", logits.min().item(), logits.max().item())
+
+    probs = torch.softmax(logits, dim=-1)
+    vals, ids = torch.topk(probs, k=10, dim=-1)
+
+    for p, tid in zip(vals[0].tolist(), ids[0].tolist()):
+        print(f"{p:.5f}", repr(tokenizer.decode([tid])))
 
 @torch.no_grad()
 def ppl_eval(

@@ -23,6 +23,9 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.set_float32_matmul_precision("highest")
 
+# TODO reconstruct full weight matrix (don't truncate) and compare it with original (DIAGNOSTICS)
+# TODO pass random calibration sample to `check_layer_activation_error` (DIAGNOSTICS)
+
 class LowRank(torch.nn.Module):
     def __init__(self, in_features, out_features, rank, bias):
         super().__init__()
@@ -806,6 +809,9 @@ def compress_svd_llm(
     # Set model to evaluation mode
     model.eval()
 
+    # Inspect uncompressed model logits
+    logits_debug(model, tokenizer, "The responsibility of an AI assistant is", "cpu")
+
     # Preprocess calibration dataset
     print("=== DATASET PREPROCESSING ===")
     vram_usage("Before loading dataset")
@@ -1221,16 +1227,41 @@ def compress_svd_llm(
             if layer_attr.bias is not None:
                 van.W_u.bias.copy_(layer_attr.bias.detach().to(van.W_u.bias.dtype))
 
+            # Check lowrank module equivalence to a single nn.Linear
+            check_lowrank_equivalence(
+                layers_str[i], 
+                layer_attr, 
+                van, 
+                device="cuda", 
+                dtype=layer_attr.weight.dtype
+            )
+
+            # Check activation relative error between compressed and original layer
+            check_layer_activation_error(
+                layers_str[i],
+                layer_attr,
+                van,
+                layer_attr.in_features,
+                device=device,
+                dtype=layer_attr.weight.dtype,
+            )
+
             setattr(layer, attr, van)
 
             # Free ram and vram from all leftover matrices
             W_u = W_v = None
             del W_u, W_v
 
-    for name, param in model.named_parameters():
-        if 'W_v' in name or 'W_u' in name:
-            print(f"{name}: dtype={param.dtype}, device={param.device}, norm={param.detach().norm():.4f}")
-            break  # just check the first one
+    # Inspect lowrank matrices
+    for name, p in model.named_parameters():
+        if "W_u" in name or "W_v" in name:
+            print(name, p.dtype, p.device, torch.isfinite(p).all().item(), p.norm().item())
+            if not torch.isfinite(p).all():
+                raise RuntimeError(f"{name} has NaN/Inf")
+    
+    # Inspect compressed model logits
+    logits_debug(model, tokenizer, "The responsibility of an AI assistant is", "cpu")
+
     ram_usage("After performing layer compression")
     vram_usage("After performing layer compression")
 

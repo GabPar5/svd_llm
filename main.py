@@ -156,7 +156,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--bypass_early_layers', 
         type=int, 
-        default=2, 
+        default=-1, 
         help='Number of starting layers which bypass heterogeneous compression (or compression at all)'
     )
     parser.add_argument(
@@ -464,11 +464,15 @@ if __name__ == "__main__":
         print(f"[DEBUG] HF model context length: {model.config.max_position_embeddings}")
 
         # Clamp max model context
-        max_length = min(
+        max_gen_task_context_length = min(
             args.eval_max_length,
             model.config.max_position_embeddings - args.max_eval_tokens
         )
-        print(f"[DEBUG] Evaluation context length: {max_length}")
+        max_length = min(
+            args.eval_max_length,
+            model.config.max_position_embeddings
+        )
+        print(f"[DEBUG] Evaluation context length for generation tasks: {max_gen_task_context_length}")
 
         results = {}
         wikitext_ppl = None
@@ -512,7 +516,7 @@ if __name__ == "__main__":
                 max_batch_size=128, # pyright: ignore[reportCallIssue]
                 device = args.device, # pyright: ignore[reportCallIssue]
                 dtype = args.dtype, # pyright: ignore[reportCallIssue]
-                max_length = max_length # pyright: ignore[reportCallIssue]
+                max_length = max_gen_task_context_length # pyright: ignore[reportCallIssue]
             )
             print(f"[DEBUG] HFLM model context length: {eval_model.max_length}") # pyright: ignore[reportAttributeAccessIssue]
 
