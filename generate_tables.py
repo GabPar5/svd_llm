@@ -9,15 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-BENCHMARK_ORDER = [
+LIKELIHOOD_BENCHMARK_ORDER = [
     "wikitext",
     "arc_easy",
     "hellaswag",
     "openbookqa",
     "piqa",
     "winogrande",
-    #"truthfulqa_gen",
-    "gsm8k"
 ]
 
 ACCURACY_BENCHMARKS = [
@@ -26,9 +24,19 @@ ACCURACY_BENCHMARKS = [
     "openbookqa",
     "piqa",
     "winogrande",
-    #"truthfulqa_gen",
-    "gsm8k",
 ]
+
+GENERATION_BENCHMARK_ORDER = [
+    "gsm8k",
+    "truthfulqa_gen",
+]
+
+BENCHMARK_ORDER = LIKELIHOOD_BENCHMARK_ORDER + GENERATION_BENCHMARK_ORDER
+
+BENCHMARK_ALIASES = {
+    "gsm8k": ["gsm8k", "gsm8k_cot"],
+    "truthfulqa_gen": ["truthfulqa_gen"],
+}
 
 BENCHMARK_LABELS_MD = {
     "wikitext": "WikiText ppl ↓",
@@ -37,8 +45,8 @@ BENCHMARK_LABELS_MD = {
     "openbookqa": "OBQA ↑",
     "piqa": "PIQA ↑",
     "winogrande": "WinoG. ↑",
-    #"truthfulqa_gen": "TruthfulQA BLEU ↑",
-    "gsm8k": "GSM8K ↑"
+    "gsm8k": "GSM8K ↑",
+    "truthfulqa_gen": "TruthfulQA ↑",
 }
 
 BENCHMARK_LABELS_LATEX = {
@@ -48,8 +56,8 @@ BENCHMARK_LABELS_LATEX = {
     "openbookqa": r"OBQA $\uparrow$",
     "piqa": r"PIQA $\uparrow$",
     "winogrande": r"WinoG. $\uparrow$",
-    #"truthfulqa_gen": r"TruthfulQA $\uparrow$",
-    "gsm8k": r"GSM8K $\uparrow$"
+    "gsm8k": r"GSM8K $\uparrow$",
+    "truthfulqa_gen": r"TruthfulQA $\uparrow$",
 }
 
 MATRIX_TOKEN_MAP = {
@@ -99,6 +107,22 @@ PREFERRED_METRICS = [
     "acc_norm,none",
     "acc,none",
 ]
+
+GENERATION_METRICS = {
+    "gsm8k": [
+        "exact_match,strict-match",
+        "exact_match,none",
+        "acc,none",
+    ],
+    "truthfulqa_gen": [
+        "bleu_acc,none",
+        "bleu_max,none",
+        "rouge1_acc,none",
+        "rouge1_max,none",
+        "rougeL_acc,none",
+        "rougeL_max,none",
+    ],
+}
 
 def compressed_rows_only(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [row for row in rows if not row.get("is_original", False)]
@@ -388,6 +412,32 @@ def pick_accuracy_metric(task_result: Dict[str, Any]) -> Tuple[Optional[str], Op
     return None, None
 
 
+def clean_metric_name(metric_name: str) -> str:
+    return metric_name.replace(",none", "").replace(",", "_")
+
+
+def pick_generation_metric(benchmark: str, task_result: Dict[str, Any]) -> Tuple[Optional[str], Optional[Any]]:
+    for metric_name in GENERATION_METRICS.get(benchmark, []):
+        if metric_name in task_result:
+            return clean_metric_name(metric_name), task_result[metric_name]
+
+    for metric_name, value in task_result.items():
+        if metric_name.endswith("_stderr,none") or metric_name in {"alias", "samples"}:
+            continue
+        if safe_float(value) is not None:
+            return clean_metric_name(metric_name), value
+
+    return None, None
+
+
+def get_task_result(results: Dict[str, Any], benchmark: str) -> Optional[Dict[str, Any]]:
+    for task_name in BENCHMARK_ALIASES.get(benchmark, [benchmark]):
+        task_result = results.get(task_name)
+        if task_result is not None:
+            return task_result
+    return None
+
+
 def load_result(path: Path, prefer_lm_eval_model_name: bool = False) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -404,7 +454,7 @@ def load_result(path: Path, prefer_lm_eval_model_name: bool = False) -> Dict[str
     acc_values = []
 
     for benchmark in BENCHMARK_ORDER:
-        task_result = results.get(benchmark)
+        task_result = get_task_result(results, benchmark)
 
         if task_result is None:
             row[benchmark] = None
@@ -416,14 +466,10 @@ def load_result(path: Path, prefer_lm_eval_model_name: bool = False) -> Dict[str
             metric_used[benchmark] = "token_perplexity"
             continue
 
-        if benchmark == "gsm8k":
-            row[benchmark] = task_result.get("exact_match,strict-match")
-            metric_used[benchmark] = "strict_match_accuracy"
-
-            value_float = safe_float(row[benchmark])
-            if value_float is not None:
-                acc_values.append(value_float)
-
+        if benchmark in GENERATION_BENCHMARK_ORDER:
+            metric_name, value = pick_generation_metric(benchmark, task_result)
+            row[benchmark] = value
+            metric_used[benchmark] = metric_name
             continue
 
         metric_name, value = pick_accuracy_metric(task_result)
@@ -431,7 +477,7 @@ def load_result(path: Path, prefer_lm_eval_model_name: bool = False) -> Dict[str
         metric_used[benchmark] = metric_name
 
         value_float = safe_float(value)
-        if value_float is not None:
+        if benchmark in ACCURACY_BENCHMARKS and value_float is not None:
             acc_values.append(value_float)
 
     row["avg_accuracy"] = sum(acc_values) / len(acc_values) if acc_values else None
@@ -548,8 +594,10 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
         "Matrices",
     ]
 
-    headers += [BENCHMARK_LABELS_MD[b] for b in BENCHMARK_ORDER]
-    headers += ["Average ↑", "File"]
+    headers += [BENCHMARK_LABELS_MD[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
+    headers += ["Average ↑"]
+    headers += [BENCHMARK_LABELS_MD[b] for b in GENERATION_BENCHMARK_ORDER]
+    headers += ["File"]
 
     lines = []
     lines.append(f"## {model_name}")
@@ -569,12 +617,16 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
                 markdown_faded("--"),
             ]
 
-            for benchmark in BENCHMARK_ORDER:
+            for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                 value = metric_value_for_display(row, benchmark)
                 row_cells.append(markdown_faded(value))
 
             avg_value = fmt_accuracy(row.get("avg_accuracy"))
             row_cells.append(markdown_faded(avg_value))
+
+            for benchmark in GENERATION_BENCHMARK_ORDER:
+                value = metric_value_for_display(row, benchmark)
+                row_cells.append(markdown_faded(value))
 
             row_cells.append(markdown_faded(row.get("file", "--")))
 
@@ -601,7 +653,7 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
                 row_cells.append(row.get("compression_denominator", "--"))
                 row_cells.append(row.get("matrices", "--"))
 
-                for benchmark in BENCHMARK_ORDER:
+                for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                     value = metric_value_for_display(row, benchmark)
                     if is_best(row, benchmark, table_best):
                         value = f"**{value}**"
@@ -611,6 +663,12 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
                 if is_best(row, "avg_accuracy", table_best):
                     avg_value = f"**{avg_value}**"
                 row_cells.append(avg_value)
+
+                for benchmark in GENERATION_BENCHMARK_ORDER:
+                    value = metric_value_for_display(row, benchmark)
+                    if is_best(row, benchmark, table_best):
+                        value = f"**{value}**"
+                    row_cells.append(value)
 
                 row_cells.append(row.get("file", "--"))
 
@@ -662,22 +720,34 @@ def make_latex_table_for_model(
         adjustbox_str = r"\begin{adjustbox}{width=" + str(table_width) + r"\textwidth,center}"
         lines.append(adjustbox_str)
 
-    colspec = r"ll lllll | rrrrrrr r"
+    benchmark_colspec = "r" * len(LIKELIHOOD_BENCHMARK_ORDER)
+    generation_colspec = "r" * len(GENERATION_BENCHMARK_ORDER)
+    colspec = rf"ll lllll | {benchmark_colspec} r {generation_colspec}"
     lines.append(rf"\begin{{tabular}}{{{colspec}}}")
     lines.append(r"\toprule")
+
+    config_end_col = 7
+    likelihood_start_col = config_end_col + 1
+    likelihood_end_col = likelihood_start_col + len(LIKELIHOOD_BENCHMARK_ORDER) - 1
+    summary_col = likelihood_end_col + 1
+    generation_start_col = summary_col + 1
+    generation_end_col = generation_start_col + len(GENERATION_BENCHMARK_ORDER) - 1
+    total_col_count = generation_end_col
 
     lines.append(
         r"\multicolumn{2}{c}{Compression} & "
         r"\multicolumn{5}{c}{Configuration} & "
-        r"\multicolumn{7}{c}{Benchmarks} & "
-        r"\multicolumn{1}{c}{Summary} \\"
+        rf"\multicolumn{{{len(LIKELIHOOD_BENCHMARK_ORDER)}}}{{c}}{{Likelihood Benchmarks}} & "
+        r"\multicolumn{1}{c}{Summary} & "
+        rf"\multicolumn{{{len(GENERATION_BENCHMARK_ORDER)}}}{{c}}{{Generation Benchmarks}} \\"
     )
 
     lines.append(
         r"\cmidrule(lr){1-2}"
         r"\cmidrule(lr){3-7}"
-        r"\cmidrule(lr){8-14}"
-        r"\cmidrule(lr){15-15}"
+        rf"\cmidrule(lr){{{likelihood_start_col}-{likelihood_end_col}}}"
+        rf"\cmidrule(lr){{{summary_col}-{summary_col}}}"
+        rf"\cmidrule(lr){{{generation_start_col}-{generation_end_col}}}"
     )
 
     header = [
@@ -690,8 +760,9 @@ def make_latex_table_for_model(
         "Matrices",
     ]
 
-    header += [BENCHMARK_LABELS_LATEX[b] for b in BENCHMARK_ORDER]
+    header += [BENCHMARK_LABELS_LATEX[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
     header += [r"Avg. $\uparrow$"]
+    header += [BENCHMARK_LABELS_LATEX[b] for b in GENERATION_BENCHMARK_ORDER]
 
     lines.append(" & ".join(header) + r" \\")
     lines.append(r"\midrule")
@@ -710,12 +781,16 @@ def make_latex_table_for_model(
                 r"\textcolor{black!45}{--}",
             ]
 
-            for benchmark in BENCHMARK_ORDER:
+            for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                 value = latex_escape(metric_value_for_display(row, benchmark))
                 cells.append(rf"\textcolor{{black!45}}{{{value}}}")
 
             avg_value = latex_escape(fmt_accuracy(row.get("avg_accuracy")))
             cells.append(rf"\textcolor{{black!45}}{{{avg_value}}}")
+
+            for benchmark in GENERATION_BENCHMARK_ORDER:
+                value = latex_escape(metric_value_for_display(row, benchmark))
+                cells.append(rf"\textcolor{{black!45}}{{{value}}}")
 
             lines.append(" & ".join(cells) + r" \\")
 
@@ -760,15 +835,18 @@ def make_latex_table_for_model(
                 cells.append(latex_escape(row.get("compression_denominator", "--")))
                 cells.append(latex_escape(row.get("matrices", "--")))
 
-                for benchmark in BENCHMARK_ORDER:
+                for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                     cells.append(latex_metric_cell(row, benchmark, table_best))
 
                 cells.append(latex_average_cell(row, table_best))
 
+                for benchmark in GENERATION_BENCHMARK_ORDER:
+                    cells.append(latex_metric_cell(row, benchmark, table_best))
+
                 lines.append(" & ".join(cells) + r" \\")
 
             if bypass_idx != len(bypass_groups) - 1:
-                lines.append(r"\cmidrule(lr){2-15}")
+                lines.append(rf"\cmidrule(lr){{2-{total_col_count}}}")
 
         if ratio_idx != len(sorted_ratios) - 1:
             lines.append(r"\midrule")
@@ -786,7 +864,8 @@ def make_latex_table_for_model(
         rf"\caption{{Hierarchical zero-shot lm-eval results for {caption_model}. "
         r"Rows are grouped by compression ratio and bypassed initial layers. "
         r"Accuracy-style metrics are reported as percentages; \texttt{acc\_norm} is used when available and "
-        r"\texttt{acc} otherwise. WikiText is reported as token perplexity, where lower is better. "
+        r"\texttt{acc} otherwise. Average accuracy excludes generation benchmarks. "
+        r"WikiText is reported as token perplexity, where lower is better. "
         r"Bold values indicate the best result in the table for each metric.}"
     )
     lines.append(rf"\label{{tab:lm-eval-hierarchical-{label_model}}}")
@@ -823,6 +902,7 @@ def build_markdown_report(rows_by_model: Dict[str, List[Dict[str, Any]]]) -> str
     out.append(
         "Hierarchical tables are grouped by compression ratio and bypassed initial layers. "
         "Accuracy-style scores are percentages. `acc_norm` is used when available; otherwise `acc` is used. "
+        "Average accuracy excludes generation benchmarks. "
         "`wikitext` is token perplexity, where lower is better."
     )
     out.append("")
