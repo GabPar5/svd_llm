@@ -15,8 +15,9 @@ BENCHMARK_ORDER = [
     "hellaswag",
     "openbookqa",
     "piqa",
-    "truthfulqa_mc2",
     "winogrande",
+    #"truthfulqa_gen",
+    "gsm8k"
 ]
 
 ACCURACY_BENCHMARKS = [
@@ -24,8 +25,9 @@ ACCURACY_BENCHMARKS = [
     "hellaswag",
     "openbookqa",
     "piqa",
-    "truthfulqa_mc2",
     "winogrande",
+    #"truthfulqa_gen",
+    "gsm8k",
 ]
 
 BENCHMARK_LABELS_MD = {
@@ -34,8 +36,9 @@ BENCHMARK_LABELS_MD = {
     "hellaswag": "HellaSwag ↑",
     "openbookqa": "OBQA ↑",
     "piqa": "PIQA ↑",
-    "truthfulqa_mc2": "TruthfulQA ↑",
     "winogrande": "WinoG. ↑",
+    #"truthfulqa_gen": "TruthfulQA BLEU ↑",
+    "gsm8k": "GSM8K ↑"
 }
 
 BENCHMARK_LABELS_LATEX = {
@@ -44,8 +47,9 @@ BENCHMARK_LABELS_LATEX = {
     "hellaswag": r"HellaS. $\uparrow$",
     "openbookqa": r"OBQA $\uparrow$",
     "piqa": r"PIQA $\uparrow$",
-    "truthfulqa_mc2": r"TruthfulQA $\uparrow$",
     "winogrande": r"WinoG. $\uparrow$",
+    #"truthfulqa_gen": r"TruthfulQA $\uparrow$",
+    "gsm8k": r"GSM8K $\uparrow$"
 }
 
 MATRIX_TOKEN_MAP = {
@@ -96,6 +100,8 @@ PREFERRED_METRICS = [
     "acc,none",
 ]
 
+def compressed_rows_only(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [row for row in rows if not row.get("is_original", False)]
 
 def is_float_token(token: str) -> bool:
     try:
@@ -410,6 +416,16 @@ def load_result(path: Path, prefer_lm_eval_model_name: bool = False) -> Dict[str
             metric_used[benchmark] = "token_perplexity"
             continue
 
+        if benchmark == "gsm8k":
+            row[benchmark] = task_result.get("exact_match,strict-match")
+            metric_used[benchmark] = "strict_match_accuracy"
+
+            value_float = safe_float(row[benchmark])
+            if value_float is not None:
+                acc_values.append(value_float)
+
+            continue
+
         metric_name, value = pick_accuracy_metric(task_result)
         row[benchmark] = value
         metric_used[benchmark] = metric_name
@@ -473,7 +489,7 @@ def metric_value_for_display(row: Dict[str, Any], benchmark: str) -> str:
     return fmt_accuracy(row.get(benchmark))
 
 
-def best_values_by_group(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+def best_values(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
     """
     Finds best benchmark values inside a local group.
 
@@ -519,6 +535,7 @@ def markdown_faded(value: Any) -> str:
 
 def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -> str:
     rows = sorted(rows, key=sort_rows_hierarchical)
+    table_best = best_values(compressed_rows_only(rows))
     original_rows, grouped = group_rows_for_model(rows)
 
     headers = [
@@ -570,7 +587,6 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
 
         for bypass in sorted(bypass_groups.keys()):
             local_rows = sorted(bypass_groups[bypass], key=sort_rows_hierarchical)
-            best = best_values_by_group(local_rows)
 
             first_bypass_row = True
 
@@ -587,12 +603,12 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
 
                 for benchmark in BENCHMARK_ORDER:
                     value = metric_value_for_display(row, benchmark)
-                    if is_best(row, benchmark, best):
+                    if is_best(row, benchmark, table_best):
                         value = f"**{value}**"
                     row_cells.append(value)
 
                 avg_value = fmt_accuracy(row.get("avg_accuracy"))
-                if is_best(row, "avg_accuracy", best):
+                if is_best(row, "avg_accuracy", table_best):
                     avg_value = f"**{avg_value}**"
                 row_cells.append(avg_value)
 
@@ -628,9 +644,11 @@ def make_latex_table_for_model(
     model_name: str,
     rows: List[Dict[str, Any]],
     table_size: str = r"\scriptsize",
-    use_resizebox: bool = True,
+    use_adjustbox: bool = True,
+    table_width: float = 1.6
 ) -> str:
     rows = sorted(rows, key=sort_rows_hierarchical)
+    table_best = best_values(compressed_rows_only(rows))
     original_rows, grouped = group_rows_for_model(rows)
 
     lines = []
@@ -640,8 +658,9 @@ def make_latex_table_for_model(
     lines.append(table_size)
     lines.append(r"\setlength{\tabcolsep}{3pt}")
 
-    if use_resizebox:
-        lines.append(r"\resizebox{\textwidth}{!}{%")
+    if use_adjustbox:
+        adjustbox_str = r"\begin{adjustbox}{width=" + str(table_width) + r"\textwidth,center}"
+        lines.append(adjustbox_str)
 
     colspec = r"ll lllll | rrrrrrr r"
     lines.append(rf"\begin{{tabular}}{{{colspec}}}")
@@ -717,7 +736,6 @@ def make_latex_table_for_model(
 
         for bypass_idx, bypass in enumerate(sorted(bypass_groups.keys())):
             local_rows = sorted(bypass_groups[bypass], key=sort_rows_hierarchical)
-            best = best_values_by_group(local_rows)
             bypass_row_count = len(local_rows)
             bypass_printed = False
 
@@ -743,9 +761,9 @@ def make_latex_table_for_model(
                 cells.append(latex_escape(row.get("matrices", "--")))
 
                 for benchmark in BENCHMARK_ORDER:
-                    cells.append(latex_metric_cell(row, benchmark, best))
+                    cells.append(latex_metric_cell(row, benchmark, table_best))
 
-                cells.append(latex_average_cell(row, best))
+                cells.append(latex_average_cell(row, table_best))
 
                 lines.append(" & ".join(cells) + r" \\")
 
@@ -758,8 +776,8 @@ def make_latex_table_for_model(
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
 
-    if use_resizebox:
-        lines.append(r"}")
+    if use_adjustbox:
+        lines.append(r"\end{adjustbox}")
 
     caption_model = latex_escape(model_name)
     label_model = latex_label_slug(model_name)
@@ -769,7 +787,7 @@ def make_latex_table_for_model(
         r"Rows are grouped by compression ratio and bypassed initial layers. "
         r"Accuracy-style metrics are reported as percentages; \texttt{acc\_norm} is used when available and "
         r"\texttt{acc} otherwise. WikiText is reported as token perplexity, where lower is better. "
-        r"Bold values indicate the best result within each bypass group.}"
+        r"Bold values indicate the best result in the table for each metric.}"
     )
     lines.append(rf"\label{{tab:lm-eval-hierarchical-{label_model}}}")
     lines.append(r"\end{table*}")
@@ -824,7 +842,7 @@ def build_markdown_report(rows_by_model: Dict[str, List[Dict[str, Any]]]) -> str
     return "\n".join(out).rstrip() + "\n"
 
 
-def build_latex_report(rows_by_model: Dict[str, List[Dict[str, Any]]]) -> str:
+def build_latex_report(rows_by_model: Dict[str, List[Dict[str, Any]]], table_width: float = 1.6) -> str:
     out = []
 
     out.append(r"% Required packages:")
@@ -835,7 +853,7 @@ def build_latex_report(rows_by_model: Dict[str, List[Dict[str, Any]]]) -> str:
     out.append("")
 
     for model_name in sorted(rows_by_model):
-        out.append(make_latex_table_for_model(model_name, rows_by_model[model_name]))
+        out.append(make_latex_table_for_model(model_name, rows_by_model[model_name], table_width = table_width))
         out.append("")
 
     return "\n".join(out).rstrip() + "\n"
@@ -879,6 +897,14 @@ def main():
     )
 
     parser.add_argument(
+        "-w",
+        "--table_width",
+        type=float,
+        default=1.6,
+        help="Table width for adjustbox",
+    )
+
+    parser.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -914,7 +940,7 @@ def main():
     if args.format == "markdown":
         report = build_markdown_report(rows_by_model)
     elif args.format == "latex":
-        report = build_latex_report(rows_by_model)
+        report = build_latex_report(rows_by_model, table_width = float(args.table_width))
     else:
         raise ValueError(f"Unsupported format: {args.format}")
 

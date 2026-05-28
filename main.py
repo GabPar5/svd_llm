@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, Genera
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import setup_logging, handle_non_serializable
 
+# TODO fix loading compressed model path
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
@@ -28,10 +29,16 @@ if __name__ == "__main__":
         help='Run SVD-LLM V2'
     )
     parser.add_argument(
-        '--dtype', 
+        '--model_dtype', 
         type=str, 
         default='float32', 
-        help='Weights dtype (original and compressed)'
+        help='Weights dtype for the model'
+    )
+    parser.add_argument(
+        '--compressed_dtype', 
+        type=str, 
+        default='float32', 
+        help='Weights dtype for the compressed modules (if it\'s different that `model_dtype` it generates a mixed precision model)'
     )
     parser.add_argument(
         '--compression_ratio', 
@@ -156,7 +163,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--bypass_early_layers', 
         type=int, 
-        default=2, 
+        default=-1, 
         help='Number of starting layers which bypass heterogeneous compression (or compression at all)'
     )
     parser.add_argument(
@@ -242,7 +249,7 @@ if __name__ == "__main__":
 
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
-            dtype=args.dtype,
+            dtype=args.model_dtype,
             device_map=args.device,
             use_safetensors=True,
             token=args.hf_token, 
@@ -277,24 +284,23 @@ if __name__ == "__main__":
 
         rank_map = checkpoint["rank_map"]
         state_dict = checkpoint["state_dict"]
+        extra_buffers = checkpoint.get("non_persistent_buffers", {})
 
         # Load model config from HF and instantiate base model
         config = AutoConfig.from_pretrained(
             args.model,
             trust_remote_code=True,
             token=args.hf_token,
-            dtype=DtypeMap.get_dtype(args.dtype)
+            dtype=DtypeMap.get_dtype(args.model_dtype)
         )
 
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(
                 config,
                 trust_remote_code=True,
-                dtype=DtypeMap.get_dtype(args.dtype),
+                dtype=DtypeMap.get_dtype(args.model_dtype),
             )
-        # Avoid warning
-        eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
-        model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
+        
         try:
             model.generation_config = GenerationConfig.from_pretrained(
                 args.model,
@@ -304,20 +310,22 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[WARNING] Could not load generation_config for {args.model}: {e}")
             model.generation_config = GenerationConfig.from_model_config(config)
-        eos = model.generation_config.eos_token_id # pyright: ignore[reportOptionalMemberAccess]
-        if eos is None:
-            eos = tokenizer.eos_token_id
-            model.generation_config.eos_token_id = eos # pyright: ignore[reportOptionalMemberAccess]
-        model.generation_config.pad_token_id = eos[0] if isinstance(eos, list) else eos # pyright: ignore[reportOptionalMemberAccess]
 
         # Replace compressed layers with LowRank modules
-        apply_lowrank(model, rank_map)
+        apply_lowrank(model, rank_map, state_dict)
         model.to_empty(device=args.device)
 
         missing, unexpected = model.load_state_dict(
             state_dict, 
-            strict=False, 
+            strict=True, 
             assign=True
+        )
+
+        restore_non_persistent_buffers(
+            model=model,
+            saved_buffers=extra_buffers,
+            device=args.device,
+            strict=True,
         )
 
         if missing:
@@ -335,7 +343,7 @@ if __name__ == "__main__":
             )
 
         # Clean memory
-        del checkpoint, state_dict, rank_map
+        del checkpoint, state_dict, rank_map, extra_buffers
         cuda_cleanup()
         gc.collect()
         vram_usage("After loading compressed model")
@@ -399,7 +407,8 @@ if __name__ == "__main__":
             },
             max_length = args.max_length,
             is_v2 = args.run_v2,
-            dtype = args.dtype,
+            dtype = args.model_dtype,
+            compressed_dtype = args.compressed_dtype,
             batch_size = args.batch_size,
             seed = args.seed,
             device = args.device,
@@ -422,7 +431,7 @@ if __name__ == "__main__":
             bypass_ratio = args.bypass_ratio,
             ratio_scope=args.ratio_scope
         )
-        model=model.to(args.device, dtype=DtypeMap.get_dtype(args.dtype))
+        model=model.to(args.device)
         print(model)
 
         gc.collect()
@@ -464,11 +473,15 @@ if __name__ == "__main__":
         print(f"[DEBUG] HF model context length: {model.config.max_position_embeddings}")
 
         # Clamp max model context
-        max_length = min(
+        max_gen_task_context_length = min(
             args.eval_max_length,
             model.config.max_position_embeddings - args.max_eval_tokens
         )
-        print(f"[DEBUG] Evaluation context length: {max_length}")
+        max_length = min(
+            args.eval_max_length,
+            model.config.max_position_embeddings
+        )
+        print(f"[DEBUG] Evaluation context length for generation tasks: {max_gen_task_context_length}")
 
         results = {}
         wikitext_ppl = None
@@ -511,8 +524,7 @@ if __name__ == "__main__":
                 batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
                 max_batch_size=128, # pyright: ignore[reportCallIssue]
                 device = args.device, # pyright: ignore[reportCallIssue]
-                dtype = args.dtype, # pyright: ignore[reportCallIssue]
-                max_length = max_length # pyright: ignore[reportCallIssue]
+                max_length = max_gen_task_context_length # pyright: ignore[reportCallIssue]
             )
             print(f"[DEBUG] HFLM model context length: {eval_model.max_length}") # pyright: ignore[reportAttributeAccessIssue]
 

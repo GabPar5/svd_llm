@@ -4,9 +4,51 @@ import re
 import torch
 from typing import List
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig
-from src.svd_llm import apply_lowrank
-from src.utils import DtypeMap, cuda_cleanup
+from src.utils import DtypeMap, cuda_cleanup, apply_lowrank, restore_non_persistent_buffers
 
+def infer_lowrank_dtype_from_state_dict(state_dict):
+    for name, tensor in state_dict.items():
+        if ".W_u." in name or ".W_v." in name:
+            return tensor.dtype
+    return None
+
+def assert_mixed_dtype(model, expected_base_dtype=None, expected_lowrank_dtype=None):
+    lowrank_dtypes = set()
+    non_lowrank_dtypes = set()
+
+    for name, p in model.named_parameters():
+        if ".W_u." in name or ".W_v." in name:
+            lowrank_dtypes.add(p.dtype)
+        else:
+            non_lowrank_dtypes.add(p.dtype)
+
+    print("[DTYPE] non-lowrank dtypes:", non_lowrank_dtypes)
+    print("[DTYPE] lowrank dtypes:", lowrank_dtypes)
+
+    if expected_base_dtype is not None and expected_base_dtype not in non_lowrank_dtypes:
+        raise RuntimeError(f"Expected base dtype {expected_base_dtype}, got {non_lowrank_dtypes}")
+
+    if expected_lowrank_dtype is not None and lowrank_dtypes != {expected_lowrank_dtype}:
+        raise RuntimeError(f"Expected LowRank dtype {expected_lowrank_dtype}, got {lowrank_dtypes}")
+
+def audit_buffers(model, state_dict=None, label="[BUFFER-AUDIT]"):
+    state_keys = set(state_dict.keys()) if state_dict is not None else set()
+
+    print(label, "non-state buffers:")
+    for name, buf in model.named_buffers():
+        in_state = name in state_keys
+        if not in_state:
+            if buf.device.type == "meta":
+                print(f"{label} {name}: META dtype={buf.dtype} shape={tuple(buf.shape)}")
+            else:
+                finite = torch.isfinite(buf).all().item() if buf.is_floating_point() else "N/A"
+                mn = buf.float().min().item() if buf.numel() and buf.is_floating_point() else "N/A"
+                mx = buf.float().max().item() if buf.numel() and buf.is_floating_point() else "N/A"
+                sum_abs = buf.float().abs().sum().item() if buf.numel() and buf.is_floating_point() else "N/A"
+                print(
+                    f"{label} {name}: device={buf.device} dtype={buf.dtype} "
+                    f"shape={tuple(buf.shape)} finite={finite} min={mn} max={mx} sum_abs={sum_abs}"
+                )
 
 def safe_filename(name: str) -> str:
     name = os.path.basename(name)
@@ -73,7 +115,7 @@ def load_compressed_model(
     The base HF config is required because the checkpoint only stores weights,
     not the full model architecture/config.
     """
-    torch_dtype = DtypeMap.get_dtype(dtype)
+    model_dtype = DtypeMap.get_dtype(dtype)
 
     if tokenizer_path is None:
         tokenizer_path = os.path.dirname(checkpoint_path)
@@ -100,12 +142,16 @@ def load_compressed_model(
 
     rank_map = checkpoint["rank_map"]
     state_dict = checkpoint["state_dict"]
+    extra_buffers = checkpoint.get("non_persistent_buffers", {})
+
+    compressed_dtype = infer_lowrank_dtype_from_state_dict(state_dict)
 
     print(f"[LOAD] Loading base config from: {base_model_name}")
     config = AutoConfig.from_pretrained(
         base_model_name,
         trust_remote_code=True,
         token=hf_token,
+        dtype=model_dtype
     )
 
     print("[LOAD] Instantiating base model architecture...")
@@ -113,8 +159,9 @@ def load_compressed_model(
         model = AutoModelForCausalLM.from_config(
             config,
             trust_remote_code=True,
-            dtype=torch_dtype,
+            dtype=model_dtype,
         )
+
     try:
         model.generation_config = GenerationConfig.from_pretrained(
             base_model_name,
@@ -126,15 +173,26 @@ def load_compressed_model(
         model.generation_config = GenerationConfig.from_model_config(config)
 
     print("[LOAD] Applying LowRank module structure...")
-    apply_lowrank(model, rank_map)
+    apply_lowrank(model, rank_map, state_dict)
     model.to_empty(device=device)
+
+    audit_buffers(model, state_dict, "[AFTER-TO-EMPTY]")
 
     print("[LOAD] Loading compressed state dict...")
     missing, unexpected = model.load_state_dict(
         state_dict, 
-        strict=False, 
+        strict=True, 
         assign=True
     )
+
+    restore_non_persistent_buffers(
+        model=model,
+        saved_buffers=extra_buffers,
+        device=device,
+        strict=True,
+    )
+
+    audit_buffers(model, state_dict, "[AFTER-LOAD]")
 
     if missing:
         print(f"[WARNING] Missing keys: {len(missing)}")
@@ -149,8 +207,14 @@ def load_compressed_model(
             "State dict mismatch. The compressed checkpoint may not match "
             "the base model or rank_map."
         )
+    
+    assert_mixed_dtype(
+        model,
+        expected_base_dtype=model_dtype,
+        expected_lowrank_dtype=compressed_dtype,
+    )
 
-    del checkpoint, state_dict, rank_map
+    del checkpoint, state_dict, rank_map, extra_buffers
     cuda_cleanup()
 
     model.eval()
