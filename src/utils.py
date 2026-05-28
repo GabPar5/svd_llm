@@ -215,6 +215,136 @@ def tokenize_dataset(
 
     return chunked.with_format("torch"), max_samples
 
+def tokenize_finetune_dataset(
+        dataset_spec: str,
+        tokenizer,
+        max_samples: int = 50000,
+        cutoff_len: int = 256,
+        seed: Optional[int] = None,
+        train_on_inputs: bool = False,
+        add_eos_token: bool = False,
+):
+    """
+    Tokenize the dataset used by the LoRA sequential update.
+
+    Default usage mirrors upstream SVD-LLM/Alpaca-LoRA:
+    `dataset_spec="yahma/alpaca-cleaned"`, split=train, Alpaca prompt format,
+    and labels masked on the instruction/input part unless train_on_inputs=True.
+    """
+    parts = dataset_spec.split(":")
+    dataset_name = parts[0]
+    dataset_subset = parts[1] if len(parts) > 1 and parts[1] else None
+    dataset_split = parts[2] if len(parts) > 2 and parts[2] else "train"
+
+    print(f"[FINETUNE] Dataset: {dataset_name} | subset={dataset_subset} | split={dataset_split}")
+
+    if os.path.isdir(dataset_name):
+        loaded = load_from_disk(dataset_name)
+        df = loaded[dataset_split] if hasattr(loaded, "keys") and dataset_split in loaded else loaded
+    elif dataset_subset is not None:
+        df = load_dataset(dataset_name, dataset_subset, split=dataset_split)
+    else:
+        df = load_dataset(dataset_name, split=dataset_split)
+
+    if max_samples is not None and max_samples > 0 and len(df) > max_samples:
+        df = df.shuffle(seed=seed).select(range(max_samples)) # pyright: ignore[reportAttributeAccessIssue]
+    else:
+        df = df.shuffle(seed=seed) # pyright: ignore[reportAttributeAccessIssue]
+
+    actual_samples = len(df)
+    print(f"[FINETUNE] Using {actual_samples} samples, cutoff_len={cutoff_len}")
+
+    def alpaca_prompt(instruction: str, input_text: str = "", output_text: Optional[str] = None) -> str:
+        if input_text and input_text.strip():
+            prompt = (
+                "Below is an instruction that describes a task, paired with an input "
+                "that provides further context. Write a response that appropriately "
+                "completes the request.\n\n"
+                "### Instruction:\n"
+                f"{instruction}\n\n"
+                "### Input:\n"
+                f"{input_text}\n\n"
+                "### Response:\n"
+            )
+        else:
+            prompt = (
+                "Below is an instruction that describes a task. Write a response "
+                "that appropriately completes the request.\n\n"
+                "### Instruction:\n"
+                f"{instruction}\n\n"
+                "### Response:\n"
+            )
+
+        if output_text is not None:
+            prompt += str(output_text)
+        return prompt
+
+    def tokenize_prompt(prompt: str, should_add_eos: bool = True) -> Dict:
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=cutoff_len,
+            padding=False,
+            return_tensors=None,
+        )
+        if (
+            should_add_eos
+            and tokenizer.eos_token_id is not None
+            and len(result["input_ids"]) > 0
+            and result["input_ids"][-1] != tokenizer.eos_token_id
+            and len(result["input_ids"]) < cutoff_len
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    def generate_and_tokenize(data_point: Dict) -> Dict:
+        if "instruction" in data_point and "output" in data_point:
+            instruction = str(data_point.get("instruction") or "")
+            input_text = str(data_point.get("input") or "")
+            output_text = str(data_point.get("output") or "")
+
+            tokenized = tokenize_prompt(
+                alpaca_prompt(instruction, input_text, output_text),
+                should_add_eos=True,
+            )
+            if not train_on_inputs:
+                user_prompt = alpaca_prompt(instruction, input_text, None)
+                tokenized_user = tokenize_prompt(
+                    user_prompt,
+                    should_add_eos=add_eos_token,
+                )
+                user_prompt_len = len(tokenized_user["input_ids"])
+                if add_eos_token and user_prompt_len > 0:
+                    user_prompt_len -= 1
+                tokenized["labels"] = (
+                    [-100] * user_prompt_len
+                    + tokenized["labels"][user_prompt_len:]
+                )
+            return tokenized
+
+        text = None
+        for field in ("text", "sentence", "page", "content"):
+            if field in data_point and data_point[field] is not None:
+                text = str(data_point[field])
+                break
+        if text is None:
+            raise ValueError(
+                "Unsupported finetune dataset format. Expected Alpaca-style "
+                "`instruction`/`input`/`output` fields or a text-like field."
+            )
+        return tokenize_prompt(text, should_add_eos=True)
+
+    tokenized = df.map(
+        generate_and_tokenize,
+        remove_columns=df.column_names, # pyright: ignore[reportArgumentType]
+        load_from_cache_file=False,
+        desc="Tokenizing finetune dataset...",
+    )
+
+    return tokenized, actual_samples
+
 def generate_paths(mlp: bool, q: bool, k: bool, v: bool, attention_output: bool, layers_number: int) -> list[str]:
     list_paths=[]
     if layers_number >= 0:

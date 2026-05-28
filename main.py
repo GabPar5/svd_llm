@@ -7,7 +7,7 @@ import json
 import torch
 import lm_eval
 import multiprocessing as mp
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, GenerationConfig # pyright: ignore[reportPrivateImportUsage]
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, GenerationConfig, DataCollatorForSeq2Seq # pyright: ignore[reportPrivateImportUsage]
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import setup_logging, handle_non_serializable
 
@@ -211,6 +211,38 @@ if __name__ == "__main__":
         "--sequential_lora_gradient_checkpointing",
         action="store_true",
         help="Enable model gradient checkpointing during the LoRA sequential update."
+    )
+    parser.add_argument(
+        "--finetune_dataset",
+        type=str,
+        default="yahma/alpaca-cleaned",
+        help=(
+            "Dataset used by --sequential_update_method lora. Format: "
+            "dataset_name[:subset[:split]]. Defaults to the Alpaca dataset used "
+            "by the upstream SVD-LLM LoRA script."
+        )
+    )
+    parser.add_argument(
+        "--max_finetune_samples",
+        type=int,
+        default=50000,
+        help="Maximum samples used by the LoRA sequential update."
+    )
+    parser.add_argument(
+        "--finetune_cutoff_len",
+        type=int,
+        default=256,
+        help="Prompt cutoff length for the LoRA sequential update."
+    )
+    parser.add_argument(
+        "--finetune_train_on_inputs",
+        action="store_true",
+        help="If set, include instruction/input tokens in the LoRA loss."
+    )
+    parser.add_argument(
+        "--finetune_add_eos_token",
+        action="store_true",
+        help="Match Alpaca-LoRA's optional EOS handling for the user prompt mask."
     )
     parser.add_argument(
         "--pin_cpu_offload",
@@ -562,6 +594,11 @@ if __name__ == "__main__":
             sequential_lora_max_steps=args.sequential_lora_max_steps,
             sequential_lora_grad_accum_steps=args.sequential_lora_grad_accum_steps,
             sequential_lora_gradient_checkpointing=args.sequential_lora_gradient_checkpointing,
+            finetune_dataset=args.finetune_dataset,
+            max_finetune_samples=args.max_finetune_samples,
+            finetune_cutoff_len=args.finetune_cutoff_len,
+            finetune_train_on_inputs=args.finetune_train_on_inputs,
+            finetune_add_eos_token=args.finetune_add_eos_token,
             pin_cpu_offload=args.pin_cpu_offload
         )
         model=model.to(args.device)
@@ -580,27 +617,52 @@ if __name__ == "__main__":
                 "data whitening only, but checkpoint metadata says sequential_update=True."
             )
 
-        dataset_name = args.calibration_dataset.split(":")[0]
-        dataset_subset = args.calibration_dataset.split(":")[1]
-        dataset_split = args.calibration_dataset.split(":")[2]
+        if args.sequential_update_method == "lora":
+            update_dataset, update_samples = tokenize_finetune_dataset(
+                dataset_spec=args.finetune_dataset,
+                tokenizer=tokenizer,
+                max_samples=args.max_finetune_samples,
+                cutoff_len=args.finetune_cutoff_len,
+                seed=args.seed,
+                train_on_inputs=args.finetune_train_on_inputs,
+                add_eos_token=args.finetune_add_eos_token,
+            )
+            finetune_collator = DataCollatorForSeq2Seq(
+                tokenizer,
+                pad_to_multiple_of=8,
+                return_tensors="pt",
+                padding=True,
+            )
+            update_dataloader = DataLoader(
+                update_dataset, # pyright: ignore[reportArgumentType]
+                batch_size=args.batch_size,
+                shuffle=True,
+                pin_memory=args.pin_cpu_offload and str(args.device).startswith("cuda"),
+                collate_fn=finetune_collator,
+            )
+        else:
+            dataset_name = args.calibration_dataset.split(":")[0]
+            dataset_subset = args.calibration_dataset.split(":")[1]
+            dataset_split = args.calibration_dataset.split(":")[2]
 
-        calibration_dataset, update_samples = tokenize_dataset(
-            dataset_name,
-            dataset_subset,
-            dataset_split,
-            tokenizer,
-            args.max_whitening_samples,
-            args.batch_size,
-            args.max_length,
-            args.seed,
-            args.save_path
-        )
-        calibration_dataloader = DataLoader(
-            calibration_dataset, # pyright: ignore[reportArgumentType]
-            batch_size=args.batch_size,
-            shuffle=False,
-            pin_memory=args.pin_cpu_offload and str(args.device).startswith("cuda"),
-        )
+            update_dataset, update_samples = tokenize_dataset(
+                dataset_name,
+                dataset_subset,
+                dataset_split,
+                tokenizer,
+                args.max_whitening_samples,
+                args.batch_size,
+                args.max_length,
+                args.seed,
+                args.save_path
+            )
+            finetune_collator = None
+            update_dataloader = DataLoader(
+                update_dataset, # pyright: ignore[reportArgumentType]
+                batch_size=args.batch_size,
+                shuffle=False,
+                pin_memory=args.pin_cpu_offload and str(args.device).startswith("cuda"),
+            )
 
         selected_by_flags = any([
             args.compress_mlp,
@@ -637,7 +699,7 @@ if __name__ == "__main__":
         if args.sequential_update_method == "lora":
             model = run_sequential_lora_update(
                 model=model,
-                loader=calibration_dataloader,
+                loader=update_dataloader,
                 device=args.device,
                 layers_str=update_layers,
                 lora_r=args.sequential_lora_r,
@@ -668,7 +730,7 @@ if __name__ == "__main__":
 
             runner = SequentialLocalUpdateRunner(
                 model=model,
-                loader=calibration_dataloader,
+                loader=update_dataloader,
                 device=args.device,
                 compressed_dtype=args.compressed_dtype,
                 ridge=args.sequential_update_ridge,
@@ -683,7 +745,7 @@ if __name__ == "__main__":
         else:
             raise ValueError(f"Unknown sequential_update_method: {args.sequential_update_method}")
 
-        del calibration_dataset, calibration_dataloader
+        del update_dataset, update_dataloader, finetune_collator
         cuda_cleanup()
 
         model.requires_grad_(False)
@@ -701,6 +763,9 @@ if __name__ == "__main__":
             "sequential_update_source": "taw_only_checkpoint",
             "taw_only_checkpoint_path": args.compressed_model_path,
             "update_samples": update_samples,
+            "sequential_update_dataset": args.finetune_dataset if args.sequential_update_method == "lora" else args.calibration_dataset,
+            "finetune_cutoff_len": args.finetune_cutoff_len if args.sequential_update_method == "lora" else None,
+            "finetune_train_on_inputs": args.finetune_train_on_inputs if args.sequential_update_method == "lora" else None,
             "num_updated_lowrank_modules": len(updated_rank_map),
             "sequential_lora_r": args.sequential_lora_r if args.sequential_update_method == "lora" else None,
             "sequential_lora_alpha": args.sequential_lora_alpha if args.sequential_update_method == "lora" else None,

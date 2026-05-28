@@ -15,7 +15,7 @@ from functools import partial
 from typing import Dict, Optional, List, Union, Literal, Tuple
 from collections import defaultdict
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForSeq2Seq # pyright: ignore[reportPrivateImportUsage]
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from torch.utils.data import DataLoader
 from .utils import *
@@ -969,11 +969,13 @@ def run_sequential_lora_update(
                 batch = {
                     k: v.to(device, non_blocking=non_blocking)
                     for k, v in batch.items()
-                    if k in ("input_ids", "attention_mask")
+                    if k in ("input_ids", "attention_mask", "labels")
                 }
-                labels = batch["input_ids"].clone()
-                if "attention_mask" in batch:
-                    labels = labels.masked_fill(batch["attention_mask"].eq(0), -100)
+                labels = batch.get("labels", None)
+                if labels is None:
+                    labels = batch["input_ids"].clone()
+                    if "attention_mask" in batch:
+                        labels = labels.masked_fill(batch["attention_mask"].eq(0), -100)
 
                 outputs = model(
                     input_ids=batch["input_ids"],
@@ -1292,6 +1294,11 @@ def compress_svd_llm(
         sequential_lora_max_steps: Optional[int] = None,
         sequential_lora_grad_accum_steps: int = 1,
         sequential_lora_gradient_checkpointing: bool = False,
+        finetune_dataset: str = "yahma/alpaca-cleaned",
+        max_finetune_samples: int = 50000,
+        finetune_cutoff_len: int = 256,
+        finetune_train_on_inputs: bool = False,
+        finetune_add_eos_token: bool = False,
         pin_cpu_offload: bool = False
 ):
     # Load model and tokenizer
@@ -1778,6 +1785,8 @@ def compress_svd_llm(
             W_u = W_v = None
             del W_u, W_v
 
+    sequential_update_samples: Optional[int] = None
+
     if sequential_update:
         print("[SEQ-UPDATE] TAW compression complete. Starting sequential low-rank update.")
         update_layers = [layer_key for layer_key in layers_str if layer_key in rank_map]
@@ -1786,12 +1795,35 @@ def compress_svd_llm(
             raise RuntimeError(
                 "Sequential update was requested, but no TAW-compressed LowRank "
                 "layers were produced. Check compression ratio and bypass settings."
-            )
+        )
 
         if sequential_update_method == "lora":
+            print("[SEQ-UPDATE][LoRA] Loading fine-tuning dataset.")
+            finetune_dataset_tokenized, sequential_update_samples = tokenize_finetune_dataset(
+                dataset_spec=finetune_dataset,
+                tokenizer=tokenizer,
+                max_samples=max_finetune_samples,
+                cutoff_len=finetune_cutoff_len,
+                seed=seed,
+                train_on_inputs=finetune_train_on_inputs,
+                add_eos_token=finetune_add_eos_token,
+            )
+            finetune_collator = DataCollatorForSeq2Seq(
+                tokenizer,
+                pad_to_multiple_of=8,
+                return_tensors="pt",
+                padding=True,
+            )
+            finetune_dataloader = DataLoader(
+                finetune_dataset_tokenized, # pyright: ignore[reportArgumentType]
+                batch_size=batch_size,
+                shuffle=True,
+                pin_memory=pin_cpu_offload and str(device).startswith("cuda"),
+                collate_fn=finetune_collator,
+            )
             model = run_sequential_lora_update(
                 model=model,
-                loader=calibration_dataloader,
+                loader=finetune_dataloader,
                 device=device,
                 layers_str=update_layers,
                 lora_r=sequential_lora_r,
@@ -1804,7 +1836,9 @@ def compress_svd_llm(
                 grad_accum_steps=sequential_lora_grad_accum_steps,
                 gradient_checkpointing=sequential_lora_gradient_checkpointing,
             )
+            del finetune_dataset_tokenized, finetune_dataloader, finetune_collator
         elif sequential_update_method == "local_u":
+            sequential_update_samples = dataset["max_samples"]
             model = model.cpu()
             cuda_cleanup()
 
@@ -1913,6 +1947,10 @@ def compress_svd_llm(
                 "rank_map_preview": list(rank_map.items())[:10],
                 "sequential_update": sequential_update,
                 "sequential_update_method": sequential_update_method if sequential_update else None,
+                "sequential_update_dataset": finetune_dataset if sequential_update and sequential_update_method == "lora" else None,
+                "sequential_update_samples": sequential_update_samples,
+                "finetune_cutoff_len": finetune_cutoff_len if sequential_update and sequential_update_method == "lora" else None,
+                "finetune_train_on_inputs": finetune_train_on_inputs if sequential_update and sequential_update_method == "lora" else None,
                 "sequential_lora_r": sequential_lora_r if sequential_update_method == "lora" and sequential_update else None,
                 "sequential_lora_alpha": sequential_lora_alpha if sequential_update_method == "lora" and sequential_update else None,
                 "sequential_lora_dropout": sequential_lora_dropout if sequential_update_method == "lora" and sequential_update else None,
