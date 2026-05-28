@@ -251,8 +251,8 @@ def tokenize_finetune_dataset(
     else:
         df = df.shuffle(seed=seed) # pyright: ignore[reportAttributeAccessIssue]
 
-    actual_samples = len(df)
-    print(f"[FINETUNE] Using {actual_samples} samples, cutoff_len={cutoff_len}")
+    requested_samples = len(df)
+    print(f"[FINETUNE] Tokenizing up to {requested_samples} samples, cutoff_len={cutoff_len}")
 
     def alpaca_prompt(instruction: str, input_text: str = "", output_text: Optional[str] = None) -> str:
         if input_text and input_text.strip():
@@ -343,7 +343,31 @@ def tokenize_finetune_dataset(
         desc="Tokenizing finetune dataset...",
     )
 
-    return tokenized, actual_samples
+    before_filter = len(tokenized)
+    tokenized = tokenized.filter(
+        lambda example: any(label != -100 for label in example["labels"]),
+        load_from_cache_file=False,
+        desc="Filtering all-masked finetune samples...",
+    )
+    dropped = before_filter - len(tokenized)
+
+    if dropped > 0:
+        print(
+            f"[FINETUNE][WARNING] Dropped {dropped} samples with all labels masked. "
+            "This usually means the instruction/input alone reached cutoff_len; "
+            "consider increasing --finetune_cutoff_len."
+        )
+
+    if len(tokenized) == 0:
+        raise ValueError(
+            "All finetune samples were filtered because every label was -100. "
+            "Increase --finetune_cutoff_len, use a shorter dataset, or set "
+            "--finetune_train_on_inputs."
+        )
+
+    print(f"[FINETUNE] Using {len(tokenized)} supervised samples after filtering.")
+
+    return tokenized, len(tokenized)
 
 def generate_paths(mlp: bool, q: bool, k: bool, v: bool, attention_output: bool, layers_number: int) -> list[str]:
     list_paths=[]

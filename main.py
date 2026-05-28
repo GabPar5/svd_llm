@@ -4,6 +4,7 @@ import argparse
 import gc
 import importlib.util
 import json
+import math
 import torch
 import lm_eval
 import multiprocessing as mp
@@ -204,8 +205,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sequential_lora_grad_accum_steps",
         type=int,
-        default=1,
-        help="Gradient accumulation steps for each LoRA phase."
+        default=None,
+        help=(
+            "Gradient accumulation steps for each LoRA phase. If omitted, it is "
+            "computed from --sequential_lora_effective_batch_size / --batch_size."
+        )
+    )
+    parser.add_argument(
+        "--sequential_lora_effective_batch_size",
+        type=int,
+        default=64,
+        help=(
+            "Target effective batch size for LoRA sequential update. The upstream "
+            "SVD-LLM example uses 64."
+        )
     )
     parser.add_argument(
         "--sequential_lora_gradient_checkpointing",
@@ -369,6 +382,12 @@ if __name__ == "__main__":
 
     if args.update_taw_only and (not args.use_compressed or not args.compressed_model_path):
         raise ValueError("--update_taw_only requires --use_compressed and --compressed_model_path.")
+
+    if args.sequential_lora_grad_accum_steps is None:
+        args.sequential_lora_grad_accum_steps = max(
+            1,
+            math.ceil(args.sequential_lora_effective_batch_size / args.batch_size),
+        )
 
     if (
         (args.sequential_update or args.update_taw_only)
@@ -593,6 +612,7 @@ if __name__ == "__main__":
             sequential_lora_epochs=args.sequential_lora_epochs,
             sequential_lora_max_steps=args.sequential_lora_max_steps,
             sequential_lora_grad_accum_steps=args.sequential_lora_grad_accum_steps,
+            sequential_lora_effective_batch_size=args.sequential_lora_effective_batch_size,
             sequential_lora_gradient_checkpointing=args.sequential_lora_gradient_checkpointing,
             finetune_dataset=args.finetune_dataset,
             max_finetune_samples=args.max_finetune_samples,
@@ -697,6 +717,12 @@ if __name__ == "__main__":
         cuda_cleanup()
 
         if args.sequential_update_method == "lora":
+            print(
+                "[SEQ-UPDATE][LoRA] "
+                f"micro_batch_size={args.batch_size}, "
+                f"grad_accum_steps={args.sequential_lora_grad_accum_steps}, "
+                f"effective_batch_size={args.batch_size * args.sequential_lora_grad_accum_steps}"
+            )
             model = run_sequential_lora_update(
                 model=model,
                 loader=update_dataloader,
@@ -773,6 +799,8 @@ if __name__ == "__main__":
             "sequential_lora_lr": args.sequential_lora_lr if args.sequential_update_method == "lora" else None,
             "sequential_lora_epochs": args.sequential_lora_epochs if args.sequential_update_method == "lora" else None,
             "sequential_lora_max_steps": args.sequential_lora_max_steps if args.sequential_update_method == "lora" else None,
+            "sequential_lora_grad_accum_steps": args.sequential_lora_grad_accum_steps if args.sequential_update_method == "lora" else None,
+            "sequential_lora_effective_batch_size": args.batch_size * args.sequential_lora_grad_accum_steps if args.sequential_update_method == "lora" else None,
         })
 
         payload = {

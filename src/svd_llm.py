@@ -957,6 +957,7 @@ def run_sequential_lora_update(
 
         optimizer_steps = 0
         micro_steps = 0
+        skipped_all_masked_batches = 0
         should_stop = False
         total_epochs = 10**12 if max_steps is not None else max(1, int(epochs))
 
@@ -976,6 +977,11 @@ def run_sequential_lora_update(
                     labels = batch["input_ids"].clone()
                     if "attention_mask" in batch:
                         labels = labels.masked_fill(batch["attention_mask"].eq(0), -100)
+
+                if not torch.any(labels.ne(-100)):
+                    skipped_all_masked_batches += 1
+                    del batch, labels
+                    continue
 
                 outputs = model(
                     input_ids=batch["input_ids"],
@@ -1011,6 +1017,18 @@ def run_sequential_lora_update(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             optimizer_steps += 1
+
+        if optimizer_steps == 0:
+            raise RuntimeError(
+                f"LoRA phase {phase_name} completed zero optimizer steps. "
+                "Check that the finetuning dataset has non-masked labels."
+            )
+
+        if skipped_all_masked_batches > 0:
+            print(
+                f"[SEQ-UPDATE][LoRA][WARNING] Skipped {skipped_all_masked_batches} "
+                "batches because every label was -100."
+            )
 
         print(f"[SEQ-UPDATE][LoRA] {phase_name}: completed {optimizer_steps} optimizer steps.")
         model.eval()
@@ -1292,7 +1310,8 @@ def compress_svd_llm(
         sequential_lora_weight_decay: float = 0.0,
         sequential_lora_epochs: int = 2,
         sequential_lora_max_steps: Optional[int] = None,
-        sequential_lora_grad_accum_steps: int = 1,
+        sequential_lora_grad_accum_steps: Optional[int] = None,
+        sequential_lora_effective_batch_size: int = 64,
         sequential_lora_gradient_checkpointing: bool = False,
         finetune_dataset: str = "yahma/alpaca-cleaned",
         max_finetune_samples: int = 50000,
@@ -1798,6 +1817,18 @@ def compress_svd_llm(
         )
 
         if sequential_update_method == "lora":
+            if sequential_lora_grad_accum_steps is None:
+                sequential_lora_grad_accum_steps = max(
+                    1,
+                    math.ceil(sequential_lora_effective_batch_size / batch_size),
+                )
+            actual_effective_batch_size = batch_size * sequential_lora_grad_accum_steps
+            print(
+                "[SEQ-UPDATE][LoRA] "
+                f"micro_batch_size={batch_size}, "
+                f"grad_accum_steps={sequential_lora_grad_accum_steps}, "
+                f"effective_batch_size={actual_effective_batch_size}"
+            )
             print("[SEQ-UPDATE][LoRA] Loading fine-tuning dataset.")
             finetune_dataset_tokenized, sequential_update_samples = tokenize_finetune_dataset(
                 dataset_spec=finetune_dataset,
@@ -1957,6 +1988,8 @@ def compress_svd_llm(
                 "sequential_lora_lr": sequential_lora_lr if sequential_update_method == "lora" and sequential_update else None,
                 "sequential_lora_epochs": sequential_lora_epochs if sequential_update_method == "lora" and sequential_update else None,
                 "sequential_lora_max_steps": sequential_lora_max_steps if sequential_update_method == "lora" and sequential_update else None,
+                "sequential_lora_grad_accum_steps": sequential_lora_grad_accum_steps if sequential_update_method == "lora" and sequential_update else None,
+                "sequential_lora_effective_batch_size": batch_size * sequential_lora_grad_accum_steps if sequential_update_method == "lora" and sequential_update and sequential_lora_grad_accum_steps is not None else None,
             },
         }
 
