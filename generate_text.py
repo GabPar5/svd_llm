@@ -229,8 +229,21 @@ def build_prompt(
     tokenizer,
     prompt: str,
     use_chat_template: bool = False,
+    use_alpaca_prompt: bool = False,
     system_prompt: str | None = None,
 ):
+    if use_chat_template and use_alpaca_prompt:
+        raise ValueError("Use either --use_chat_template or --use_alpaca_prompt, not both.")
+
+    if use_alpaca_prompt:
+        return (
+            "Below is an instruction that describes a task. Write a response "
+            "that appropriately completes the request.\n\n"
+            "### Instruction:\n"
+            f"{prompt}\n\n"
+            "### Response:\n"
+        )
+
     if not use_chat_template:
         return prompt
 
@@ -486,6 +499,16 @@ def main():
     )
 
     parser.add_argument(
+        "--use_alpaca_prompt",
+        action="store_true",
+        help=(
+            "Wrap --prompt/--prompt_file with the Alpaca instruction template. "
+            "Useful for models sequentially updated with the default Alpaca "
+            "finetuning dataset."
+        ),
+    )
+
+    parser.add_argument(
         "--system_prompt",
         type=str,
         default=None,
@@ -558,6 +581,7 @@ def main():
             tokenizer=tokenizer,
             prompt=raw_prompt,
             use_chat_template=args.use_chat_template,
+            use_alpaca_prompt=args.use_alpaca_prompt,
             system_prompt=args.system_prompt,
         )
 
@@ -602,6 +626,7 @@ def main():
             tokenizer=tokenizer,
             prompt=raw_prompt,
             use_chat_template=args.use_chat_template,
+            use_alpaca_prompt=args.use_alpaca_prompt,
             system_prompt=args.system_prompt,
         )
 
