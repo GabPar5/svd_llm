@@ -3,7 +3,7 @@ import os
 import re
 import torch
 from typing import List
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig # pyright: ignore[reportPrivateImportUsage]
 from src.utils import DtypeMap, cuda_cleanup, apply_lowrank, restore_non_persistent_buffers
 
 def infer_lowrank_dtype_from_state_dict(state_dict):

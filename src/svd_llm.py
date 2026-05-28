@@ -12,7 +12,7 @@ import jax
 import numpy as np
 import scipy.linalg
 from functools import partial
-from typing import Dict, Optional, List, Union, Literal
+from typing import Dict, Optional, List, Union, Literal, Tuple
 from collections import defaultdict
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -526,6 +526,508 @@ def get_whitening_matrices(
     )
 
     return whitening_matrices_paths
+
+
+class FixedVLowRankUSolver:
+    """
+    Solves W_u in y ~= W_u(W_v x) while keeping W_v fixed.
+
+    This mirrors the closed-form local_update helper present in the upstream
+    SVDLLM.py file. The full paper pipeline updates both factors through the
+    LoRA-based two-pass routine implemented below.
+    """
+
+    def __init__(
+            self,
+            layer_name: str,
+            fixed_w_v: torch.Tensor,
+            out_features: int,
+            bias: Optional[torch.Tensor],
+            device: str,
+            ridge: float,
+    ):
+        self.layer_name = layer_name
+        self.device = device
+        self.ridge = ridge
+        self.dtype = torch.float32
+        self.fixed_w_v = fixed_w_v.detach().to(device=device, dtype=self.dtype).contiguous()
+        self.rank = self.fixed_w_v.shape[0]
+        self.gram = torch.zeros(self.rank, self.rank, dtype=self.dtype, device=device)
+        self.cross = torch.zeros(self.rank, out_features, dtype=self.dtype, device=device)
+        self.bias = bias.detach().to(device=device, dtype=self.dtype) if bias is not None else None
+
+    @torch.no_grad()
+    def add_batch(self, inp: torch.Tensor, out: torch.Tensor) -> None:
+        x = inp.detach().reshape(-1, inp.shape[-1]).to(device=self.device, dtype=self.dtype)
+        y = out.detach().reshape(-1, out.shape[-1]).to(device=self.device, dtype=self.dtype)
+
+        if self.bias is not None:
+            y = y - self.bias
+
+        z = torch.matmul(x, self.fixed_w_v.transpose(0, 1))
+        self.gram.addmm_(z.transpose(0, 1), z)
+        self.cross.addmm_(z.transpose(0, 1), y)
+
+        del x, y, z
+
+    @torch.no_grad()
+    def solve(self, compressed_dtype: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        H = (self.gram + self.gram.transpose(0, 1)) * 0.5
+        scale = torch.diag(H).abs().mean().clamp_min(1.0)
+        eye = torch.eye(self.rank, dtype=self.dtype, device=self.device)
+
+        W_u_t = None
+        reg = self.ridge * scale
+        for _ in range(5):
+            try:
+                W_u_t = torch.linalg.solve(H + reg * eye, self.cross)
+                break
+            except RuntimeError:
+                reg = reg * 10.0
+
+        if W_u_t is None:
+            print(f"[SEQ-UPDATE][WARNING] Falling back to lstsq for {self.layer_name}")
+            W_u_t = torch.linalg.lstsq(H + reg * eye, self.cross).solution
+
+        out_dtype = DtypeMap.get_dtype(compressed_dtype)
+        W_u = W_u_t.transpose(0, 1).detach().cpu().to(out_dtype).contiguous()
+        W_v = self.fixed_w_v.detach().cpu().to(out_dtype).contiguous()
+
+        del H, eye, W_u_t
+        return W_u, W_v
+
+
+class SequentialLocalUpdateRunner:
+    """
+    Owns the low-VRAM U-only sequential update workflow.
+
+    This is useful when VRAM pressure is the primary constraint. For the
+    paper/upstream-repo faithful U-then-V update, use run_sequential_lora_update.
+    """
+
+    def __init__(
+            self,
+            model: Qwen2ForCausalLM,
+            loader: DataLoader,
+            device: str,
+            compressed_dtype: str,
+            ridge: float = 1e-6,
+            pin_cpu_offload: bool = False,
+    ):
+        self.model = model
+        self.loader = loader
+        self.device = device
+        self.compressed_dtype = compressed_dtype
+        self.ridge = ridge
+        self.pin_cpu_offload = (
+            pin_cpu_offload
+            and torch.cuda.is_available()
+            and str(device).startswith("cuda")
+        )
+        self.non_blocking = self.pin_cpu_offload
+
+    def _cpu_offload_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.detach().cpu()
+        if self.pin_cpu_offload:
+            tensor = tensor.pin_memory()
+        return tensor
+
+    def _tree_to_cpu(self, value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return self._cpu_offload_tensor(value)
+        if isinstance(value, tuple):
+            return tuple(self._tree_to_cpu(v) for v in value)
+        if isinstance(value, list):
+            return [self._tree_to_cpu(v) for v in value]
+        return value
+
+    def _tree_to_device(self, value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return value.to(self.device, non_blocking=self.non_blocking)
+        if isinstance(value, tuple):
+            return tuple(self._tree_to_device(v) for v in value)
+        if isinstance(value, list):
+            return [self._tree_to_device(v) for v in value]
+        return value
+
+    def _decoder_kwargs(self, entry: Dict) -> Dict:
+        kwargs = {}
+        for key in ("attention_mask", "position_ids", "cache_position", "position_embeddings", "past_key_values"):
+            value = entry.get(key, None)
+            if value is not None:
+                kwargs[key] = self._tree_to_device(value)
+        return kwargs
+
+    def _capture_layer0_inputs(self) -> Tuple[List[torch.Tensor], List[Dict]]:
+        decoder_layers = self.model.model.layers
+        self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
+        if hasattr(self.model.model, "rotary_emb"):
+            self.model.model.rotary_emb = self.model.model.rotary_emb.to(self.device)
+
+        captured: List[Dict] = []
+
+        runner = self
+
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def __getattr__(self, name: str):
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.module, name)
+
+            def forward(self, inp, **kwargs):
+                captured.append({
+                    "inp": inp.detach().cpu(),
+                    "attention_mask": runner._tree_to_cpu(kwargs.get("attention_mask", None)),
+                    "position_ids": runner._tree_to_cpu(kwargs.get("position_ids", None)),
+                    "cache_position": runner._tree_to_cpu(kwargs.get("cache_position", None)),
+                    "position_embeddings": runner._tree_to_cpu(kwargs.get("position_embeddings", None)),
+                    "past_key_values": runner._tree_to_cpu(kwargs.get("past_key_values", None)),
+                })
+                raise CatcherExit
+
+        original_layer0 = decoder_layers[0].to(self.device)
+        decoder_layers[0] = Catcher(original_layer0)
+
+        try:
+            for batch in tqdm(self.loader, desc="Capturing layer_0 inputs for local update"):
+                try:
+                    batch = {
+                        k: v.to(self.device, non_blocking=self.non_blocking)
+                        for k, v in batch.items()
+                        if k in ("input_ids", "attention_mask")
+                    }
+                    self.model(**batch, use_cache=False)
+                except CatcherExit:
+                    pass
+                finally:
+                    del batch
+        finally:
+            decoder_layers[0] = original_layer0
+            decoder_layers[0] = decoder_layers[0].cpu()
+            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
+            if hasattr(self.model.model, "rotary_emb"):
+                self.model.model.rotary_emb = self.model.model.rotary_emb.cpu()
+            cuda_cleanup()
+
+        inps = [entry["inp"] for entry in captured]
+        for entry in captured:
+            entry["inp"] = None
+
+        print(f"[SEQ-UPDATE] Captured layer_0 inputs for {len(inps)} batches.")
+        return inps, captured
+
+    def _layer_hidden(self, layer: nn.Module, inp: torch.Tensor, entry: Dict) -> torch.Tensor:
+        out = layer(inp.to(self.device, non_blocking=self.non_blocking), use_cache=False, **self._decoder_kwargs(entry))
+        return out[0] if isinstance(out, tuple) else out
+
+    @torch.no_grad()
+    def _run_layer_for_hooks(self, layer: nn.Module, inps: List[torch.Tensor], captured: List[Dict]) -> None:
+        for inp, entry in zip(inps, captured):
+            hidden = self._layer_hidden(layer, inp, entry)
+            del hidden
+
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def _replay_layer_to_cpu(self, layer: nn.Module, inps: List[torch.Tensor], captured: List[Dict]) -> List[torch.Tensor]:
+        outs: List[Optional[torch.Tensor]] = [None] * len(inps)
+        for idx, (inp, entry) in enumerate(zip(inps, captured)):
+            hidden = self._layer_hidden(layer, inp, entry)
+            outs[idx] = self._cpu_offload_tensor(hidden)
+            del hidden
+
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.synchronize()
+
+        return outs  # type: ignore[return-value]
+
+    def _groups(self, layers_str: List[str]) -> Dict[int, List[Tuple[str, str]]]:
+        groups: Dict[int, List[Tuple[str, str]]] = defaultdict(list)
+        for lstr in layers_str:
+            match = re.search(r"model\.layers\.(\d+)\.(.*)", lstr)
+            if match is not None:
+                groups[int(match.group(1))].append((match.group(2), lstr))
+        return groups
+
+    @staticmethod
+    def _parent_and_attr(layer: nn.Module, local_path: str):
+        if "." not in local_path:
+            return layer, local_path
+        parent_path, attr = local_path.rsplit(".", 1)
+        return get_submodule(layer, parent_path), attr
+
+    def _register_solver_hook(self, module: nn.Linear, solver: FixedVLowRankUSolver):
+        def add_batch(_, inp, out):
+            solver.add_batch(inp[0], out)
+        return module.register_forward_hook(add_batch)
+
+    @torch.no_grad()
+    def update_taw_only_checkpoint(
+            self,
+            dense_reference_model: Qwen2ForCausalLM,
+            layers_str: List[str],
+    ) -> Dict[str, int]:
+        rank_map: Dict[str, int] = {}
+        student_layers = self.model.model.layers
+        dense_reference_layers = dense_reference_model.model.layers
+        groups = self._groups(layers_str)
+
+        print("[SEQ-UPDATE] Starting sequential update for TAW-only compressed model.")
+        inps, captured = self._capture_layer0_inputs()
+        vram_usage("After compressed-update layer_0 capture")
+
+        for idx in tqdm(range(len(student_layers)), desc="Updating compressed decoder layers"):
+            student_layer_cpu = student_layers[idx]
+            group = groups.get(idx, [])
+
+            if group:
+                dense_reference_layer = dense_reference_layers[idx].to(self.device)
+
+                # Lowest-VRAM mode: one selected matrix at a time. This repeats
+                # the dense-reference layer replay, but avoids keeping solver
+                # buffers for every projection in the decoder layer at once.
+                for local_path, lstr in group:
+                    student_parent, attr = self._parent_and_attr(student_layer_cpu, local_path)
+                    dense_reference_parent, _ = self._parent_and_attr(dense_reference_layer, local_path)
+                    lowrank = getattr(student_parent, attr)
+                    dense_reference_linear = getattr(dense_reference_parent, attr)
+
+                    if not isinstance(lowrank, LowRank) or not isinstance(dense_reference_linear, nn.Linear):
+                        print(f"[SEQ-UPDATE][WARNING] Skipping {lstr}: expected LowRank student and Linear dense reference.")
+                        continue
+
+                    fixed_w_v = lowrank.W_v.weight.detach()
+                    solver = FixedVLowRankUSolver(
+                        layer_name=lstr,
+                        fixed_w_v=fixed_w_v,
+                        out_features=dense_reference_linear.out_features,
+                        bias=dense_reference_linear.bias,
+                        device=self.device,
+                        ridge=self.ridge,
+                    )
+                    handle = self._register_solver_hook(dense_reference_linear, solver)
+                    self._run_layer_for_hooks(dense_reference_layer, inps, captured)
+                    handle.remove()
+
+                    W_u, W_v = solver.solve(self.compressed_dtype)
+                    lowrank.W_u.weight.copy_(W_u.to(lowrank.W_u.weight.device, dtype=lowrank.W_u.weight.dtype))
+                    lowrank.W_v.weight.copy_(W_v.to(lowrank.W_v.weight.device, dtype=lowrank.W_v.weight.dtype))
+                    if lowrank.W_u.bias is not None and dense_reference_linear.bias is not None:
+                        lowrank.W_u.bias.copy_(dense_reference_linear.bias.detach().cpu().to(lowrank.W_u.bias.dtype))
+                    if self.compressed_dtype in ("float16", "fp16"):
+                        factor_range_report(lstr, W_u, W_v)
+
+                    rank_map[lstr] = fixed_w_v.shape[0]
+                    del W_u, W_v, solver, handle
+                    cuda_cleanup()
+
+                dense_reference_layers[idx] = dense_reference_layer.cpu()
+                del dense_reference_layer
+                cuda_cleanup()
+
+            student_layer = student_layer_cpu.to(self.device)
+            outs = self._replay_layer_to_cpu(student_layer, inps, captured)
+            student_layers[idx] = student_layer.cpu()
+            del student_layer, student_layer_cpu, inps
+            inps = outs
+
+            cuda_cleanup()
+            vram_usage(f"After compressed update decoder layer {idx}")
+
+        del inps, captured
+        cuda_cleanup()
+        print("[SEQ-UPDATE] TAW-only checkpoint sequential local update complete.")
+        return rank_map
+
+
+def run_sequential_lora_update(
+        model: Qwen2ForCausalLM,
+        loader: DataLoader,
+        device: str,
+        layers_str: Optional[List[str]] = None,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.0,
+        epochs: int = 2,
+        max_steps: Optional[int] = None,
+        grad_accum_steps: int = 1,
+        gradient_checkpointing: bool = False,
+) -> Qwen2ForCausalLM:
+    """
+    Sequential low-rank update.
+
+    First LoRA-tune the U-side compressed projections, merge the adapter,
+    then LoRA-tune the V-side projections and merge again.
+    Each compressed projection is a LowRank module containing W_u and W_v, so
+    the two phases target those inner Linear modules directly.
+    """
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:
+        raise ImportError(
+            "The paper-faithful sequential update mode requires `peft`. "
+            "Install it in this environment, or use "
+            "`--sequential_update_method local_u` for the low-VRAM closed-form path."
+        ) from exc
+
+    if max_steps is not None and max_steps <= 0:
+        max_steps = None
+    if max_steps is None and epochs <= 0:
+        raise ValueError("LoRA sequential update needs epochs > 0 or max_steps > 0.")
+
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    selected_layers = set(layers_str or [])
+    non_blocking = str(device).startswith("cuda") and torch.cuda.is_available()
+
+    def factor_targets(factor_name: str) -> List[str]:
+        suffix = f".{factor_name}"
+        targets = []
+        for name, module in model.named_modules():
+            if not isinstance(module, nn.Linear) or not name.endswith(suffix):
+                continue
+            lowrank_name = name[:-len(suffix)]
+            if selected_layers and lowrank_name not in selected_layers:
+                continue
+            targets.append(name)
+        return targets
+
+    original_use_cache = getattr(model.config, "use_cache", None)
+    model.config.use_cache = False
+    model = model.to(device) # pyright: ignore[reportArgumentType]
+
+    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    phases = [
+        ("first_half", "W_u"),
+        ("second_half", "W_v"),
+    ]
+
+    for phase_name, factor_name in phases:
+        target_modules = factor_targets(factor_name)
+        if not target_modules:
+            raise RuntimeError(
+                f"No LoRA targets found for {factor_name}. "
+                "Expected compressed LowRank modules with inner W_u/W_v linears."
+            )
+
+        print(
+            f"[SEQ-UPDATE][LoRA] {phase_name}: tuning {factor_name} "
+            f"for {len(target_modules)} compressed projections."
+        )
+
+        model.requires_grad_(False)
+        config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config) # pyright: ignore[reportAssignmentType]
+        model.train()
+
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        trainable_count = sum(p.numel() for p in trainable_params)
+        if trainable_count == 0:
+            raise RuntimeError(f"LoRA phase {phase_name} produced no trainable parameters.")
+        print(f"[SEQ-UPDATE][LoRA] Trainable parameters: {trainable_count:,}")
+
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+        optimizer.zero_grad(set_to_none=True)
+
+        optimizer_steps = 0
+        micro_steps = 0
+        should_stop = False
+        total_epochs = 10**12 if max_steps is not None else max(1, int(epochs))
+
+        for epoch_idx in range(total_epochs):
+            progress = tqdm(
+                loader,
+                desc=f"Sequential LoRA {phase_name} epoch {epoch_idx + 1}",
+            )
+            for batch in progress:
+                batch = {
+                    k: v.to(device, non_blocking=non_blocking)
+                    for k, v in batch.items()
+                    if k in ("input_ids", "attention_mask")
+                }
+                labels = batch["input_ids"].clone()
+                if "attention_mask" in batch:
+                    labels = labels.masked_fill(batch["attention_mask"].eq(0), -100)
+
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask", None),
+                    labels=labels,
+                    use_cache=False,
+                )
+                loss = outputs.loss / grad_accum_steps
+                loss.backward()
+                micro_steps += 1
+
+                if micro_steps % grad_accum_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+                    progress.set_postfix(
+                        loss=f"{(loss.detach().item() * grad_accum_steps):.4f}",
+                        step=optimizer_steps,
+                    )
+
+                    if max_steps is not None and optimizer_steps >= max_steps:
+                        should_stop = True
+
+                del batch, labels, outputs, loss
+
+                if should_stop:
+                    break
+
+            if should_stop:
+                break
+
+        if micro_steps > 0 and micro_steps % grad_accum_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            optimizer_steps += 1
+
+        print(f"[SEQ-UPDATE][LoRA] {phase_name}: completed {optimizer_steps} optimizer steps.")
+        model.eval()
+        model = model.merge_and_unload() # pyright: ignore[reportCallIssue]
+        model.requires_grad_(False)
+
+        del optimizer, trainable_params
+        cuda_cleanup()
+
+    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+
+    if original_use_cache is not None:
+        model.config.use_cache = original_use_cache
+
+    model = model.cpu()
+    cuda_cleanup()
+    print("[SEQ-UPDATE][LoRA] Sequential U-then-V update complete.")
+    return model
  
 def allocate_ratios(
         group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]],
@@ -777,7 +1279,20 @@ def compress_svd_llm(
         bypass_early_layers: int = 2,
         bypass_ratio: float = 0.0,
         ratio_scope: Literal["selected", "all"] = "selected",
-        eps: float = 1e-6
+        eps: float = 1e-6,
+        sequential_update: bool = False,
+        sequential_update_ridge: float = 1e-6,
+        sequential_update_method: Literal["lora", "local_u"] = "lora",
+        sequential_lora_r: int = 8,
+        sequential_lora_alpha: int = 16,
+        sequential_lora_dropout: float = 0.05,
+        sequential_lora_lr: float = 1e-4,
+        sequential_lora_weight_decay: float = 0.0,
+        sequential_lora_epochs: int = 2,
+        sequential_lora_max_steps: Optional[int] = None,
+        sequential_lora_grad_accum_steps: int = 1,
+        sequential_lora_gradient_checkpointing: bool = False,
+        pin_cpu_offload: bool = False
 ):
     # Load model and tokenizer
     vram_usage("Before loading original model")
@@ -822,7 +1337,8 @@ def compress_svd_llm(
     calibration_dataloader = DataLoader(
         calibration_dataset, # pyright: ignore[reportArgumentType]
         batch_size=batch_size,
-        shuffle=False
+        shuffle=False,
+        pin_memory=pin_cpu_offload and str(device).startswith("cuda"),
     )
     ram_usage("After loading dataset")
     vram_usage("After loading dataset")
@@ -1262,6 +1778,72 @@ def compress_svd_llm(
             W_u = W_v = None
             del W_u, W_v
 
+    if sequential_update:
+        print("[SEQ-UPDATE] TAW compression complete. Starting sequential low-rank update.")
+        update_layers = [layer_key for layer_key in layers_str if layer_key in rank_map]
+
+        if not update_layers:
+            raise RuntimeError(
+                "Sequential update was requested, but no TAW-compressed LowRank "
+                "layers were produced. Check compression ratio and bypass settings."
+            )
+
+        if sequential_update_method == "lora":
+            model = run_sequential_lora_update(
+                model=model,
+                loader=calibration_dataloader,
+                device=device,
+                layers_str=update_layers,
+                lora_r=sequential_lora_r,
+                lora_alpha=sequential_lora_alpha,
+                lora_dropout=sequential_lora_dropout,
+                learning_rate=sequential_lora_lr,
+                weight_decay=sequential_lora_weight_decay,
+                epochs=sequential_lora_epochs,
+                max_steps=sequential_lora_max_steps,
+                grad_accum_steps=sequential_lora_grad_accum_steps,
+                gradient_checkpointing=sequential_lora_gradient_checkpointing,
+            )
+        elif sequential_update_method == "local_u":
+            model = model.cpu()
+            cuda_cleanup()
+
+            dense_reference_model: Qwen2ForCausalLM = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                dtype=dtype,
+                device_map=None,
+                max_position_embeddings=max_length,
+                use_cache=False,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+                token=hf_token,
+                trust_remote_code=True,
+            ) # type: ignore[assignment]
+            dense_reference_model.eval()
+            dense_reference_model.requires_grad_(False)
+
+            runner = SequentialLocalUpdateRunner(
+                model=model,
+                loader=calibration_dataloader,
+                device=device,
+                compressed_dtype=compressed_dtype,
+                ridge=sequential_update_ridge,
+                pin_cpu_offload=pin_cpu_offload,
+            )
+            updated_rank_map = runner.update_taw_only_checkpoint(
+                dense_reference_model=dense_reference_model,
+                layers_str=update_layers,
+            )
+            rank_map.update(updated_rank_map)
+
+            del runner, dense_reference_model, updated_rank_map
+        else:
+            raise ValueError(f"Unknown sequential_update_method: {sequential_update_method}")
+
+        cuda_cleanup()
+        ram_usage("After performing sequential low-rank update")
+        vram_usage("After performing sequential low-rank update")
+
     # Inspect lowrank matrices
     for name, p in model.named_parameters():
         if "W_u" in name or "W_v" in name:
@@ -1306,6 +1888,7 @@ def compress_svd_llm(
         score_metric_str = ("_" + score_metric_substr) if heterogeneous else ""
         v2_str = "_v2" if is_v2 else ""
         bypassed_layers_str = "_" + str(bypass_early_layers) if bypass_early_layers >= 0 else ""
+        sequential_update_str = f"_upd_{sequential_update_method}" if sequential_update else ""
 
         payload = {
             "state_dict": model.state_dict(),
@@ -1328,6 +1911,14 @@ def compress_svd_llm(
                 "lowrank_parameter_dtypes": dtype_summary(model, only_lowrank=True),
                 "num_lowrank_modules": len(rank_map),
                 "rank_map_preview": list(rank_map.items())[:10],
+                "sequential_update": sequential_update,
+                "sequential_update_method": sequential_update_method if sequential_update else None,
+                "sequential_lora_r": sequential_lora_r if sequential_update_method == "lora" and sequential_update else None,
+                "sequential_lora_alpha": sequential_lora_alpha if sequential_update_method == "lora" and sequential_update else None,
+                "sequential_lora_dropout": sequential_lora_dropout if sequential_update_method == "lora" and sequential_update else None,
+                "sequential_lora_lr": sequential_lora_lr if sequential_update_method == "lora" and sequential_update else None,
+                "sequential_lora_epochs": sequential_lora_epochs if sequential_update_method == "lora" and sequential_update else None,
+                "sequential_lora_max_steps": sequential_lora_max_steps if sequential_update_method == "lora" and sequential_update else None,
             },
         }
 
@@ -1344,6 +1935,7 @@ def compress_svd_llm(
            group_criterion_str +
            score_metric_str +
            bypassed_layers_str +
+           sequential_update_str +
            v2_str + 
            ".pt")
         print("[DEBUG] Compressed model saved succesfully")
