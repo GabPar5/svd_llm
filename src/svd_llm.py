@@ -958,10 +958,14 @@ def run_sequential_lora_update(
         optimizer_steps = 0
         micro_steps = 0
         skipped_all_masked_batches = 0
+        total_loss = 0.0
+        total_loss_batches = 0
         should_stop = False
         total_epochs = 10**12 if max_steps is not None else max(1, int(epochs))
 
         for epoch_idx in range(total_epochs):
+            epoch_loss = 0.0
+            epoch_loss_batches = 0
             progress = tqdm(
                 loader,
                 desc=f"Sequential LoRA {phase_name} epoch {epoch_idx + 1}",
@@ -989,6 +993,12 @@ def run_sequential_lora_update(
                     labels=labels,
                     use_cache=False,
                 )
+                batch_loss = outputs.loss.detach().float().item()
+                epoch_loss += batch_loss
+                epoch_loss_batches += 1
+                total_loss += batch_loss
+                total_loss_batches += 1
+
                 loss = outputs.loss / grad_accum_steps
                 loss.backward()
                 micro_steps += 1
@@ -998,7 +1008,8 @@ def run_sequential_lora_update(
                     optimizer.zero_grad(set_to_none=True)
                     optimizer_steps += 1
                     progress.set_postfix(
-                        loss=f"{(loss.detach().item() * grad_accum_steps):.4f}",
+                        loss=f"{batch_loss:.4f}",
+                        avg_loss=f"{(total_loss / total_loss_batches):.4f}",
                         step=optimizer_steps,
                     )
 
@@ -1012,6 +1023,13 @@ def run_sequential_lora_update(
 
             if should_stop:
                 break
+
+            if epoch_loss_batches > 0:
+                print(
+                    f"[SEQ-UPDATE][LoRA] {phase_name} epoch {epoch_idx + 1}: "
+                    f"avg_loss={epoch_loss / epoch_loss_batches:.6f} "
+                    f"over {epoch_loss_batches} supervised batches."
+                )
 
         if micro_steps > 0 and micro_steps % grad_accum_steps != 0:
             optimizer.step()
@@ -1030,7 +1048,12 @@ def run_sequential_lora_update(
                 "batches because every label was -100."
             )
 
-        print(f"[SEQ-UPDATE][LoRA] {phase_name}: completed {optimizer_steps} optimizer steps.")
+        average_loss = total_loss / total_loss_batches if total_loss_batches > 0 else float("nan")
+        print(
+            f"[SEQ-UPDATE][LoRA] {phase_name}: completed {optimizer_steps} "
+            f"optimizer steps | avg_loss={average_loss:.6f} "
+            f"over {total_loss_batches} supervised batches."
+        )
         model.eval()
         model = model.merge_and_unload() # pyright: ignore[reportCallIssue]
         model.requires_grad_(False)
