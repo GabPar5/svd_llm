@@ -13,6 +13,7 @@ from tqdm import tqdm
 from enum import Enum
 from datasets import load_dataset, load_from_disk, Dataset
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
+from .modules import *
 
 # Threshold above which cuSOLVER 32-bit indexing overflows
 SOLVER_GPU_MAX_DIM = 32000
@@ -505,7 +506,6 @@ def _redundancy_from_scores(scores: torch.Tensor, offset: float = 1.5) -> torch.
     # Handle nan and infinite values (fallback)
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # TODO - understand this fallback ???
     if weights.sum() <= 0:
         weights = torch.ones_like(weights)
 
@@ -576,21 +576,53 @@ def allocate_param_weighted_group(
 
     return {k: float(r) for k, r in zip(keys, ratios.tolist())}
 
+def factor_range_report(name, W_u, W_v):
+    if not torch.isfinite(W_u).all() or not torch.isfinite(W_v).all():
+        raise RuntimeError(f"{name}: fp16 cast produced inf/nan")
+    for label, W in [("W_u", W_u), ("W_v", W_v)]:
+        amax = W.float().abs().max().item()
+        rms = W.float().pow(2).mean().sqrt().item()
+        print(f"[FACTOR-RANGE] {name}.{label}: absmax={amax:.6e}, rms={rms:.6e}")
+
+        if amax > 60000:
+            print(f"[WARNING] {name}.{label} is near fp16 overflow range")
+
 @torch.no_grad()
-def check_lowrank_equivalence(layer_name, layer_attr, van, device="cuda", dtype=torch.bfloat16):
+def check_weights_relative_difference(layer_name, layer_attr, van, device="cuda"):
+    W_hat = (
+        van.W_u.weight.to(device).float()
+        @ van.W_v.weight.to(device).float()
+    )
+    W_orig = layer_attr.weight.to(device).float()
+
+    rel_w = (W_orig - W_hat).norm() / W_orig.norm().clamp_min(1e-12)
+    print(f"[CHECK] {layer_name}: Relative error of reduced rank reconstruction: {rel_w:.3e}")
+
+    van.cpu()
+
+@torch.no_grad()
+def check_lowrank_equivalence(layer_name, layer_attr, van, device="cuda"):
+    input_dtype = layer_attr.weight.dtype
+    factor_dtype = van.W_v.weight.dtype
+
     x = torch.randn(
         2, 8, layer_attr.in_features,
         device=device,
-        dtype=layer_attr.weight.dtype,
+        dtype=input_dtype,
     )
 
-    W_hat = van.W_u.weight.to(device, dtype=dtype) @ van.W_v.weight.to(device, dtype=dtype)
-    b = van.W_u.bias.to(device, dtype=dtype) if van.W_u.bias is not None else None
+    van = van.to(device).eval()
 
-    y_dense_hat = F.linear(x, W_hat, b)
-    y_lowrank = van.to(device, dtype=dtype)(x)
+    # Match LowRank.forward(): input is cast to factor dtype internally.
+    x_factor = x.to(factor_dtype)
 
-    rel = (y_dense_hat - y_lowrank).norm() / y_dense_hat.norm().clamp_min(1e-12)
+    W_hat = van.W_u.weight @ van.W_v.weight
+    b = van.W_u.bias
+
+    y_dense_hat = F.linear(x_factor, W_hat, b).to(input_dtype)
+    y_lowrank = van(x)
+
+    rel = (y_dense_hat.float() - y_lowrank.float()).norm() / y_dense_hat.float().norm().clamp_min(1e-12)
     print(f"[CHECK] {layer_name}: lowrank-vs-dense relerr={rel.item():.3e}")
 
     if not torch.isfinite(y_lowrank).all():
@@ -599,14 +631,15 @@ def check_lowrank_equivalence(layer_name, layer_attr, van, device="cuda", dtype=
     van.cpu()
 
 @torch.no_grad()
-def check_layer_activation_error(name, old_linear, lowrank, in_features, device="cuda", dtype=torch.bfloat16):
-    x = torch.randn(2, 128, in_features, device=device, dtype=dtype)
+def check_layer_activation_error(name, old_linear, van, device="cuda"):
+    x = torch.randn(
+        2, 128, old_linear.in_features,
+        device=device, 
+        dtype=old_linear.weight.dtype
+    )
 
-    old_linear = old_linear.to(device, dtype=dtype).eval()
-    lowrank = lowrank.to(device, dtype=dtype).eval()
-
-    y0 = old_linear(x)
-    y1 = lowrank(x)
+    y0 = old_linear.to(device).eval()(x)
+    y1 = van.to(device).eval()(x)
 
     rel = (y0.float() - y1.float()).norm() / y0.float().norm().clamp_min(1e-12)
     max_abs = (y0.float() - y1.float()).abs().max()
@@ -619,8 +652,11 @@ def check_layer_activation_error(name, old_linear, lowrank, in_features, device=
         f"y1_norm={y1.float().norm().item():.6e}"
     )
 
-    lowrank.cpu()
+    van.cpu()
     old_linear.cpu()
+
+    W_hat = b = y_dense_hat = y_lowrank = None
+    del W_hat, b, y_dense_hat, y_lowrank
 
 @torch.no_grad()
 def logits_debug(model, tokenizer, text, device="cuda"):
@@ -639,6 +675,126 @@ def logits_debug(model, tokenizer, text, device="cuda"):
 
     for p, tid in zip(vals[0].tolist(), ids[0].tolist()):
         print(f"{p:.5f}", repr(tokenizer.decode([tid])))
+
+def collect_non_persistent_buffers(model: torch.nn.Module):
+    """
+    Save buffers that are registered on the model but absent from state_dict().
+    These include things like RoPE inv_freq in some HF models.
+
+    Returns CPU tensors so the checkpoint is device-independent.
+    """
+    state_keys = set(model.state_dict().keys())
+
+    extra_buffers = {}
+    for name, buf in model.named_buffers():
+        if name not in state_keys:
+            extra_buffers[name] = buf.detach().cpu().clone()
+
+    return extra_buffers
+
+def dtype_summary(model: torch.nn.Module, only_lowrank: bool = False):
+    counts = {}
+    for name, p in model.named_parameters():
+        if only_lowrank and ".W_u." not in name and ".W_v." not in name:
+            continue
+        counts[str(p.dtype)] = counts.get(str(p.dtype), 0) + p.numel()
+    return counts
+
+def get_parent_module(root: torch.nn.Module, tensor_name: str):
+    parts = tensor_name.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    return parent, parts[-1]
+
+@torch.no_grad()
+def restore_non_persistent_buffers(
+    model: torch.nn.Module,
+    saved_buffers: dict[str, torch.Tensor],
+    device: str | torch.device,
+    strict: bool = True,
+):
+    if not saved_buffers:
+        print("[LOAD] No non-persistent buffers found in checkpoint.")
+        return
+
+    restored = []
+    missing = []
+    shape_mismatch = []
+
+    for name, saved in saved_buffers.items():
+        try:
+            parent, attr = get_parent_module(model, name)
+            current = getattr(parent, attr)
+        except AttributeError:
+            missing.append(name)
+            continue
+
+        if not torch.is_tensor(current):
+            missing.append(name)
+            continue
+
+        if tuple(current.shape) != tuple(saved.shape):
+            shape_mismatch.append(
+                (name, tuple(current.shape), tuple(saved.shape))
+            )
+            continue
+
+        current.copy_(
+            saved.to(
+                device=current.device if current.device.type != "meta" else device,
+                dtype=current.dtype,
+            )
+        )
+        restored.append(name)
+
+    print(f"[LOAD] Restored {len(restored)} non-persistent buffers.")
+    for name in restored[:20]:
+        print(f"[LOAD]   restored buffer: {name}")
+
+    if missing:
+        msg = f"Missing non-persistent buffers in model: {missing[:20]}"
+        if strict:
+            raise RuntimeError(msg)
+        print("[LOAD][WARNING]", msg)
+
+    if shape_mismatch:
+        msg = f"Shape-mismatched non-persistent buffers: {shape_mismatch[:20]}"
+        if strict:
+            raise RuntimeError(msg)
+        print("[LOAD][WARNING]", msg)
+
+# TODO - define transformers model and (possibly) save to huggingface. This would reduce exposure to bugs during compressed model loading
+def apply_lowrank(model, rank_map, state_dict=None):
+    """
+    Replace MLP linear layers with LowRank modules.
+    rank_map: dict with keys like 'model.layers.0.mlp.down_proj', 'model.layers.0.mlp.gate_proj', etc.
+    """
+    for layer_name, rank in rank_map.items():
+        layer_path = layer_name.split(".")[:-1]
+        attr_name = layer_name.split(".")[-1]
+
+        parent = model
+        for sub_layer in layer_path:
+            parent = getattr(parent, sub_layer)
+
+        old = getattr(parent, attr_name)
+
+        if state_dict is not None:
+            factor_key = f"{layer_name}.W_v.weight"
+            factor_dtype = state_dict[factor_key].dtype
+        else:
+            factor_dtype = old.weight.dtype
+
+        lowrank = LowRank(
+            in_features=old.in_features,
+            out_features=old.out_features,
+            rank=rank,
+            bias=old.bias is not None,
+        ).to(device=old.weight.device, dtype=factor_dtype)
+
+        lowrank.requires_grad_(False)
+        setattr(parent, attr_name, lowrank)
 
 @torch.no_grad()
 def ppl_eval(
@@ -689,7 +845,7 @@ def ppl_eval(
     # --- Step 3: compute NLL for each chunk ---
     batch_size_ppl = batch_size
     if not isinstance(batch_size, int):
-        batch_size_ppl = 4 # Fallback if batch size was set to auto
+        batch_size_ppl = 2 # Fallback if batch size was set to auto
 
     nlls = []
     for i in tqdm(range(0, num_chunks, batch_size_ppl), desc="Evaluating perplexity..."): # pyright: ignore[reportArgumentType]

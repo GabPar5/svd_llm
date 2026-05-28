@@ -1,5 +1,6 @@
 import re
 import gc
+import math
 import os
 import torch
 import torch.nn as nn
@@ -18,25 +19,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from torch.utils.data import DataLoader
 from .utils import *
+from .modules import *
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.set_float32_matmul_precision("highest")
 
-# TODO reconstruct full weight matrix (don't truncate) and compare it with original (DIAGNOSTICS)
 # TODO pass random calibration sample to `check_layer_activation_error` (DIAGNOSTICS)
-
-class LowRank(torch.nn.Module):
-    def __init__(self, in_features, out_features, rank, bias):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.W_v = nn.Linear(in_features, rank, bias=False)
-        self.W_u = nn.Linear(rank, out_features, bias=bias)
-        
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        output =  self.W_u(self.W_v(input))
-        return output
 
 jax.config.update("jax_enable_x64", True)
 
@@ -299,7 +288,7 @@ def get_whitening_matrices(
                 la.raw_xxt_matrix = torch.zeros(
                     la.in_features,
                     la.in_features,
-                    dtype=torch.float32,
+                    dtype=torch.float64, # accumulate in fp64 (lots of eigenvalues were negative with fp32 accumulation)
                     device=device,
                 )
                 handles.append(la.register_forward_hook(hook))
@@ -350,8 +339,17 @@ def get_whitening_matrices(
             if not(isinstance(la, nn.Linear) and hasattr(la, "raw_xxt_matrix")):
                 continue
             
-            # Detach XXT matrix from graph, cast it to higher precision and move it to cpu
-            raw_xxt_cpu = la.raw_xxt_matrix.detach().to(torch.float64).cpu() # pyright: ignore[reportCallIssue]
+            # Detach XXT matrix from graph, cast it to higher precision, compute covariance and move it to cpu
+            raw_xxt_cpu = la.raw_xxt_matrix.detach().to(torch.float64).cpu() / n_tokens # pyright: ignore[reportCallIssue]
+
+            # Check for unexpected asymmetries
+            skew = (raw_xxt_cpu - raw_xxt_cpu.T).abs().max()
+            scale = raw_xxt_cpu.abs().max().clamp_min(1e-12)
+            rel_skew = skew / scale
+            if rel_skew > 1e-5:
+                print(f"[WARNING] XXT has unexpected asymmetry: rel_skew={rel_skew:.2e}")
+            # Symmetrize to correct any eventual asymmetry
+            raw_xxt_cpu = (raw_xxt_cpu + raw_xxt_cpu.transpose(0, 1)) * 0.5
 
             la.raw_xxt_matrix = None  # pyright: ignore[reportArgumentType]
             del la.raw_xxt_matrix
@@ -368,13 +366,6 @@ def get_whitening_matrices(
         # Process whitening matrices one at a time.
         for lstr, raw_xxt_cpu in pending_xxt:
             if is_v2:
-                # Check for unexpected asymmetries, since we're going to use `eigh`
-                skew = (raw_xxt_cpu - raw_xxt_cpu.T).abs().max()
-                scale = raw_xxt_cpu.abs().max().clamp_min(1e-12)
-                rel_skew = skew / scale
-                if rel_skew > 1e-5:
-                    print(f"[WARNING] XXT has unexpected asymmetry: rel_skew={rel_skew:.2e}")
-
                 # Route to jax if the matrix is too large (pytorch fails due to a cuSolver index error)
                 if raw_xxt_cpu.shape[0] > SOLVER_GPU_MAX_DIM:
                     print(
@@ -388,10 +379,12 @@ def get_whitening_matrices(
 
                     # Peform eigenvalue decomposition using `eigh` and move results to CPU
                     L_s, U_s = torch.linalg.eigh(raw_xxt_gpu)
-                    L_s = L_s.cpu()
-                    U_s = U_s.cpu()
 
                     del raw_xxt_gpu
+
+                # Order eigenvalues/singular values in a descending order
+                L_s = L_s.flip(0).cpu()
+                U_s = U_s.flip(1).cpu()
                 
                 # Eigenvalues/singular values diagnostics
                 neg = L_s[L_s < 0]
@@ -402,9 +395,7 @@ def get_whitening_matrices(
                         f"min={L_s.min().item():.3e}, rel_min={rel_neg.item():.3e}"
                     )
 
-                # Order eigenvalues/singular values in a descending order, then put outputs into a tuple
-                L_s = L_s.flip(0)
-                U_s = U_s.flip(1)
+                # Put outputs into a tuple
                 wm = (U_s, L_s)
 
                 del U_s, L_s
@@ -764,6 +755,7 @@ def compress_svd_llm(
         max_length: int = 2048,
         is_v2: bool = False,
         dtype: str = "bfloat16",
+        compressed_dtype: str = "float16",
         batch_size: int = 32,
         seed: Optional[int] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -784,7 +776,8 @@ def compress_svd_llm(
         whitening_end_layer: Optional[int] = None,
         bypass_early_layers: int = 2,
         bypass_ratio: float = 0.0,
-        ratio_scope: Literal["selected", "all"] = "selected"
+        ratio_scope: Literal["selected", "all"] = "selected",
+        eps: float = 1e-6
 ):
     # Load model and tokenizer
     vram_usage("Before loading original model")
@@ -961,6 +954,8 @@ def compress_svd_llm(
     steps: int = 1
     steps_counter: int = 1
 
+    # TODO put all into one loop, exclude scoring pass for homogeneous. Perform only one svd of D, there's no need of doing one svdvals and one svd
+    # TODO try with covariance matrix - done, to monitor
     # Compression ratio allocation
     if heterogeneous:
         # Compute SVD for all layers and collect score metric
@@ -1011,11 +1006,12 @@ def compress_svd_llm(
                     U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
 
                     # Auxiliary matrix
-                    L_s_sqrt = torch.sqrt(torch.clamp(L_s, min=0.0))
+                    L_s_sqrt = torch.sqrt(L_s.clamp_min(eps))
+
 
                     # Perform SVD on W x U_s x sqrt(L_s)
-                    D = torch.matmul(W, U_s)
-                    D.mul_(L_s_sqrt.unsqueeze(0))
+                    C_sqrt = U_s * L_s_sqrt.unsqueeze(0)
+                    D = torch.matmul(W, C_sqrt)
                     # Calculate singular values only
                     L = torch.linalg.svdvals(D)
                 else:
@@ -1031,6 +1027,10 @@ def compress_svd_llm(
                     / (W.shape[0] + W.shape[1])
                 )
                 rank = max(1, min(rank, L.shape[0] - 1))
+
+                # Multiply by sqrt(n_tokens) to recover the unnormalized singular values.
+                # This pushes the scores into the hundreds/thousands
+                L = L * math.sqrt(max(max_length * dataset["max_samples"], 1))
 
                 # Calculate score metric
                 match score_metric:
@@ -1121,19 +1121,20 @@ def compress_svd_llm(
             W = layer_attr.weight.detach().to(device, dtype=torch.float64)
             
             # Compute rank from compression ratio
-            rank = int((W.shape[0] * W.shape[1] * (1 - layer_ratio)) / (W.shape[0] + W.shape[1]))
+            rank = int((W.shape[0] * W.shape[1] * (1 - layer_ratio)) / (W.shape[0] + W.shape[1])) # TODO restore rank compression
+            #rank = min(W.shape[0], W.shape[1])
             
             if is_v2:
                 # heterogeneous-v2 path - stream U_s and L_s calculated during the previous steps
                 U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=False)
-                L_s_clean = torch.clamp(L_s, min=0.0)
+                L_s_clean = L_s.clamp_min(eps)
 
                 # Auxiliary matrix
                 L_s_sqrt = torch.sqrt(L_s_clean)            
 
                 # Perform SVD on W x U_s x sqrt(L_s)
-                D = torch.matmul(W, U_s)
-                D.mul_(L_s_sqrt.unsqueeze(0))
+                C_sqrt = U_s * L_s_sqrt.unsqueeze(0)
+                D = torch.matmul(W, C_sqrt)
                 # Free W as soon as D is ready
                 W = None
                 del W
@@ -1143,32 +1144,32 @@ def compress_svd_llm(
                 D = None
                 del D
 
-                # Calculate 1/sqrt(L_s) and U_s inverse matrices
+                # Calculate 1/sqrt(L_s)
                 L_s_sqrt_inv = torch.rsqrt(L_s_clean)
-                U_s_inv_L_s_sqrt_inv = (U_s * L_s_sqrt_inv.unsqueeze(0)).T
 
                 # Free U_s and L_s
-                U_s = L_s = L_s_sqrt = None
-                del U_s, L_s, L_s_sqrt
+                L_s = L_s_sqrt = None
+                del L_s, L_s_sqrt
 
                 # Calculate final rank and truncate matrices
+                #rank = max(1, min(rank, L_ws.shape[0])) # TODO restore rank compression
                 rank = max(1, min(rank, L_ws.shape[0] - 1))
                 rank_map[layers_str[i]] = rank
                 U_ws_r = U_ws[:, :rank].contiguous()
                 L_ws_r = L_ws[:rank].clone()
                 V_wsT_r = V_wsT[:rank, :].contiguous()
+                L_ws_r_sqrt = torch.sqrt(L_ws_r)
 
                 # Free full-rank matrices as soon as truncated slices are built
-                U_ws = L_ws = V_wsT = L_s_sqrt_inv = None
-                del U_ws, L_ws, V_wsT, L_s_sqrt_inv
+                U_ws = L_ws = V_wsT = None
+                del U_ws, L_ws, V_wsT
 
                 # Compute approximate weight matrix, split in two matrices
-                L_ws_r_sqrt = torch.sqrt(L_ws_r)
-                W_u = (U_ws_r * L_ws_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
-                W_v = torch.matmul(L_ws_r_sqrt.unsqueeze(1) * V_wsT_r, U_s_inv_L_s_sqrt_inv).cpu().to(layer_attr.weight.dtype)
+                W_u = (U_ws_r * L_ws_r_sqrt.unsqueeze(0)).cpu().to(DtypeMap.get_dtype(compressed_dtype)).contiguous()
+                W_v = (L_ws_r_sqrt.unsqueeze(1) * torch.matmul((V_wsT_r * L_s_sqrt_inv.unsqueeze(0)), U_s.transpose(0, 1))).cpu().to(DtypeMap.get_dtype(compressed_dtype)).contiguous()
                 # Free low-rank matrices, leave only W_u and W_v
-                U_ws_r = L_ws_r = V_wsT_r = L_ws_r_sqrt = U_s_inv_L_s_sqrt_inv = None
-                del U_ws_r, L_ws_r, V_wsT_r, L_ws_r_sqrt, U_s_inv_L_s_sqrt_inv
+                U_s = L_s_sqrt_inv = U_ws_r = L_ws_r = V_wsT_r = L_ws_r_sqrt = None
+                del U_ws_r, L_ws_r, V_wsT_r, L_ws_r_sqrt
             else:
                 # Get normalized whitening matrix
                 whitening_matrix = load_whitening_data(whitening_matrices, layers_str[i], device, keep=False)
@@ -1207,8 +1208,8 @@ def compress_svd_llm(
                 del U, L, VT, whitening_matrix_inv
 
                 # Compute approximate weight matrix, split in two matrices
-                W_u = (U_r * L_r_sqrt.unsqueeze(0)).cpu().to(layer_attr.weight.dtype)
-                W_v = (VT_r * L_r_sqrt.unsqueeze(1)).cpu().to(layer_attr.weight.dtype)
+                W_u = (U_r * L_r_sqrt.unsqueeze(0)).cpu().to(DtypeMap.get_dtype(compressed_dtype))
+                W_v = (VT_r * L_r_sqrt.unsqueeze(1)).cpu().to(DtypeMap.get_dtype(compressed_dtype))
                 # Free low-rank matrices, leave only W_u and W_v
                 U_r = VT_r = L_r_sqrt = None
                 del U_r, VT_r, L_r_sqrt
@@ -1219,21 +1220,32 @@ def compress_svd_llm(
                 layer_attr.out_features,
                 rank,
                 layer_attr.bias is not None
-            ).to(device="cpu", dtype=layer_attr.weight.dtype)
+            ).to(device="cpu", dtype=DtypeMap.get_dtype(compressed_dtype))
             van.requires_grad_(False)
 
             van.W_u.weight.copy_(W_u)
             van.W_v.weight.copy_(W_v)
             if layer_attr.bias is not None:
-                van.W_u.bias.copy_(layer_attr.bias.detach().to(van.W_u.bias.dtype))
+                van.W_u.bias.copy_(layer_attr.bias.detach().to(DtypeMap.get_dtype(compressed_dtype)))
 
-            # Check lowrank module equivalence to a single nn.Linear
+            # Overflow check for fp16 case only + throw error if any value is not finite
+            if compressed_dtype == "float16" or compressed_dtype == "fp16":
+                factor_range_report(layers_str[i], W_u, W_v)
+
+            # Check relative diference between lowrank and original weight matrix
+            check_weights_relative_difference(
+                layers_str[i], 
+                layer_attr, 
+                van, 
+                device="cuda"
+            )
+
+            # Check lowrank module equivalence to a single nn.Linear (uses the compressed matrices in both cases)
             check_lowrank_equivalence(
                 layers_str[i], 
                 layer_attr, 
                 van, 
-                device="cuda", 
-                dtype=layer_attr.weight.dtype
+                device="cuda"
             )
 
             # Check activation relative error between compressed and original layer
@@ -1241,9 +1253,7 @@ def compress_svd_llm(
                 layers_str[i],
                 layer_attr,
                 van,
-                layer_attr.in_features,
-                device=device,
-                dtype=layer_attr.weight.dtype,
+                device=device
             )
 
             setattr(layer, attr, van)
@@ -1270,15 +1280,19 @@ def compress_svd_llm(
 
     if save_path:
         print("[DEBUG] Saving compressed model to disk...")
+
         # Create model directory
         save_path_model = save_path + \
                           "/models/" + \
                           model_name.replace("/", "_").replace("-", "_") + \
                           "/"
+        
         if not os.path.exists(save_path_model):
             os.makedirs(save_path_model)
+
         # Save tokenizer
         tokenizer.save_pretrained(save_path_model)
+
         # Save model weights
         compress_att_q_str = "_q" if compress_att_q else ""
         compress_att_k_str = "_k" if compress_att_k else ""
@@ -1292,10 +1306,32 @@ def compress_svd_llm(
         score_metric_str = ("_" + score_metric_substr) if heterogeneous else ""
         v2_str = "_v2" if is_v2 else ""
         bypassed_layers_str = "_" + str(bypass_early_layers) if bypass_early_layers >= 0 else ""
-        torch.save({
+
+        payload = {
             "state_dict": model.state_dict(),
             "rank_map": rank_map,
-        }, save_path_model + 
+
+            # General fix for meta + to_empty loading.
+            "non_persistent_buffers": collect_non_persistent_buffers(model),
+
+            # Useful metadata.
+            "config": model.config.to_dict(),
+            "generation_config": (
+                model.generation_config.to_dict() # pyright: ignore[reportOptionalMemberAccess]
+                if getattr(model, "generation_config", None) is not None
+                else None
+            ),
+            "svd_llm_metadata": {
+                "format_version": 2 if is_v2 else 1,
+                "base_model_name": model_name,
+                "parameter_dtypes": dtype_summary(model),
+                "lowrank_parameter_dtypes": dtype_summary(model, only_lowrank=True),
+                "num_lowrank_modules": len(rank_map),
+                "rank_map_preview": list(rank_map.items())[:10],
+            },
+        }
+
+        torch.save(payload, save_path_model + 
            model_name.replace("/", "_").replace("-", "_") + 
            compress_att_q_str +
            compress_att_k_str +
@@ -1314,29 +1350,3 @@ def compress_svd_llm(
 
     cuda_cleanup()
     return model, tokenizer
-
-# TODO - define transformers model and (possibly) save to huggingface. This would reduce exposure to bugs during compressed model loading
-def apply_lowrank(model, rank_map):
-    """
-    Replace MLP linear layers with LowRank modules.
-    rank_map: dict with keys like 'model.layers.0.mlp.down_proj', 'model.layers.0.mlp.gate_proj', etc.
-    """
-    for layer_name, rank in rank_map.items():
-        layer_path = layer_name.split(".")[:-1]
-        attr_name = layer_name.split(".")[-1]
-
-        parent = model
-        for sub_layer in layer_path:
-            parent = getattr(parent, sub_layer)
-
-        old = getattr(parent, attr_name)
-
-        lowrank = LowRank(
-            in_features=old.in_features,
-            out_features=old.out_features,
-            rank=rank,
-            bias=old.bias is not None,
-        ).to(device=old.weight.device, dtype=old.weight.dtype)
-        lowrank.requires_grad_(False)
-
-        setattr(parent, attr_name, lowrank)
