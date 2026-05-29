@@ -1,5 +1,6 @@
 import re
 import gc
+import inspect
 import math
 import os
 import torch
@@ -15,7 +16,7 @@ from functools import partial
 from typing import Dict, Optional, List, Union, Literal, Tuple
 from collections import defaultdict
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForSeq2Seq # pyright: ignore[reportPrivateImportUsage]
+from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForSeq2Seq, Trainer, TrainerCallback, TrainingArguments # pyright: ignore[reportPrivateImportUsage]
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from torch.utils.data import DataLoader
 from .utils import *
@@ -850,7 +851,66 @@ class SequentialLocalUpdateRunner:
         return rank_map
 
 
-def run_sequential_lora_update(
+class SavePeftAdapterCallback(TrainerCallback):
+    """Keep Trainer checkpoints adapter-only when training a PEFT model."""
+
+    def on_save(self, args, state, control, **kwargs):
+        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        model = kwargs.get("model", None)
+        if model is not None and hasattr(model, "save_pretrained"):
+            model.save_pretrained(checkpoint_dir)
+
+        for filename in ("pytorch_model.bin", "model.safetensors"):
+            path = os.path.join(checkpoint_dir, filename)
+            if os.path.exists(path):
+                os.remove(path)
+
+        return control
+
+
+def _lora_factor_targets(
+        model: nn.Module,
+        factor_name: str,
+        selected_layers: Optional[set[str]] = None,
+) -> List[str]:
+    suffix = f".{factor_name}"
+    targets = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear) or not name.endswith(suffix):
+            continue
+        lowrank_name = name[:-len(suffix)]
+        if selected_layers and lowrank_name not in selected_layers:
+            continue
+        targets.append(name)
+    return targets
+
+
+def _print_trainable_dtype_summary(model: nn.Module) -> None:
+    dtype_counts: Dict[str, int] = defaultdict(int)
+    trainable_total = 0
+    for param in model.parameters():
+        if param.requires_grad:
+            dtype_counts[str(param.dtype)] += param.numel()
+            trainable_total += param.numel()
+
+    print(f"[SEQ-UPDATE][LoRA] Trainable parameters: {trainable_total:,}")
+    for dtype_name, count in sorted(dtype_counts.items()):
+        print(f"[SEQ-UPDATE][LoRA]   trainable dtype {dtype_name}: {count:,}")
+
+
+def _assert_lowrank_parameters_finite(model: nn.Module, label: str) -> None:
+    bad = []
+    for name, param in model.named_parameters():
+        if (".W_u." in name or ".W_v." in name) and not torch.isfinite(param).all():
+            bad.append(name)
+
+    if bad:
+        raise RuntimeError(f"[SEQ-UPDATE][LoRA] Non-finite LowRank parameters after {label}: {bad[:10]}")
+
+    print(f"[SEQ-UPDATE][LoRA] Finite LowRank parameter check passed after {label}.")
+
+
+def run_sequential_lora_update_custom(
         model: Qwen2ForCausalLM,
         loader: DataLoader,
         device: str,
@@ -1070,6 +1130,231 @@ def run_sequential_lora_update(
     model = model.cpu()
     cuda_cleanup()
     print("[SEQ-UPDATE][LoRA] Sequential U-then-V update complete.")
+    return model
+
+
+def run_sequential_lora_update(
+        model: Qwen2ForCausalLM,
+        device: str,
+        layers_str: Optional[List[str]] = None,
+        backend: Literal["trainer", "custom"] = "trainer",
+        loader: Optional[DataLoader] = None,
+        train_dataset=None,
+        eval_dataset=None,
+        data_collator=None,
+        tokenizer=None,
+        output_dir: Optional[str] = None,
+        model_dtype: Union[str, torch.dtype] = "float16",
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.0,
+        epochs: int = 2,
+        max_steps: Optional[int] = None,
+        micro_batch_size: int = 4,
+        effective_batch_size: int = 64,
+        grad_accum_steps: Optional[int] = None,
+        gradient_checkpointing: bool = False,
+) -> Qwen2ForCausalLM:
+    if backend == "custom":
+        if loader is None:
+            raise ValueError("Custom LoRA backend requires a DataLoader.")
+        return run_sequential_lora_update_custom(
+            model=model,
+            loader=loader,
+            device=device,
+            layers_str=layers_str,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            epochs=epochs,
+            max_steps=max_steps,
+            grad_accum_steps=grad_accum_steps or max(1, math.ceil(effective_batch_size / micro_batch_size)),
+            gradient_checkpointing=gradient_checkpointing,
+        )
+
+    if backend != "trainer":
+        raise ValueError(f"Unknown LoRA backend: {backend}")
+
+    if max_steps is not None and max_steps <= 0:
+        max_steps = None
+
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:
+        raise ImportError(
+            "The Trainer LoRA backend requires `peft`. Install peft, or use "
+            "`--sequential_lora_backend custom` only if peft is available there too."
+        ) from exc
+
+    if train_dataset is None or data_collator is None or tokenizer is None:
+        raise ValueError("Trainer LoRA backend requires train_dataset, data_collator, and tokenizer.")
+    if micro_batch_size <= 0:
+        raise ValueError("sequential_lora_micro_batch_size must be > 0.")
+    if effective_batch_size <= 0:
+        raise ValueError("sequential_lora_effective_batch_size must be > 0.")
+    if effective_batch_size % micro_batch_size != 0 and grad_accum_steps is None:
+        raise ValueError(
+            "For the Trainer LoRA backend, --sequential_lora_effective_batch_size "
+            "must be divisible by --sequential_lora_micro_batch_size."
+        )
+
+    grad_accum_steps = (
+        grad_accum_steps
+        if grad_accum_steps is not None
+        else effective_batch_size // micro_batch_size
+    )
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    actual_effective_batch_size = micro_batch_size * grad_accum_steps
+
+    print(
+        "[SEQ-UPDATE][LoRA][Trainer] "
+        f"micro_batch_size={micro_batch_size}, "
+        f"grad_accum_steps={grad_accum_steps}, "
+        f"effective_batch_size={actual_effective_batch_size}"
+    )
+    print(
+        "[SEQ-UPDATE][LoRA][Trainer] "
+        f"train_samples={len(train_dataset)} | "
+        f"eval_samples={len(eval_dataset) if eval_dataset is not None else 0}"
+    )
+
+    selected_layers = set(layers_str or [])
+    original_use_cache = getattr(model.config, "use_cache", None)
+    model.config.use_cache = False
+    model = model.to(device) # pyright: ignore[reportArgumentType]
+
+    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    if output_dir is None:
+        output_dir = os.path.join("./tmp", "sequential_lora_trainer")
+    os.makedirs(output_dir, exist_ok=True)
+
+    torch_dtype = DtypeMap.get_dtype(model_dtype)
+    use_fp16 = torch_dtype == torch.float16
+    use_bf16 = torch_dtype == torch.bfloat16
+
+    phases = [
+        ("first_half", "W_u"),
+        ("second_half", "W_v"),
+    ]
+
+    for phase_name, factor_name in phases:
+        target_modules = _lora_factor_targets(model, factor_name, selected_layers)
+        if not target_modules:
+            raise RuntimeError(
+                f"No LoRA targets found for {factor_name}. "
+                "Expected compressed LowRank modules with inner W_u/W_v linears."
+            )
+
+        print(
+            f"[SEQ-UPDATE][LoRA][Trainer] {phase_name}: tuning {factor_name} "
+            f"for {len(target_modules)} compressed projections."
+        )
+        print(f"[SEQ-UPDATE][LoRA][Trainer] Target preview: {target_modules[:8]}")
+
+        model.requires_grad_(False)
+        config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config) # pyright: ignore[reportAssignmentType]
+        model.train()
+        _print_trainable_dtype_summary(model)
+
+        phase_output_dir = os.path.join(output_dir, phase_name)
+        os.makedirs(phase_output_dir, exist_ok=True)
+
+        use_eval = eval_dataset is not None and len(eval_dataset) > 0
+        eval_steps = 100
+        save_steps = 200
+        if max_steps is not None and max_steps > 0 and max_steps < save_steps:
+            eval_steps = max(1, min(eval_steps, max_steps))
+            save_steps = eval_steps
+
+        training_arg_names = inspect.signature(TrainingArguments.__init__).parameters
+        strategy_arg_name = (
+            "eval_strategy"
+            if "eval_strategy" in training_arg_names
+            else "evaluation_strategy"
+        )
+        training_kwargs = {
+            "output_dir": phase_output_dir,
+            "overwrite_output_dir": True,
+            "per_device_train_batch_size": micro_batch_size,
+            "gradient_accumulation_steps": grad_accum_steps,
+            "warmup_steps": 100,
+            "num_train_epochs": epochs,
+            "max_steps": max_steps if max_steps is not None else -1,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "fp16": use_fp16,
+            "bf16": use_bf16,
+            "logging_steps": 10,
+            "logging_first_step": True,
+            strategy_arg_name: "steps" if use_eval else "no",
+            "save_strategy": "steps",
+            "eval_steps": eval_steps,
+            "save_steps": save_steps,
+            "load_best_model_at_end": use_eval,
+            "metric_for_best_model": "eval_loss" if use_eval else None,
+            "greater_is_better": False if use_eval else None,
+            "save_safetensors": True,
+            "optim": "adamw_torch",
+            "remove_unused_columns": False,
+            "report_to": [],
+        }
+        training_args = TrainingArguments(**training_kwargs)
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset if use_eval else None,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            callbacks=[SavePeftAdapterCallback()],
+        )
+
+        train_result = trainer.train()
+        print(f"[SEQ-UPDATE][LoRA][Trainer] {phase_name} train metrics: {train_result.metrics}")
+
+        if use_eval:
+            eval_metrics = trainer.evaluate()
+            print(f"[SEQ-UPDATE][LoRA][Trainer] {phase_name} eval metrics: {eval_metrics}")
+            print(
+                f"[SEQ-UPDATE][LoRA][Trainer] {phase_name} best checkpoint: "
+                f"{trainer.state.best_model_checkpoint} | best_metric={trainer.state.best_metric}"
+            )
+
+        model = trainer.model
+        model.eval()
+        model = model.merge_and_unload() # pyright: ignore[reportCallIssue]
+        model.requires_grad_(False)
+        _assert_lowrank_parameters_finite(model, phase_name)
+
+        del trainer, train_result
+        cuda_cleanup()
+
+    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+
+    if original_use_cache is not None:
+        model.config.use_cache = original_use_cache
+
+    model = model.cpu()
+    cuda_cleanup()
+    print("[SEQ-UPDATE][LoRA][Trainer] Sequential U-then-V update complete.")
     return model
  
 def allocate_ratios(
@@ -1326,6 +1611,7 @@ def compress_svd_llm(
         sequential_update: bool = False,
         sequential_update_ridge: float = 1e-6,
         sequential_update_method: Literal["lora", "local_u"] = "lora",
+        sequential_lora_backend: Literal["trainer", "custom"] = "trainer",
         sequential_lora_r: int = 8,
         sequential_lora_alpha: int = 16,
         sequential_lora_dropout: float = 0.05,
@@ -1335,6 +1621,8 @@ def compress_svd_llm(
         sequential_lora_max_steps: Optional[int] = None,
         sequential_lora_grad_accum_steps: Optional[int] = None,
         sequential_lora_effective_batch_size: int = 64,
+        sequential_lora_micro_batch_size: int = 4,
+        sequential_lora_val_set_size: int = 2000,
         sequential_lora_gradient_checkpointing: bool = False,
         finetune_dataset: str = "yahma/alpaca-cleaned",
         max_finetune_samples: int = 50000,
@@ -1828,6 +2116,7 @@ def compress_svd_llm(
             del W_u, W_v
 
     sequential_update_samples: Optional[int] = None
+    sequential_update_finetune_stats: Optional[Dict] = None
 
     if sequential_update:
         print("[SEQ-UPDATE] TAW compression complete. Starting sequential low-rank update.")
@@ -1840,20 +2129,33 @@ def compress_svd_llm(
         )
 
         if sequential_update_method == "lora":
+            if sequential_lora_micro_batch_size <= 0:
+                raise ValueError("sequential_lora_micro_batch_size must be > 0.")
+            if sequential_lora_backend == "trainer" and sequential_lora_effective_batch_size % sequential_lora_micro_batch_size != 0:
+                raise ValueError(
+                    "For --sequential_lora_backend trainer, "
+                    "sequential_lora_effective_batch_size must be divisible by "
+                    "sequential_lora_micro_batch_size."
+                )
             if sequential_lora_grad_accum_steps is None:
                 sequential_lora_grad_accum_steps = max(
                     1,
-                    math.ceil(sequential_lora_effective_batch_size / batch_size),
+                    (
+                        sequential_lora_effective_batch_size // sequential_lora_micro_batch_size
+                        if sequential_lora_backend == "trainer"
+                        else math.ceil(sequential_lora_effective_batch_size / sequential_lora_micro_batch_size)
+                    ),
                 )
-            actual_effective_batch_size = batch_size * sequential_lora_grad_accum_steps
+            actual_effective_batch_size = sequential_lora_micro_batch_size * sequential_lora_grad_accum_steps
             print(
                 "[SEQ-UPDATE][LoRA] "
-                f"micro_batch_size={batch_size}, "
+                f"backend={sequential_lora_backend}, "
+                f"micro_batch_size={sequential_lora_micro_batch_size}, "
                 f"grad_accum_steps={sequential_lora_grad_accum_steps}, "
                 f"effective_batch_size={actual_effective_batch_size}"
             )
             print("[SEQ-UPDATE][LoRA] Loading fine-tuning dataset.")
-            finetune_dataset_tokenized, sequential_update_samples = tokenize_finetune_dataset(
+            train_dataset, eval_dataset, finetune_stats = tokenize_finetune_dataset(
                 dataset_spec=finetune_dataset,
                 tokenizer=tokenizer,
                 max_samples=max_finetune_samples,
@@ -1861,25 +2163,37 @@ def compress_svd_llm(
                 seed=seed,
                 train_on_inputs=finetune_train_on_inputs,
                 add_eos_token=finetune_add_eos_token,
+                val_set_size=sequential_lora_val_set_size,
             )
+            sequential_update_finetune_stats = finetune_stats
+            sequential_update_samples = finetune_stats["train_samples"]
             finetune_collator = DataCollatorForSeq2Seq(
                 tokenizer,
                 pad_to_multiple_of=8,
                 return_tensors="pt",
                 padding=True,
             )
-            finetune_dataloader = DataLoader(
-                finetune_dataset_tokenized, # pyright: ignore[reportArgumentType]
-                batch_size=batch_size,
-                shuffle=True,
-                pin_memory=pin_cpu_offload and str(device).startswith("cuda"),
-                collate_fn=finetune_collator,
-            )
+            finetune_dataloader = None
+            if sequential_lora_backend == "custom":
+                finetune_dataloader = DataLoader(
+                    train_dataset, # pyright: ignore[reportArgumentType]
+                    batch_size=sequential_lora_micro_batch_size,
+                    shuffle=True,
+                    pin_memory=pin_cpu_offload and str(device).startswith("cuda"),
+                    collate_fn=finetune_collator,
+                )
             model = run_sequential_lora_update(
                 model=model,
-                loader=finetune_dataloader,
                 device=device,
                 layers_str=update_layers,
+                backend=sequential_lora_backend,
+                loader=finetune_dataloader,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                data_collator=finetune_collator,
+                tokenizer=tokenizer,
+                output_dir=os.path.join(save_path or "./tmp", "sequential_lora_trainer", model_name.replace("/", "_").replace("-", "_")),
+                model_dtype=dtype,
                 lora_r=sequential_lora_r,
                 lora_alpha=sequential_lora_alpha,
                 lora_dropout=sequential_lora_dropout,
@@ -1887,10 +2201,12 @@ def compress_svd_llm(
                 weight_decay=sequential_lora_weight_decay,
                 epochs=sequential_lora_epochs,
                 max_steps=sequential_lora_max_steps,
+                micro_batch_size=sequential_lora_micro_batch_size,
+                effective_batch_size=sequential_lora_effective_batch_size,
                 grad_accum_steps=sequential_lora_grad_accum_steps,
                 gradient_checkpointing=sequential_lora_gradient_checkpointing,
             )
-            del finetune_dataset_tokenized, finetune_dataloader, finetune_collator
+            del train_dataset, eval_dataset, finetune_dataloader, finetune_collator
         elif sequential_update_method == "local_u":
             sequential_update_samples = dataset["max_samples"]
             model = model.cpu()
@@ -2001,8 +2317,10 @@ def compress_svd_llm(
                 "rank_map_preview": list(rank_map.items())[:10],
                 "sequential_update": sequential_update,
                 "sequential_update_method": sequential_update_method if sequential_update else None,
+                "sequential_lora_backend": sequential_lora_backend if sequential_update and sequential_update_method == "lora" else None,
                 "sequential_update_dataset": finetune_dataset if sequential_update and sequential_update_method == "lora" else None,
                 "sequential_update_samples": sequential_update_samples,
+                "sequential_update_finetune_stats": sequential_update_finetune_stats,
                 "finetune_cutoff_len": finetune_cutoff_len if sequential_update and sequential_update_method == "lora" else None,
                 "finetune_train_on_inputs": finetune_train_on_inputs if sequential_update and sequential_update_method == "lora" else None,
                 "sequential_lora_r": sequential_lora_r if sequential_update_method == "lora" and sequential_update else None,
@@ -2012,7 +2330,9 @@ def compress_svd_llm(
                 "sequential_lora_epochs": sequential_lora_epochs if sequential_update_method == "lora" and sequential_update else None,
                 "sequential_lora_max_steps": sequential_lora_max_steps if sequential_update_method == "lora" and sequential_update else None,
                 "sequential_lora_grad_accum_steps": sequential_lora_grad_accum_steps if sequential_update_method == "lora" and sequential_update else None,
-                "sequential_lora_effective_batch_size": batch_size * sequential_lora_grad_accum_steps if sequential_update_method == "lora" and sequential_update and sequential_lora_grad_accum_steps is not None else None,
+                "sequential_lora_micro_batch_size": sequential_lora_micro_batch_size if sequential_update_method == "lora" and sequential_update else None,
+                "sequential_lora_effective_batch_size": sequential_lora_micro_batch_size * sequential_lora_grad_accum_steps if sequential_update_method == "lora" and sequential_update and sequential_lora_grad_accum_steps is not None else None,
+                "sequential_lora_val_set_size": sequential_lora_val_set_size if sequential_update_method == "lora" and sequential_update else None,
             },
         }
 

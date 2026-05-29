@@ -8,7 +8,7 @@ import random
 import sys
 import re
 import resource
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 from tqdm import tqdm
 from enum import Enum
 from datasets import load_dataset, load_from_disk, Dataset
@@ -223,6 +223,8 @@ def tokenize_finetune_dataset(
         seed: Optional[int] = None,
         train_on_inputs: bool = False,
         add_eos_token: bool = False,
+        val_set_size: int = 2000,
+        val_split_seed: int = 42,
 ):
     """
     Tokenize the dataset used by the LoRA sequential update.
@@ -246,13 +248,39 @@ def tokenize_finetune_dataset(
     else:
         df = load_dataset(dataset_name, split=dataset_split)
 
-    if max_samples is not None and max_samples > 0 and len(df) > max_samples:
-        df = df.shuffle(seed=seed).select(range(max_samples)) # pyright: ignore[reportAttributeAccessIssue]
+    sample_limit = max_samples
+    if max_samples is not None and max_samples > 0 and val_set_size > 0:
+        # Keep max_samples as the intended training-set budget; add validation
+        # examples before splitting so default 50k + 2k mirrors upstream better.
+        sample_limit = max_samples + val_set_size
+
+    if sample_limit is not None and sample_limit > 0 and len(df) > sample_limit:
+        df = df.shuffle(seed=seed).select(range(sample_limit)) # pyright: ignore[reportAttributeAccessIssue]
     else:
         df = df.shuffle(seed=seed) # pyright: ignore[reportAttributeAccessIssue]
 
     requested_samples = len(df)
     print(f"[FINETUNE] Tokenizing up to {requested_samples} samples, cutoff_len={cutoff_len}")
+
+    eval_raw = None
+    actual_val_set_size = 0
+    if val_set_size > 0 and len(df) > 1:
+        actual_val_set_size = min(int(val_set_size), len(df) - 1)
+        if actual_val_set_size != val_set_size:
+            print(
+                f"[FINETUNE][WARNING] Requested val_set_size={val_set_size}, "
+                f"using {actual_val_set_size} to keep a non-empty train split."
+            )
+
+        split = df.train_test_split(
+            test_size=actual_val_set_size,
+            shuffle=True,
+            seed=val_split_seed,
+        )
+        train_raw = split["train"]
+        eval_raw = split["test"]
+    else:
+        train_raw = df
 
     def alpaca_prompt(instruction: str, input_text: str = "", output_text: Optional[str] = None) -> str:
         if input_text and input_text.strip():
@@ -336,38 +364,62 @@ def tokenize_finetune_dataset(
             )
         return tokenize_prompt(text, should_add_eos=True)
 
-    tokenized = df.map(
-        generate_and_tokenize,
-        remove_columns=df.column_names, # pyright: ignore[reportArgumentType]
-        load_from_cache_file=False,
-        desc="Tokenizing finetune dataset...",
-    )
-
-    before_filter = len(tokenized)
-    tokenized = tokenized.filter(
-        lambda example: any(label != -100 for label in example["labels"]),
-        load_from_cache_file=False,
-        desc="Filtering all-masked finetune samples...",
-    )
-    dropped = before_filter - len(tokenized)
-
-    if dropped > 0:
-        print(
-            f"[FINETUNE][WARNING] Dropped {dropped} samples with all labels masked. "
-            "This usually means the instruction/input alone reached cutoff_len; "
-            "consider increasing --finetune_cutoff_len."
+    def tokenize_and_filter_split(raw_split, split_name: str, allow_empty: bool = False):
+        tokenized = raw_split.map(
+            generate_and_tokenize,
+            remove_columns=raw_split.column_names, # pyright: ignore[reportArgumentType]
+            load_from_cache_file=False,
+            desc=f"Tokenizing {split_name} finetune dataset...",
         )
 
-    if len(tokenized) == 0:
-        raise ValueError(
-            "All finetune samples were filtered because every label was -100. "
-            "Increase --finetune_cutoff_len, use a shorter dataset, or set "
-            "--finetune_train_on_inputs."
+        before_filter = len(tokenized)
+        tokenized = tokenized.filter(
+            lambda example: any(label != -100 for label in example["labels"]),
+            load_from_cache_file=False,
+            desc=f"Filtering all-masked {split_name} finetune samples...",
         )
+        dropped = before_filter - len(tokenized)
 
-    print(f"[FINETUNE] Using {len(tokenized)} supervised samples after filtering.")
+        if dropped > 0:
+            print(
+                f"[FINETUNE][WARNING] Dropped {dropped} {split_name} samples "
+                "with all labels masked. This usually means the instruction/input "
+                "alone reached cutoff_len; consider increasing --finetune_cutoff_len."
+            )
 
-    return tokenized, len(tokenized)
+        if len(tokenized) == 0 and not allow_empty:
+            raise ValueError(
+                f"All {split_name} finetune samples were filtered because every "
+                "label was -100. Increase --finetune_cutoff_len, use a shorter "
+                "dataset, or set --finetune_train_on_inputs."
+            )
+
+        return tokenized, dropped
+
+    train_dataset, dropped_train = tokenize_and_filter_split(train_raw, "train")
+    eval_dataset = None
+    dropped_eval = 0
+    if eval_raw is not None:
+        eval_dataset, dropped_eval = tokenize_and_filter_split(eval_raw, "validation", allow_empty=True)
+        if len(eval_dataset) == 0:
+            print("[FINETUNE][WARNING] Validation split is empty after filtering; disabling evaluation.")
+            eval_dataset = None
+
+    stats: Dict[str, Any] = {
+        "requested_samples": requested_samples,
+        "train_samples": len(train_dataset),
+        "eval_samples": len(eval_dataset) if eval_dataset is not None else 0,
+        "val_set_size": actual_val_set_size,
+        "dropped_train_all_masked": dropped_train,
+        "dropped_eval_all_masked": dropped_eval,
+    }
+
+    print(
+        "[FINETUNE] Supervised samples after filtering: "
+        f"train={stats['train_samples']} | validation={stats['eval_samples']}"
+    )
+
+    return train_dataset, eval_dataset, stats
 
 def generate_paths(mlp: bool, q: bool, k: bool, v: bool, attention_output: bool, layers_number: int) -> list[str]:
     list_paths=[]
