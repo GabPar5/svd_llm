@@ -104,15 +104,14 @@ DENOMINATOR_TOKENS = {
 }
 
 PREFERRED_METRICS = [
-    "acc_norm,none",
     "acc,none",
+    "acc_norm,none",
 ]
 
 GENERATION_METRICS = {
     "gsm8k": [
         "exact_match,strict-match",
-        "exact_match,none",
-        "acc,none",
+        "exact_match,flexible-extract",
     ],
     "truthfulqa_gen": [
         "bleu_acc,none",
@@ -924,13 +923,6 @@ def build_markdown_report(rows_by_model: Dict[str, List[Dict[str, Any]]]) -> str
 
 def build_latex_report(rows_by_model: Dict[str, List[Dict[str, Any]]], table_width: float = 1.6) -> str:
     out = []
-
-    out.append(r"% Required packages:")
-    out.append(r"% \usepackage{booktabs}")
-    out.append(r"% \usepackage{multirow}")
-    out.append(r"% \usepackage{graphicx}")
-    out.append(r"% \usepackage[table]{xcolor}")
-    out.append("")
 
     for model_name in sorted(rows_by_model):
         out.append(make_latex_table_for_model(model_name, rows_by_model[model_name], table_width = table_width))

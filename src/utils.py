@@ -272,7 +272,7 @@ def tokenize_finetune_dataset(
                 f"using {actual_val_set_size} to keep a non-empty train split."
             )
 
-        split = df.train_test_split(
+        split = df.train_test_split( # pyright: ignore[reportAttributeAccessIssue]
             test_size=actual_val_set_size,
             shuffle=True,
             seed=val_split_seed,
@@ -711,9 +711,6 @@ def _redundancy_from_scores(scores: torch.Tensor, offset: float = 1.5) -> torch.
     weights = 1.0 / torch.log(scores + offset)
     # Handle nan and infinite values (fallback)
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if weights.sum() <= 0:
-        weights = torch.ones_like(weights)
 
     return weights
 

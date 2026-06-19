@@ -855,7 +855,7 @@ class SavePeftAdapterCallback(TrainerCallback):
     """Keep Trainer checkpoints adapter-only when training a PEFT model."""
 
     def on_save(self, args, state, control, **kwargs):
-        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}") # type: ignore
         model = kwargs.get("model", None)
         if model is not None and hasattr(model, "save_pretrained"):
             model.save_pretrained(checkpoint_dir)
@@ -1277,7 +1277,7 @@ def run_sequential_lora_update(
 
         use_eval = eval_dataset is not None and len(eval_dataset) > 0
         eval_steps = 100
-        save_steps = 200
+        save_steps = 100
         if max_steps is not None and max_steps > 0 and max_steps < save_steps:
             eval_steps = max(1, min(eval_steps, max_steps))
             save_steps = eval_steps
@@ -1322,7 +1322,7 @@ def run_sequential_lora_update(
             train_dataset=train_dataset,
             eval_dataset=eval_dataset if use_eval else None,
             data_collator=data_collator,
-            tokenizer=tokenizer,
+            tokenizer=tokenizer, # pyright: ignore[reportCallIssue]
             callbacks=[SavePeftAdapterCallback()],
         )
 
@@ -1337,7 +1337,7 @@ def run_sequential_lora_update(
                 f"{trainer.state.best_model_checkpoint} | best_metric={trainer.state.best_metric}"
             )
 
-        model = trainer.model
+        model = trainer.model # pyright: ignore[reportAssignmentType]
         model.eval()
         model = model.merge_and_unload() # pyright: ignore[reportCallIssue]
         model.requires_grad_(False)
@@ -1527,6 +1527,8 @@ def allocate_ratios(
             else 0.0
         )
 
+        offset = 1.5 # TODO make it an argument
+
         # TODO understand well how it works
         group_ratio_map = allocate_param_weighted_group(
             keys=keys,
@@ -1534,7 +1536,7 @@ def allocate_ratios(
             param_count_map=param_count_map,
             group_budget=group_budget,
             max_ratio=max_ratio,
-            offset=1.5
+            offset=offset
         )
 
         ratio_map.update(group_ratio_map)
@@ -1557,7 +1559,7 @@ def allocate_ratios(
                 f"    - {k:<55} "
                 f"| params={param_count_map[k]:>12,} "
                 f"| ratio={ratio_map[k]:.6f} "
-                f"| score={score_map[k]:.6f}"
+                f"| score={score_map[k]:.6f} (+ offset = {(score_map[k] + offset):.6f})"
             )
 
     actual_removed = sum(
@@ -1596,7 +1598,7 @@ def compress_svd_llm(
         compress_att_k: bool = False,
         compress_att_v: bool = False,
         compress_att_out: bool = False,
-        score_metric: Union[ScoreMetric, Literal["truncation", "entropy", "norm|p"]] = "truncation",
+        score_metric: Union[ScoreMetric, Literal["truncation", "truncation_sq", "entropy", "norm|p"]] = "truncation",
         heterogeneous: bool = False,
         group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]] = "type",
         group_patterns: Dict[str, List[str]] | None = None,
@@ -1890,10 +1892,15 @@ def compress_svd_llm(
                     case "truncation":
                         # After whitening, theoretical truncation loss equals to the L2 norm of truncated singular values = 2-schatten norm = Frobenius norm
                         score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=2).item()
+                    case "truncation_sq":
+                        score_map[layers_str[i]] = torch.sum(L[rank:]**2).item()
+                    case "relative_truncation_sq":
+                        energy = L.pow(2)
+                        score_map[layers_str[i]] = energy[rank:].sum() / energy.sum().clamp_min(eps)
                     case "entropy":
-                        # After whitening, entropy loss equals the sum of normalized singular values of the tail - TODO what if we don't normalize?
+                        # After whitening, entropy loss equals the sum of normalized singular values of the tail
                         norm_spectrum = L/L.sum()
-                        score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:] + 1e-9)).sum().item()
+                        score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum().item()
                     case s if s.startswith('norm'):
                         if s.split("|")[1].startswith("-"):
                             p_norm_value = -float(s.split("|")[1][1:])

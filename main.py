@@ -10,6 +10,7 @@ import lm_eval
 import multiprocessing as mp
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, GenerationConfig, DataCollatorForSeq2Seq # pyright: ignore[reportPrivateImportUsage]
 from lm_eval.models.huggingface import HFLM
+from lm_eval.tasks import TaskManager
 from lm_eval.utils import setup_logging, handle_non_serializable
 
 # TODO fix loading compressed model path
@@ -296,6 +297,12 @@ if __name__ == "__main__":
         )
     )
     parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
+    )
+    parser.add_argument(
         '--use_compressed', 
         action='store_true', 
         help='Use compressed model for evaluation'
@@ -464,6 +471,7 @@ if __name__ == "__main__":
             args.model,
             dtype=args.model_dtype,
             device_map=args.device,
+            attn_implementation=args.attn_implementation,
             use_safetensors=True,
             token=args.hf_token, 
             trust_remote_code=True
@@ -556,6 +564,11 @@ if __name__ == "__main__":
                 "State dict mismatch. The compressed checkpoint may not match "
                 "the base model or rank_map."
             )
+        
+        if hasattr(model, "set_attn_implementation"):
+            model.set_attn_implementation(args.attn_implementation)
+        else:
+            model.config._attn_implementation = args.attn_implementation
 
         # Clean memory
         del checkpoint, state_dict, extra_buffers
@@ -782,7 +795,7 @@ if __name__ == "__main__":
                 f"effective_batch_size={args.sequential_lora_micro_batch_size * args.sequential_lora_grad_accum_steps}"
             )
             model = run_sequential_lora_update(
-                model=model,
+                model=model, # pyright: ignore[reportArgumentType]
                 device=args.device,
                 layers_str=update_layers,
                 backend=args.sequential_lora_backend,
@@ -822,8 +835,8 @@ if __name__ == "__main__":
             dense_reference_model.requires_grad_(False)
 
             runner = SequentialLocalUpdateRunner(
-                model=model,
-                loader=update_dataloader,
+                model=model, # pyright: ignore[reportArgumentType]
+                loader=update_dataloader, # pyright: ignore[reportArgumentType]
                 device=args.device,
                 compressed_dtype=args.compressed_dtype,
                 ridge=args.sequential_update_ridge,
@@ -926,13 +939,26 @@ if __name__ == "__main__":
             else:
                 num_fewshot = int(tasks_shots[1])
         
+        lm_eval_task_names = [t for t in tasks_list if t not in {"wikitext", "c4"}]
         if isinstance(num_fewshot, list):
-            tasks_dict = [{"task": tasks_list[i], "num_fewshot": int(num_fewshot[i])} for i in range(len(tasks_list)) if tasks_list[i] != "wikitext" and tasks_list[i] != "c4"]
+            shot_by_task = {
+                tasks_list[i]: int(num_fewshot[i])
+                for i in range(len(tasks_list))
+            }
         else:
-            tasks_dict = [{"task": tasks_list[i], "num_fewshot": int(num_fewshot)} for i in range(len(tasks_list)) if tasks_list[i] != "wikitext" and tasks_list[i] != "c4"]
+            shot_by_task = {t: int(num_fewshot) for t in tasks_list}
+
+        task_manager = TaskManager()
+        loaded = task_manager.load(lm_eval_task_names)
+        task_objects = []
+
+        for task_name, task_obj in loaded["tasks"].items():
+            task_obj.set_config("num_fewshot", shot_by_task[task_name])
+            task_objects.append(task_obj)
+
         print(f"[DEBUG] Num few-shots: {num_fewshot}")
         print(f"[DEBUG] List of evaluation tasks: {tasks_list}")
-        print(f"[DEBUG] Tasks dictionaries: {tasks_dict}")
+        print(f"[DEBUG] Tasks dictionaries: {task_objects}")
         print(f"[DEBUG] HF model context length: {model.config.max_position_embeddings}")
 
         # Clamp max model context
@@ -977,9 +1003,11 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
             gc.collect()
 
-        if tasks_dict is not None and len(tasks_dict) > 0:
+        if task_objects is not None and len(task_objects) > 0:
             model.config.use_cache = True
-            model.generation_config.max_new_tokens = args.max_eval_tokens # pyright: ignore[reportOptionalMemberAccess]
+            # Avoid HF generate() warning from a stale global GenerationConfig.
+            if getattr(model, "generation_config", None) is not None:
+                model.generation_config.max_new_tokens = None # pyright: ignore[reportOptionalMemberAccess]
             # WARNING - PyRight reports lots of issues when dealing with lm-eval-harness 
             eval_model = HFLM(
                 pretrained=model, # pyright: ignore[reportCallIssue]
@@ -987,7 +1015,7 @@ if __name__ == "__main__":
                 batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
                 max_batch_size=128, # pyright: ignore[reportCallIssue]
                 device = args.device, # pyright: ignore[reportCallIssue]
-                max_length = max_gen_task_context_length # pyright: ignore[reportCallIssue]
+                max_length = max_length # pyright: ignore[reportCallIssue] # TODO revert to max generation tokens if necessary
             )
             print(f"[DEBUG] HFLM model context length: {eval_model.max_length}") # pyright: ignore[reportAttributeAccessIssue]
 
@@ -997,7 +1025,8 @@ if __name__ == "__main__":
             # Run evaluation 
             results = lm_eval.simple_evaluate(
                 model=eval_model, # pyright: ignore[reportCallIssue]
-                tasks=tasks_dict,  # type: ignore
+                tasks=task_objects,  # type: ignore
+                num_fewshot=None, # pyright: ignore[reportCallIssue]
                 batch_size=args.eval_batch_size, # pyright: ignore[reportCallIssue]
                 max_batch_size=128, # pyright: ignore[reportCallIssue]
                 device=args.device, # pyright: ignore[reportCallIssue]
