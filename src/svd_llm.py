@@ -1363,6 +1363,7 @@ def allocate_ratios(
         layers_str: List[str],
         target_ratio: float,
         param_count_map: Dict[str, int],
+        offset: float = 1.5,
         group_patterns: Dict[str, List[str]] | None = None,
         bypass_early_layers: int = 2,
         bypass_ratio: float = 0.0,
@@ -1527,8 +1528,6 @@ def allocate_ratios(
             else 0.0
         )
 
-        offset = 1.5 # TODO make it an argument
-
         # TODO understand well how it works
         group_ratio_map = allocate_param_weighted_group(
             keys=keys,
@@ -1598,7 +1597,7 @@ def compress_svd_llm(
         compress_att_k: bool = False,
         compress_att_v: bool = False,
         compress_att_out: bool = False,
-        score_metric: Union[ScoreMetric, Literal["truncation", "truncation_sq", "entropy", "norm|p"]] = "truncation",
+        score_metric: Union[ScoreMetric, Literal["truncation", "truncation_sq", "entropy", "entropy_sq", "eff_rank", "eff_rank_sq", "norm|p"]] = "truncation",
         heterogeneous: bool = False,
         group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]] = "type",
         group_patterns: Dict[str, List[str]] | None = None,
@@ -1609,6 +1608,7 @@ def compress_svd_llm(
         bypass_early_layers: int = 2,
         bypass_ratio: float = 0.0,
         ratio_scope: Literal["selected", "all"] = "selected",
+        offset: float = 1.5,
         eps: float = 1e-6,
         sequential_update: bool = False,
         sequential_update_ridge: float = 1e-6,
@@ -1893,14 +1893,23 @@ def compress_svd_llm(
                         # After whitening, theoretical truncation loss equals to the L2 norm of truncated singular values = 2-schatten norm = Frobenius norm
                         score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=2).item()
                     case "truncation_sq":
-                        score_map[layers_str[i]] = torch.sum(L[rank:]**2).item()
-                    case "relative_truncation_sq":
-                        energy = L.pow(2)
-                        score_map[layers_str[i]] = energy[rank:].sum() / energy.sum().clamp_min(eps)
+                        score_map[layers_str[i]] = torch.sum(L[rank:].pow(2)).item()
                     case "entropy":
                         # After whitening, entropy loss equals the sum of normalized singular values of the tail
                         norm_spectrum = L/L.sum()
                         score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum().item()
+                    case "entropy_sq":
+                        # Same of entropy loss but with squared singular values
+                        norm_spectrum = L.pow(2)/L.pow(2).sum()
+                        score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum().item()
+                    case "eff_rank":
+                        # Effective rank is the exponential of the entropy loss
+                        norm_spectrum = L/L.sum()
+                        score_map[layers_str[i]] = torch.exp(-(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum()).item()
+                    case "eff_rank_sq":
+                        # Same of effective rank but with squared singular values (like D-Rank paper)
+                        norm_spectrum = L.pow(2)/L.pow(2).sum()
+                        score_map[layers_str[i]] = torch.exp(-(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum()).item()
                     case s if s.startswith('norm'):
                         if s.split("|")[1].startswith("-"):
                             p_norm_value = -float(s.split("|")[1][1:])
@@ -1922,6 +1931,7 @@ def compress_svd_llm(
             layers_str=layers_str,
             target_ratio=ratio,
             param_count_map=param_count_map,
+            offset=offset,
             group_patterns=group_patterns,
             bypass_early_layers=bypass_early_layers,
             bypass_ratio=bypass_ratio,

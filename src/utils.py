@@ -28,7 +28,11 @@ class GroupBy(str, Enum):
 
 class ScoreMetric(str, Enum):
     TRUNCATION="truncation"
+    TRUNCATION_SQ="truncation_sq"
     ENTROPY="entropy"
+    ENTROPY_SQ="entropy_sq"
+    EFF_RANK="eff_rank"
+    EFF_RANK_SQ="eff_rank_sq"
     
     @classmethod
     def _missing_(cls, value):

@@ -371,7 +371,13 @@ if __name__ == "__main__":
         '--score_metric', 
         type=str, 
         default="truncation", 
-        help='Score metric to use for weight importance during heterogeneous ratio allocation. Possible values are "truncation" and "entropy"'
+        help='Score metric to use for weight importance during heterogeneous ratio allocation. Possible values are "truncation", "entropy" and "eff_rank" with respective squares (appending "_sq")'
+    )
+    parser.add_argument(
+        '--offset', 
+        type=float, 
+        default=1.5, 
+        help='Offset added to scores to avoid log(x) with x <= 1'
     )
     parser.add_argument(
         '--hf_token', 
@@ -660,6 +666,7 @@ if __name__ == "__main__":
             bypass_early_layers = args.bypass_early_layers,
             bypass_ratio = args.bypass_ratio,
             ratio_scope=args.ratio_scope,
+            offset=args.offset,
             sequential_update=args.sequential_update,
             sequential_update_ridge=args.sequential_update_ridge,
             sequential_update_method=args.sequential_update_method,

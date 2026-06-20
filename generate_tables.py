@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import argparse
 import json
 import math
@@ -88,7 +86,23 @@ GROUPING_TOKENS = {
 SCORING_TOKENS = {
     "truncation": "truncation_loss",
     "truncation_loss": "truncation_loss",
+    "truncation_sq": "truncation_sq",
+    "eff_rank": "eff_rank",
+    "eff_rank_sq": "eff_rank_sq",
     "entropy": "entropy",
+    "entropy_sq": "entropy_sq",
+}
+
+SCORE_ORDER = {
+    "truncation_loss": 0,
+    "truncation_sq": 1,
+    "eff_rank": 2,
+    "eff_rank_sq": 3,
+    "entropy": 4,
+    "entropy_sq": 5,
+    "unknown": 999,
+    "original": -1,
+    "--": 998,
 }
 
 SCHEME_TOKENS = {
@@ -212,30 +226,48 @@ def normalize_filename_stem(path: Path) -> List[str]:
     return stem.split("_")
 
 
-def find_scoring(tokens: List[str]) -> Tuple[str, Optional[int], int]:
+def find_scoring(tokens: List[str], start_idx: int) -> Tuple[str, Optional[int], int]:
     """
+    Parse a scoring token sequence starting at start_idx.
+
+    Supports:
+      truncation
+      truncation_sq
+      truncation_loss
+      eff_rank
+      eff_rank_sq
+      entropy
+      entropy_sq
+
     Returns:
-        scoring_name, scoring_start_idx, scoring_token_count
-
-    Handles both:
-        truncation
-        truncation_loss
-
-    If the filename is split by underscores, then "truncation_loss"
-    appears as ["truncation", "loss"].
+        (scoring_name, scoring_start_idx, scoring_token_count)
     """
 
-    for i, tok in enumerate(tokens):
-        if tok == "truncation":
-            if i + 1 < len(tokens) and tokens[i + 1] == "loss":
-                return "truncation_loss", i, 2
-            return "truncation_loss", i, 1
+    candidates = [
+        "truncation_loss",
+        "truncation_sq",
+        "eff_rank_sq",
+        "entropy_sq",
+        "eff_rank",
+        "truncation",
+        "entropy",
+    ]
 
-        if tok == "entropy":
-            return "entropy", i, 1
+    for end in range(len(tokens), start_idx, -1):
+        cand = "_".join(tokens[start_idx:end])
+        if cand in SCORING_TOKENS:
+            return SCORING_TOKENS[cand], start_idx, end - start_idx
 
-        if tok == "truncation_loss":
-            return "truncation_loss", i, 1
+    # Fallback: scan token by token
+    for i in range(start_idx, len(tokens)):
+        tok = tokens[i]
+        if tok in SCORING_TOKENS:
+            mapped = SCORING_TOKENS[tok]
+            count = 1
+            if tok == "truncation" and i + 1 < len(tokens) and tokens[i + 1] == "loss":
+                mapped = "truncation_loss"
+                count = 2
+            return mapped, i, count
 
     return "unknown", None, 0
 
@@ -331,8 +363,8 @@ def parse_filename(path: Path) -> Dict[str, Any]:
         maybe_denominator = tokens[ratio_idx - 1]
         if maybe_denominator in DENOMINATOR_TOKENS:
             compression_denominator = DENOMINATOR_TOKENS[maybe_denominator]
-        # If it wasn't catched during compression, this case = "all" denominator always
-        if all(matrix in matrices for matrix in ["q","k","v","out","mlp"]):
+        elif all(matrix in matrices for matrix in ["q", "k", "v", "out", "mlp"]):
+            # Legacy naming without an explicit denominator token.
             compression_denominator = "all"
 
     scheme = "--"
@@ -351,16 +383,19 @@ def parse_filename(path: Path) -> Dict[str, Any]:
     if scheme == "het":
         # Heterogeneous format:
         # ... matrices denominator ratio het grouping scoring bypass version
-        for tok in tokens:
-            if tok in GROUPING_TOKENS:
-                grouping = GROUPING_TOKENS[tok]
+        if scheme_idx is not None and scheme_idx + 1 < len(tokens):
+            next_tok = tokens[scheme_idx + 1]
+            if next_tok in GROUPING_TOKENS:
+                grouping = GROUPING_TOKENS[next_tok]
+                score_start = scheme_idx + 2
+            else:
+                score_start = scheme_idx + 1
 
-        scoring, scoring_idx, scoring_token_count = find_scoring(tokens)
-
-        if scoring_idx is not None:
-            bypass_idx = scoring_idx + scoring_token_count
-            if bypass_idx < len(tokens) and is_int_token(tokens[bypass_idx]):
-                bypassed_layers = int(tokens[bypass_idx])
+            scoring, scoring_idx, scoring_token_count = find_scoring(tokens, score_start)
+            if scoring_idx is not None:
+                bypass_idx = scoring_idx + scoring_token_count
+                if bypass_idx < len(tokens) and is_int_token(tokens[bypass_idx]):
+                    bypassed_layers = int(tokens[bypass_idx])
 
     elif scheme == "hom":
         # Homogeneous format:
@@ -374,20 +409,20 @@ def parse_filename(path: Path) -> Dict[str, Any]:
                 bypassed_layers = int(tokens[bypass_idx])
 
     else:
-        # Fallback for older or malformed names.
-        grouping = "--"
-        scoring = "--"
+        # Fallback for malformed names.
+        if scheme_idx is not None and scheme_idx + 1 < len(tokens):
+            candidate = tokens[scheme_idx + 1]
+            if candidate in GROUPING_TOKENS:
+                grouping = GROUPING_TOKENS[candidate]
+                score_start = scheme_idx + 2
+            else:
+                score_start = scheme_idx + 1
 
-        for tok in tokens:
-            if tok in GROUPING_TOKENS:
-                grouping = GROUPING_TOKENS[tok]
-
-        scoring, scoring_idx, scoring_token_count = find_scoring(tokens)
-
-        if scoring_idx is not None:
-            bypass_idx = scoring_idx + scoring_token_count
-            if bypass_idx < len(tokens) and is_int_token(tokens[bypass_idx]):
-                bypassed_layers = int(tokens[bypass_idx])
+            scoring, scoring_idx, scoring_token_count = find_scoring(tokens, score_start)
+            if scoring_idx is not None:
+                bypass_idx = scoring_idx + scoring_token_count
+                if bypass_idx < len(tokens) and is_int_token(tokens[bypass_idx]):
+                    bypassed_layers = int(tokens[bypass_idx])
 
     return {
         "file": path.name,
@@ -561,6 +596,21 @@ def best_values(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
 
     return best
 
+def group_rows_for_model_by_bypass(rows: List[Dict[str, Any]]):
+    original_rows = []
+    grouped = defaultdict(lambda: defaultdict(list))
+
+    for row in rows:
+        if row.get("is_original", False):
+            original_rows.append(row)
+        else:
+            grouped[row.get("bypassed_layers")][row.get("compression_ratio")].append(row)
+
+    return sorted(original_rows, key=sort_rows_hierarchical), grouped
+
+
+def best_values_non_original(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    return best_values([r for r in rows if not r.get("is_original", False)])
 
 def is_best(row: Dict[str, Any], benchmark: str, best: Dict[str, Optional[float]]) -> bool:
     value = safe_float(row.get(benchmark))
@@ -580,12 +630,10 @@ def markdown_faded(value: Any) -> str:
 
 def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -> str:
     rows = sorted(rows, key=sort_rows_hierarchical)
-    table_best = best_values(compressed_rows_only(rows))
-    original_rows, grouped = group_rows_for_model(rows)
+    original_rows, grouped = group_rows_for_model_by_bypass(rows)
 
     headers = [
         "Ratio",
-        "Bypass",
         "Grouping",
         "Scoring",
         "Scheme",
@@ -598,85 +646,80 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
     headers += [BENCHMARK_LABELS_MD[b] for b in GENERATION_BENCHMARK_ORDER]
     headers += ["File"]
 
-    lines = []
-    lines.append(f"## {model_name}")
-    lines.append("")
-    lines.append("| " + " | ".join(headers) + " |")
-    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    lines: List[str] = [f"## {model_name}", ""]
 
-    if original_rows:
-        for row in original_rows:
-            row_cells = [
-                markdown_faded("0%"),
-                markdown_faded("--"),
-                markdown_faded("--"),
-                markdown_faded("--"),
-                markdown_faded("--"),
-                markdown_faded("--"),
-                markdown_faded("--"),
-            ]
+    for bypass in sorted(grouped.keys()):
+        lines.append(f"### Bypassed layers: {bypass}")
+        lines.append("")
 
-            for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
-                value = metric_value_for_display(row, benchmark)
-                row_cells.append(markdown_faded(value))
+        # Faded baseline row shown at the top of each bypass-specific table.
+        if original_rows:
+            for row in original_rows:
+                row_cells = [
+                    markdown_faded("0%"),
+                    markdown_faded("--"),
+                    markdown_faded("--"),
+                    markdown_faded("--"),
+                    markdown_faded("--"),
+                    markdown_faded("--"),
+                ]
 
-            avg_value = fmt_accuracy(row.get("avg_accuracy"))
-            row_cells.append(markdown_faded(avg_value))
+                for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
+                    row_cells.append(markdown_faded(metric_value_for_display(row, benchmark)))
 
-            for benchmark in GENERATION_BENCHMARK_ORDER:
-                value = metric_value_for_display(row, benchmark)
-                row_cells.append(markdown_faded(value))
+                row_cells.append(markdown_faded(fmt_accuracy(row.get("avg_accuracy"))))
 
-            row_cells.append(markdown_faded(row.get("file", "--")))
+                for benchmark in GENERATION_BENCHMARK_ORDER:
+                    row_cells.append(markdown_faded(metric_value_for_display(row, benchmark)))
 
-            lines.append("| " + " | ".join(row_cells) + " |")
+                row_cells.append(markdown_faded(row.get("file", "--")))
+                lines.append("| " + " | ".join(row_cells) + " |")
 
-    for ratio in sorted(grouped.keys(), key=lambda x: -1 if x is None else x):
-        bypass_groups = grouped[ratio]
+            lines.append("")
 
-        first_ratio_row = True
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
 
-        for bypass in sorted(bypass_groups.keys()):
-            local_rows = sorted(bypass_groups[bypass], key=sort_rows_hierarchical)
+        for ratio in sorted(grouped[bypass].keys(), key=lambda x: -1 if x is None else x):
+            local_rows = sorted(grouped[bypass][ratio], key=sort_rows_hierarchical)
+            ratio_best = best_values_non_original(local_rows)
 
-            first_bypass_row = True
-
+            first_ratio_row = True
             for row in local_rows:
-                row_cells = []
-
-                row_cells.append(fmt_ratio_md(ratio) if first_ratio_row else "")
-                row_cells.append(str(bypass) if first_bypass_row else "")
-                row_cells.append(row.get("grouping", "--"))
-                row_cells.append(row.get("scoring", "--"))
-                row_cells.append(row.get("scheme", "--"))
-                row_cells.append(row.get("compression_denominator", "--"))
-                row_cells.append(row.get("matrices", "--"))
+                row_cells = [
+                    fmt_ratio_md(ratio) if first_ratio_row else "",
+                    row.get("grouping", "--"),
+                    row.get("scoring", "--"),
+                    row.get("scheme", "--"),
+                    row.get("compression_denominator", "--"),
+                    row.get("matrices", "--"),
+                ]
 
                 for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                     value = metric_value_for_display(row, benchmark)
-                    if is_best(row, benchmark, table_best):
+                    if is_best(row, benchmark, ratio_best):
                         value = f"**{value}**"
                     row_cells.append(value)
 
                 avg_value = fmt_accuracy(row.get("avg_accuracy"))
-                if is_best(row, "avg_accuracy", table_best):
+                if is_best(row, "avg_accuracy", ratio_best):
                     avg_value = f"**{avg_value}**"
                 row_cells.append(avg_value)
 
                 for benchmark in GENERATION_BENCHMARK_ORDER:
                     value = metric_value_for_display(row, benchmark)
-                    if is_best(row, benchmark, table_best):
+                    if is_best(row, benchmark, ratio_best):
                         value = f"**{value}**"
                     row_cells.append(value)
 
                 row_cells.append(row.get("file", "--"))
 
                 lines.append("| " + " | ".join(markdown_escape(v) for v in row_cells) + " |")
-
                 first_ratio_row = False
-                first_bypass_row = False
 
-    return "\n".join(lines)
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def latex_metric_cell(row: Dict[str, Any], benchmark: str, best: Dict[str, Optional[float]]) -> str:
@@ -702,175 +745,146 @@ def make_latex_table_for_model(
     rows: List[Dict[str, Any]],
     table_size: str = r"\scriptsize",
     use_adjustbox: bool = True,
-    table_width: float = 1.6
+    table_width: float = 1.6,
 ) -> str:
     rows = sorted(rows, key=sort_rows_hierarchical)
-    table_best = best_values(compressed_rows_only(rows))
-    original_rows, grouped = group_rows_for_model(rows)
+    original_rows, grouped = group_rows_for_model_by_bypass(rows)
 
-    lines = []
+    lines: List[str] = []
 
-    lines.append(r"\begin{table*}[t]")
-    lines.append(r"\centering")
-    lines.append(table_size)
-    lines.append(r"\setlength{\tabcolsep}{3pt}")
+    for bypass in sorted(grouped.keys()):
+        lines.append(r"\begin{table*}[t]")
+        lines.append(r"\centering")
+        lines.append(table_size)
+        lines.append(r"\setlength{\tabcolsep}{3pt}")
 
-    if use_adjustbox:
-        adjustbox_str = r"\begin{adjustbox}{width=" + str(table_width) + r"\textwidth,center}"
-        lines.append(adjustbox_str)
+        if use_adjustbox:
+            lines.append(r"\begin{adjustbox}{width=" + str(table_width) + r"\textwidth,center}")
 
-    benchmark_colspec = "r" * len(LIKELIHOOD_BENCHMARK_ORDER)
-    generation_colspec = "r" * len(GENERATION_BENCHMARK_ORDER)
-    colspec = rf"ll lllll | {benchmark_colspec} r {generation_colspec}"
-    lines.append(rf"\begin{{tabular}}{{{colspec}}}")
-    lines.append(r"\toprule")
+        benchmark_colspec = "r" * len(LIKELIHOOD_BENCHMARK_ORDER)
+        generation_colspec = "r" * len(GENERATION_BENCHMARK_ORDER)
+        colspec = rf"l lllll | {benchmark_colspec} r {generation_colspec}"
+        lines.append(rf"\begin{{tabular}}{{{colspec}}}")
+        lines.append(r"\toprule")
 
-    config_end_col = 7
-    likelihood_start_col = config_end_col + 1
-    likelihood_end_col = likelihood_start_col + len(LIKELIHOOD_BENCHMARK_ORDER) - 1
-    summary_col = likelihood_end_col + 1
-    generation_start_col = summary_col + 1
-    generation_end_col = generation_start_col + len(GENERATION_BENCHMARK_ORDER) - 1
-    total_col_count = generation_end_col
+        likelihood_start_col = 7
+        likelihood_end_col = likelihood_start_col + len(LIKELIHOOD_BENCHMARK_ORDER) - 1
+        summary_col = likelihood_end_col + 1
+        generation_start_col = summary_col + 1
+        generation_end_col = generation_start_col + len(GENERATION_BENCHMARK_ORDER) - 1
+        total_col_count = generation_end_col
 
-    lines.append(
-        r"\multicolumn{2}{c}{Compression} & "
-        r"\multicolumn{5}{c}{Configuration} & "
-        rf"\multicolumn{{{len(LIKELIHOOD_BENCHMARK_ORDER)}}}{{c}}{{Likelihood Benchmarks}} & "
-        r"\multicolumn{1}{c}{Summary} & "
-        rf"\multicolumn{{{len(GENERATION_BENCHMARK_ORDER)}}}{{c}}{{Generation Benchmarks}} \\"
-    )
+        lines.append(
+            r"\multicolumn{1}{c}{Compression} & "
+            r"\multicolumn{5}{c}{Configuration} & "
+            rf"\multicolumn{{{len(LIKELIHOOD_BENCHMARK_ORDER)}}}{{c}}{{Likelihood Benchmarks}} & "
+            r"\multicolumn{1}{c}{Summary} & "
+            rf"\multicolumn{{{len(GENERATION_BENCHMARK_ORDER)}}}{{c}}{{Generation Benchmarks}} \\"
+        )
 
-    lines.append(
-        r"\cmidrule(lr){1-2}"
-        r"\cmidrule(lr){3-7}"
-        rf"\cmidrule(lr){{{likelihood_start_col}-{likelihood_end_col}}}"
-        rf"\cmidrule(lr){{{summary_col}-{summary_col}}}"
-        rf"\cmidrule(lr){{{generation_start_col}-{generation_end_col}}}"
-    )
+        lines.append(
+            r"\cmidrule(lr){1-1}"
+            r"\cmidrule(lr){2-6}"
+            rf"\cmidrule(lr){{{likelihood_start_col}-{likelihood_end_col}}}"
+            rf"\cmidrule(lr){{{summary_col}-{summary_col}}}"
+            rf"\cmidrule(lr){{{generation_start_col}-{generation_end_col}}}"
+        )
 
-    header = [
-        "Ratio",
-        "Byp.",
-        "Group",
-        "Score",
-        "Scheme",
-        "Denom.",
-        "Matrices",
-    ]
+        header = [
+            "Ratio",
+            "Group",
+            "Score",
+            "Scheme",
+            "Denom.",
+            "Matrices",
+        ]
 
-    header += [BENCHMARK_LABELS_LATEX[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
-    header += [r"Avg. $\uparrow$"]
-    header += [BENCHMARK_LABELS_LATEX[b] for b in GENERATION_BENCHMARK_ORDER]
+        header += [BENCHMARK_LABELS_LATEX[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
+        header += [r"Avg. $\uparrow$"]
+        header += [BENCHMARK_LABELS_LATEX[b] for b in GENERATION_BENCHMARK_ORDER]
 
-    lines.append(" & ".join(header) + r" \\")
-    lines.append(r"\midrule")
+        lines.append(" & ".join(header) + r" \\")
+        lines.append(r"\midrule")
 
-    # Semi-transparent original-model row.
-    # Requires: \usepackage[table]{xcolor}
-    if original_rows:
-        for row in original_rows:
-            cells = [
-                r"\textcolor{black!45}{0\%}",
-                r"\textcolor{black!45}{--}",
-                r"\textcolor{black!45}{--}",
-                r"\textcolor{black!45}{--}",
-                r"\textcolor{black!45}{--}",
-                r"\textcolor{black!45}{--}",
-                r"\textcolor{black!45}{--}",
-            ]
-
-            for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
-                value = latex_escape(metric_value_for_display(row, benchmark))
-                cells.append(rf"\textcolor{{black!45}}{{{value}}}")
-
-            avg_value = latex_escape(fmt_accuracy(row.get("avg_accuracy")))
-            cells.append(rf"\textcolor{{black!45}}{{{avg_value}}}")
-
-            for benchmark in GENERATION_BENCHMARK_ORDER:
-                value = latex_escape(metric_value_for_display(row, benchmark))
-                cells.append(rf"\textcolor{{black!45}}{{{value}}}")
-
-            lines.append(" & ".join(cells) + r" \\")
-
-        if grouped:
-            lines.append(r"\midrule")
-
-    sorted_ratios = sorted(grouped.keys(), key=lambda x: -1 if x is None else x)
-
-    for ratio_idx, ratio in enumerate(sorted_ratios):
-        bypass_groups = grouped[ratio]
-
-        ratio_rows = []
-        for bypass in bypass_groups:
-            ratio_rows.extend(bypass_groups[bypass])
-
-        ratio_row_count = len(ratio_rows)
-        ratio_printed = False
-
-        for bypass_idx, bypass in enumerate(sorted(bypass_groups.keys())):
-            local_rows = sorted(bypass_groups[bypass], key=sort_rows_hierarchical)
-            bypass_row_count = len(local_rows)
-            bypass_printed = False
-
-            for row in local_rows:
-                cells = []
-
-                if not ratio_printed:
-                    cells.append(rf"\multirow{{{ratio_row_count}}}{{*}}{{{fmt_ratio(ratio)}}}")
-                    ratio_printed = True
-                else:
-                    cells.append("")
-
-                if not bypass_printed:
-                    cells.append(rf"\multirow{{{bypass_row_count}}}{{*}}{{{latex_escape(bypass)}}}")
-                    bypass_printed = True
-                else:
-                    cells.append("")
-
-                cells.append(latex_escape(row.get("grouping", "--")))
-                cells.append(latex_escape(row.get("scoring", "--")))
-                cells.append(latex_escape(row.get("scheme", "--")))
-                cells.append(latex_escape(row.get("compression_denominator", "--")))
-                cells.append(latex_escape(row.get("matrices", "--")))
+        # Faded baseline row shown at the top of each bypass-specific table.
+        if original_rows:
+            for row in original_rows:
+                cells = [
+                    r"\textcolor{black!45}{0\%}",
+                    r"\textcolor{black!45}{--}",
+                    r"\textcolor{black!45}{--}",
+                    r"\textcolor{black!45}{--}",
+                    r"\textcolor{black!45}{--}",
+                    r"\textcolor{black!45}{--}",
+                ]
 
                 for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
-                    cells.append(latex_metric_cell(row, benchmark, table_best))
+                    value = latex_escape(metric_value_for_display(row, benchmark))
+                    cells.append(rf"\textcolor{{black!45}}{{{value}}}")
 
-                cells.append(latex_average_cell(row, table_best))
+                avg_value = latex_escape(fmt_accuracy(row.get("avg_accuracy")))
+                cells.append(rf"\textcolor{{black!45}}{{{avg_value}}}")
 
                 for benchmark in GENERATION_BENCHMARK_ORDER:
-                    cells.append(latex_metric_cell(row, benchmark, table_best))
+                    value = latex_escape(metric_value_for_display(row, benchmark))
+                    cells.append(rf"\textcolor{{black!45}}{{{value}}}")
 
                 lines.append(" & ".join(cells) + r" \\")
-
-            if bypass_idx != len(bypass_groups) - 1:
-                lines.append(rf"\cmidrule(lr){{2-{total_col_count}}}")
-
-        if ratio_idx != len(sorted_ratios) - 1:
             lines.append(r"\midrule")
 
-    lines.append(r"\bottomrule")
-    lines.append(r"\end{tabular}")
+        sorted_ratios = sorted(grouped[bypass].keys(), key=lambda x: -1 if x is None else x)
 
-    if use_adjustbox:
-        lines.append(r"\end{adjustbox}")
+        for ratio_idx, ratio in enumerate(sorted_ratios):
+            local_rows = sorted(grouped[bypass][ratio], key=sort_rows_hierarchical)
+            ratio_best = best_values_non_original(local_rows)
 
-    caption_model = latex_escape(model_name)
-    label_model = latex_label_slug(model_name)
+            first_ratio_row = True
+            for row in local_rows:
+                cells = [
+                    fmt_ratio(ratio) if first_ratio_row else "",
+                    latex_escape(row.get("grouping", "--")),
+                    latex_escape(row.get("scoring", "--")),
+                    latex_escape(row.get("scheme", "--")),
+                    latex_escape(row.get("compression_denominator", "--")),
+                    latex_escape(row.get("matrices", "--")),
+                ]
 
-    lines.append(
-        rf"\caption{{Hierarchical zero-shot lm-eval results for {caption_model}. "
-        r"Rows are grouped by compression ratio and bypassed initial layers. "
-        r"Accuracy-style metrics are reported as percentages; \texttt{acc\_norm} is used when available and "
-        r"\texttt{acc} otherwise. Average accuracy excludes generation benchmarks. "
-        r"WikiText is reported as token perplexity, where lower is better. "
-        r"Bold values indicate the best result in the table for each metric.}"
-    )
-    lines.append(rf"\label{{tab:lm-eval-hierarchical-{label_model}}}")
-    lines.append(r"\end{table*}")
+                for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
+                    cells.append(latex_metric_cell(row, benchmark, ratio_best))
 
-    return "\n".join(lines)
+                cells.append(latex_average_cell(row, ratio_best))
+
+                for benchmark in GENERATION_BENCHMARK_ORDER:
+                    cells.append(latex_metric_cell(row, benchmark, ratio_best))
+
+                lines.append(" & ".join(cells) + r" \\")
+                first_ratio_row = False
+
+            if ratio_idx != len(sorted_ratios) - 1:
+                lines.append(r"\cmidrule(lr){1-" + str(total_col_count) + r"}")
+
+        lines.append(r"\bottomrule")
+        lines.append(r"\end{tabular}")
+
+        if use_adjustbox:
+            lines.append(r"\end{adjustbox}")
+
+        caption_model = latex_escape(model_name)
+        label_model = latex_label_slug(model_name)
+
+        lines.append(
+            rf"\caption{{Hierarchical zero-shot lm-eval results for {caption_model} (bypassed layers = {bypass}). "
+            r"Rows are grouped by compression ratio within each bypass setting. "
+            r"Accuracy-style metrics are reported as percentages; \texttt{acc\_norm} is used when available and "
+            r"\texttt{acc} otherwise. Average accuracy excludes generation benchmarks. "
+            r"WikiText is reported as token perplexity, where lower is better. "
+            r"Bold values indicate the best result within each compression ratio.}"
+        )
+        lines.append(rf"\label{{tab:lm-eval-hierarchical-{label_model}-b{bypass}}}")
+        lines.append(r"\end{table*}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def make_metric_note(rows: List[Dict[str, Any]]) -> str:
