@@ -708,8 +708,8 @@ def _redundancy_from_scores(scores: torch.Tensor, offset: float = 1.5) -> torch.
     # Handle negative values (fallback)
     scores = torch.clamp(scores, min=0.0)
 
-    if offset <= 1.0:
-        raise ValueError("`offset` must be > 1.0")
+    if offset < 0.0:
+        raise ValueError("`offset` must be >= 0.0")
 
     # Shift the score to guarantee it is strictly > 1.0 before ratio allocation.
     weights = 1.0 / torch.log(scores + offset)

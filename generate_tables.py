@@ -6,9 +6,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+PERPLEXITY_BENCHMARK_ORDER = [
+    "wikitext",
+]
 
 LIKELIHOOD_BENCHMARK_ORDER = [
-    "wikitext",
     "arc_easy",
     "hellaswag",
     "openbookqa",
@@ -29,7 +31,7 @@ GENERATION_BENCHMARK_ORDER = [
     "truthfulqa_gen",
 ]
 
-BENCHMARK_ORDER = LIKELIHOOD_BENCHMARK_ORDER + GENERATION_BENCHMARK_ORDER
+BENCHMARK_ORDER = PERPLEXITY_BENCHMARK_ORDER + LIKELIHOOD_BENCHMARK_ORDER + GENERATION_BENCHMARK_ORDER
 
 BENCHMARK_ALIASES = {
     "gsm8k": ["gsm8k", "gsm8k_cot"],
@@ -37,7 +39,7 @@ BENCHMARK_ALIASES = {
 }
 
 BENCHMARK_LABELS_MD = {
-    "wikitext": "WikiText ppl ↓",
+    "wikitext": "WikiText ↓",
     "arc_easy": "ARC-E ↑",
     "hellaswag": "HellaSwag ↑",
     "openbookqa": "OBQA ↑",
@@ -110,11 +112,6 @@ SCHEME_TOKENS = {
     "heterogeneous": "het",
     "hom": "hom",
     "homogeneous": "hom",
-}
-
-DENOMINATOR_TOKENS = {
-    "all": "all",
-    "selected": "selected",
 }
 
 PREFERRED_METRICS = [
@@ -279,23 +276,13 @@ def parse_filename(path: Path) -> Dict[str, Any]:
     Original / uncompressed:
         Qwen_Qwen2.5_32B.json
 
-    Heterogeneous compression with denominator token:
+    Heterogeneous compression:
         Qwen_Qwen2.5_32B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_8_v2.json
         Qwen_Qwen2.5_32B_q_k_v_out_mlp_selected_0.2_het_decoder_truncation_8_v2.json
 
-    Homogeneous compression with denominator token:
+    Homogeneous compression:
         huggyllama_llama_7b_q_k_v_out_mlp_all_0.2_hom_8_v2.json
         huggyllama_llama_7b_q_k_v_out_mlp_selected_0.2_hom_8_v2.json
-
-    Older format without denominator token is also supported:
-        Qwen_Qwen2.5_32B_q_k_v_out_mlp_0.2_het_decoder_truncation_8_v2.json
-
-    Meaning of denominator:
-        all:
-            the whole parameter count was used as denominator for the compression ratio.
-
-        selected:
-            only the parameter count of the selected matrix types was used as denominator.
     """
 
     tokens = normalize_filename_stem(path)
@@ -314,7 +301,6 @@ def parse_filename(path: Path) -> Dict[str, Any]:
             "model": model_name,
             "is_original": True,
             "matrices": "none",
-            "compression_denominator": "original",
             "compression_ratio": 0.0,
             "scheme": "original",
             "grouping": "original",
@@ -353,20 +339,6 @@ def parse_filename(path: Path) -> Dict[str, Any]:
 
     model_name = "_".join(tokens[:model_end])
 
-    compression_denominator = "--"
-
-    # New format: denominator token appears after matrix tokens and before ratio.
-    # Example:
-    #   ..._q_k_v_out_mlp_all_0.2_...
-    #   ..._q_k_v_out_mlp_selected_0.2_...
-    if ratio_idx is not None and ratio_idx - 1 >= 0:
-        maybe_denominator = tokens[ratio_idx - 1]
-        if maybe_denominator in DENOMINATOR_TOKENS:
-            compression_denominator = DENOMINATOR_TOKENS[maybe_denominator]
-        elif all(matrix in matrices for matrix in ["q", "k", "v", "out", "mlp"]):
-            # Legacy naming without an explicit denominator token.
-            compression_denominator = "all"
-
     scheme = "--"
     scheme_idx = None
 
@@ -381,8 +353,6 @@ def parse_filename(path: Path) -> Dict[str, Any]:
     bypassed_layers = 0
 
     if scheme == "het":
-        # Heterogeneous format:
-        # ... matrices denominator ratio het grouping scoring bypass version
         if scheme_idx is not None and scheme_idx + 1 < len(tokens):
             next_tok = tokens[scheme_idx + 1]
             if next_tok in GROUPING_TOKENS:
@@ -398,8 +368,6 @@ def parse_filename(path: Path) -> Dict[str, Any]:
                     bypassed_layers = int(tokens[bypass_idx])
 
     elif scheme == "hom":
-        # Homogeneous format:
-        # ... matrices denominator ratio hom bypass version
         grouping = "--"
         scoring = "--"
 
@@ -429,7 +397,6 @@ def parse_filename(path: Path) -> Dict[str, Any]:
         "model": model_name,
         "is_original": False,
         "matrices": "+".join(matrices) if matrices else "unknown",
-        "compression_denominator": compression_denominator,
         "compression_ratio": compression_ratio,
         "scheme": scheme,
         "grouping": grouping,
@@ -532,7 +499,6 @@ def sort_rows_hierarchical(row: Dict[str, Any]):
         ratio_sort,
         row.get("bypassed_layers", 0),
         row.get("scheme", ""),
-        row.get("compression_denominator", ""),
         row.get("grouping", ""),
         row.get("scoring", ""),
         row.get("matrices", ""),
@@ -637,10 +603,10 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
         "Grouping",
         "Scoring",
         "Scheme",
-        "Denom.",
         "Matrices",
     ]
 
+    headers += [BENCHMARK_LABELS_MD[b] for b in PERPLEXITY_BENCHMARK_ORDER]
     headers += [BENCHMARK_LABELS_MD[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
     headers += ["Average ↑"]
     headers += [BENCHMARK_LABELS_MD[b] for b in GENERATION_BENCHMARK_ORDER]
@@ -661,8 +627,10 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
                     markdown_faded("--"),
                     markdown_faded("--"),
                     markdown_faded("--"),
-                    markdown_faded("--"),
                 ]
+
+                for benchmark in PERPLEXITY_BENCHMARK_ORDER:
+                    row_cells.append(markdown_faded(metric_value_for_display(row, benchmark)))
 
                 for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                     row_cells.append(markdown_faded(metric_value_for_display(row, benchmark)))
@@ -691,9 +659,14 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
                     row.get("grouping", "--"),
                     row.get("scoring", "--"),
                     row.get("scheme", "--"),
-                    row.get("compression_denominator", "--"),
                     row.get("matrices", "--"),
                 ]
+
+                for benchmark in PERPLEXITY_BENCHMARK_ORDER:
+                    value = metric_value_for_display(row, benchmark)
+                    if is_best(row, benchmark, ratio_best):
+                        value = f"**{value}**"
+                    row_cells.append(value)
 
                 for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                     value = metric_value_for_display(row, benchmark)
@@ -761,13 +734,16 @@ def make_latex_table_for_model(
         if use_adjustbox:
             lines.append(r"\begin{adjustbox}{width=" + str(table_width) + r"\textwidth,center}")
 
+        ppl_benchmark_colspec = "r" * len(PERPLEXITY_BENCHMARK_ORDER)
         benchmark_colspec = "r" * len(LIKELIHOOD_BENCHMARK_ORDER)
         generation_colspec = "r" * len(GENERATION_BENCHMARK_ORDER)
-        colspec = rf"l lllll | {benchmark_colspec} r {generation_colspec}"
+        colspec = rf"l llll | {ppl_benchmark_colspec} {benchmark_colspec} r {generation_colspec}"
         lines.append(rf"\begin{{tabular}}{{{colspec}}}")
         lines.append(r"\toprule")
 
-        likelihood_start_col = 7
+        ppl_start_col = 6
+        ppl_end_col = ppl_start_col + len(PERPLEXITY_BENCHMARK_ORDER) - 1
+        likelihood_start_col = ppl_end_col + 1
         likelihood_end_col = likelihood_start_col + len(LIKELIHOOD_BENCHMARK_ORDER) - 1
         summary_col = likelihood_end_col + 1
         generation_start_col = summary_col + 1
@@ -776,7 +752,8 @@ def make_latex_table_for_model(
 
         lines.append(
             r"\multicolumn{1}{c}{Compression} & "
-            r"\multicolumn{5}{c}{Configuration} & "
+            r"\multicolumn{4}{c}{Configuration} & "
+            rf"\multicolumn{{{len(PERPLEXITY_BENCHMARK_ORDER)}}}{{c}}{{Perplexity Benchmarks}} & "
             rf"\multicolumn{{{len(LIKELIHOOD_BENCHMARK_ORDER)}}}{{c}}{{Likelihood Benchmarks}} & "
             r"\multicolumn{1}{c}{Summary} & "
             rf"\multicolumn{{{len(GENERATION_BENCHMARK_ORDER)}}}{{c}}{{Generation Benchmarks}} \\"
@@ -784,7 +761,8 @@ def make_latex_table_for_model(
 
         lines.append(
             r"\cmidrule(lr){1-1}"
-            r"\cmidrule(lr){2-6}"
+            r"\cmidrule(lr){2-5}"
+            rf"\cmidrule(lr){{{ppl_start_col}-{ppl_end_col}}}"
             rf"\cmidrule(lr){{{likelihood_start_col}-{likelihood_end_col}}}"
             rf"\cmidrule(lr){{{summary_col}-{summary_col}}}"
             rf"\cmidrule(lr){{{generation_start_col}-{generation_end_col}}}"
@@ -795,10 +773,10 @@ def make_latex_table_for_model(
             "Group",
             "Score",
             "Scheme",
-            "Denom.",
             "Matrices",
         ]
 
+        header += [BENCHMARK_LABELS_LATEX[b] for b in PERPLEXITY_BENCHMARK_ORDER]
         header += [BENCHMARK_LABELS_LATEX[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
         header += [r"Avg. $\uparrow$"]
         header += [BENCHMARK_LABELS_LATEX[b] for b in GENERATION_BENCHMARK_ORDER]
@@ -815,8 +793,11 @@ def make_latex_table_for_model(
                     r"\textcolor{black!45}{--}",
                     r"\textcolor{black!45}{--}",
                     r"\textcolor{black!45}{--}",
-                    r"\textcolor{black!45}{--}",
                 ]
+
+                for benchmark in PERPLEXITY_BENCHMARK_ORDER:
+                    value = latex_escape(metric_value_for_display(row, benchmark))
+                    cells.append(rf"\textcolor{{black!45}}{{{value}}}")
 
                 for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                     value = latex_escape(metric_value_for_display(row, benchmark))
@@ -845,9 +826,11 @@ def make_latex_table_for_model(
                     latex_escape(row.get("grouping", "--")),
                     latex_escape(row.get("scoring", "--")),
                     latex_escape(row.get("scheme", "--")),
-                    latex_escape(row.get("compression_denominator", "--")),
                     latex_escape(row.get("matrices", "--")),
                 ]
+
+                for benchmark in PERPLEXITY_BENCHMARK_ORDER:
+                    cells.append(latex_metric_cell(row, benchmark, ratio_best))
 
                 for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
                     cells.append(latex_metric_cell(row, benchmark, ratio_best))

@@ -1894,22 +1894,38 @@ def compress_svd_llm(
                         score_map[layers_str[i]] = torch.linalg.norm(L[rank:], ord=2).item()
                     case "truncation_sq":
                         score_map[layers_str[i]] = torch.sum(L[rank:].pow(2)).item()
-                    case "entropy":
+                    case "full_norm_tail_entropy":
                         # After whitening, entropy loss equals the sum of normalized singular values of the tail
                         norm_spectrum = L/L.sum()
                         score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum().item()
-                    case "entropy_sq":
+                    case "full_norm_sq_tail_entropy":
                         # Same of entropy loss but with squared singular values
                         norm_spectrum = L.pow(2)/L.pow(2).sum()
                         score_map[layers_str[i]] = -(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum().item()
-                    case "eff_rank":
+                    case "full_norm_tail_eff_rank":
                         # Effective rank is the exponential of the entropy loss
                         norm_spectrum = L/L.sum()
                         score_map[layers_str[i]] = torch.exp(-(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum()).item()
-                    case "eff_rank_sq":
+                    case "full_norm_sq_tail_eff_rank":
                         # Same of effective rank but with squared singular values (like D-Rank paper)
                         norm_spectrum = L.pow(2)/L.pow(2).sum()
                         score_map[layers_str[i]] = torch.exp(-(norm_spectrum[rank:] * torch.log(norm_spectrum[rank:].clamp_min(eps))).sum()).item()
+                    case "entropy":
+                        # After whitening, entropy equals the sum of normalized singular values
+                        norm_spectrum = L/L.sum()
+                        score_map[layers_str[i]] = -(norm_spectrum * torch.log(norm_spectrum.clamp_min(eps))).sum().item()
+                    case "entropy_sq":
+                        # Same of entropy but with squared singular values
+                        norm_spectrum = L.pow(2)/L.pow(2).sum()
+                        score_map[layers_str[i]] = -(norm_spectrum * torch.log(norm_spectrum.clamp_min(eps))).sum().item()
+                    case "eff_rank":
+                        # Effective rank is the exponential of the entropy
+                        norm_spectrum = L/L.sum()
+                        score_map[layers_str[i]] = torch.exp(-(norm_spectrum * torch.log(norm_spectrum.clamp_min(eps))).sum()).item()
+                    case "eff_rank_sq":
+                        # Same of effective rank but with squared singular values (like D-Rank paper)
+                        norm_spectrum = L.pow(2)/L.pow(2).sum()
+                        score_map[layers_str[i]] = torch.exp(-(norm_spectrum * torch.log(norm_spectrum.clamp_min(eps))).sum()).item()
                     case s if s.startswith('norm'):
                         if s.split("|")[1].startswith("-"):
                             p_norm_value = -float(s.split("|")[1][1:])
