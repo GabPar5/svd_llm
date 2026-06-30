@@ -165,7 +165,7 @@ def fmt_accuracy(value: Any, decimals: int = 2) -> str:
     value = safe_float(value)
     if value is None:
         return "--"
-    return f"{100.0 * value:.{decimals}f}"
+    return f"{value:.{decimals}f}"
 
 
 def fmt_ppl(value: Any, decimals: int = 2) -> str:
