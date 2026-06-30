@@ -856,10 +856,10 @@ def make_latex_table_for_model(
         label_model = latex_label_slug(model_name)
 
         lines.append(
-            rf"\caption{{Hierarchical zero-shot lm-eval results for {caption_model} (bypassed layers = {bypass}). "
-            r"Rows are grouped by compression ratio within each bypass setting. "
-            r"Accuracy-style metrics are reported as percentages; \texttt{acc\_norm} is used when available and "
-            r"\texttt{acc} otherwise. Average accuracy excludes generation benchmarks. "
+            rf"\caption{{Zero-shot lm-eval results for {caption_model} (bypassed initial layers = {bypass}). "
+            r"Rows are grouped by compression ratio. "
+            r"Accuracy-style metrics are reported as percentages; \texttt{acc} is used when available and "
+            r"\texttt{acc\_norm} otherwise. Average accuracy excludes generation benchmarks. "
             r"WikiText is reported as token perplexity, where lower is better. "
             r"Bold values indicate the best result within each compression ratio.}"
         )
@@ -896,8 +896,8 @@ def build_markdown_report(rows_by_model: Dict[str, List[Dict[str, Any]]]) -> str
     out.append("# LM Eval Results")
     out.append("")
     out.append(
-        "Hierarchical tables are grouped by compression ratio and bypassed initial layers. "
-        "Accuracy-style scores are percentages. `acc_norm` is used when available; otherwise `acc` is used. "
+        "Hierarchical tables are grouped by compression ratio. "
+        "Accuracy-style scores are percentages. `acc` is used when available; otherwise `acc_norm` is used. "
         "Average accuracy excludes generation benchmarks. "
         "`wikitext` is token perplexity, where lower is better."
     )
