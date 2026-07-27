@@ -2,53 +2,9 @@ import argparse
 import os
 import re
 import torch
-from typing import List
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig # pyright: ignore[reportPrivateImportUsage]
-from src.utils import DtypeMap, cuda_cleanup, apply_lowrank, restore_non_persistent_buffers
-
-def infer_lowrank_dtype_from_state_dict(state_dict):
-    for name, tensor in state_dict.items():
-        if ".W_u." in name or ".W_v." in name:
-            return tensor.dtype
-    return None
-
-def assert_mixed_dtype(model, expected_base_dtype=None, expected_lowrank_dtype=None):
-    lowrank_dtypes = set()
-    non_lowrank_dtypes = set()
-
-    for name, p in model.named_parameters():
-        if ".W_u." in name or ".W_v." in name:
-            lowrank_dtypes.add(p.dtype)
-        else:
-            non_lowrank_dtypes.add(p.dtype)
-
-    print("[DTYPE] non-lowrank dtypes:", non_lowrank_dtypes)
-    print("[DTYPE] lowrank dtypes:", lowrank_dtypes)
-
-    if expected_base_dtype is not None and expected_base_dtype not in non_lowrank_dtypes:
-        raise RuntimeError(f"Expected base dtype {expected_base_dtype}, got {non_lowrank_dtypes}")
-
-    if expected_lowrank_dtype is not None and lowrank_dtypes != {expected_lowrank_dtype}:
-        raise RuntimeError(f"Expected LowRank dtype {expected_lowrank_dtype}, got {lowrank_dtypes}")
-
-def audit_buffers(model, state_dict=None, label="[BUFFER-AUDIT]"):
-    state_keys = set(state_dict.keys()) if state_dict is not None else set()
-
-    print(label, "non-state buffers:")
-    for name, buf in model.named_buffers():
-        in_state = name in state_keys
-        if not in_state:
-            if buf.device.type == "meta":
-                print(f"{label} {name}: META dtype={buf.dtype} shape={tuple(buf.shape)}")
-            else:
-                finite = torch.isfinite(buf).all().item() if buf.is_floating_point() else "N/A"
-                mn = buf.float().min().item() if buf.numel() and buf.is_floating_point() else "N/A"
-                mx = buf.float().max().item() if buf.numel() and buf.is_floating_point() else "N/A"
-                sum_abs = buf.float().abs().sum().item() if buf.numel() and buf.is_floating_point() else "N/A"
-                print(
-                    f"{label} {name}: device={buf.device} dtype={buf.dtype} "
-                    f"shape={tuple(buf.shape)} finite={finite} min={mn} max={mx} sum_abs={sum_abs}"
-                )
+from transformers import AutoTokenizer, AutoModelForCausalLM # pyright: ignore[reportPrivateImportUsage]
+from typing import List, Optional, Tuple
+from src.utils import DtypeMap, alpaca_prompt, cuda_cleanup, load_compressed_model
 
 def safe_filename(name: str) -> str:
     name = os.path.basename(name)
@@ -56,20 +12,19 @@ def safe_filename(name: str) -> str:
     name = re.sub(r"[^A-Za-z0-9._+-]+", "_", name)
     return name
 
-def safe_pad_token_setup(tokenizer, model):
+def safe_pad_token_setup(tokenizer) -> None:
     if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     tokenizer.padding_side = "left"
 
-
 def load_original_model(
     model_name: str,
     dtype: str,
     device: str,
-    hf_token: str | None = None,
-):
+    hf_token: Optional[str] = None,
+) -> Tuple[torch.nn.Module, object]:
     torch_dtype = DtypeMap.get_dtype(dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -91,36 +46,28 @@ def load_original_model(
     model.eval()
     model.config.use_cache = True
 
-    safe_pad_token_setup(tokenizer, model)
+    safe_pad_token_setup(tokenizer)
 
     return model, tokenizer
 
-
-def load_compressed_model(
+def load_compressed_checkpoint(
     base_model_name: str,
     checkpoint_path: str,
     dtype: str,
     device: str,
-    tokenizer_path: str | None = None,
-    hf_token: str | None = None,
-):
+    tokenizer_path: Optional[str] = None,
+    hf_token: Optional[str] = None,
+) -> Tuple[torch.nn.Module, object]:
     """
-    Loads a compressed checkpoint saved like:
+    Load a compressed checkpoint together with its tokenizer, ready to generate.
 
-        torch.save({
-            "state_dict": model.state_dict(),
-            "rank_map": rank_map,
-        }, checkpoint_path)
-
-    The base HF config is required because the checkpoint only stores weights,
-    not the full model architecture/config.
+    The tokenizer is looked up next to the checkpoint and falls back to the base
+    model when the checkpoint directory does not carry one.
     """
-    model_dtype = DtypeMap.get_dtype(dtype)
-
     if tokenizer_path is None:
         tokenizer_path = os.path.dirname(checkpoint_path)
 
-        # Fallback to base model tokenizer if the checkpoint directory does not contain one.
+        # Fallback to base model tokenizer if the checkpoint directory does not contain one
         if not os.path.exists(os.path.join(tokenizer_path, "tokenizer_config.json")):
             tokenizer_path = base_model_name
 
@@ -129,98 +76,20 @@ def load_compressed_model(
         trust_remote_code=True,
         token=hf_token,
     )
-    if getattr(tokenizer, "pad_token", None) is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print(f"[LOAD] Loading compressed checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location=device,
-        weights_only=False,
-    )
-
-    rank_map = checkpoint["rank_map"]
-    state_dict = checkpoint["state_dict"]
-    extra_buffers = checkpoint.get("non_persistent_buffers", {})
-
-    compressed_dtype = infer_lowrank_dtype_from_state_dict(state_dict)
-
-    print(f"[LOAD] Loading base config from: {base_model_name}")
-    config = AutoConfig.from_pretrained(
-        base_model_name,
-        trust_remote_code=True,
-        token=hf_token,
-        dtype=model_dtype
-    )
-
-    print("[LOAD] Instantiating base model architecture...")
-    with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(
-            config,
-            trust_remote_code=True,
-            dtype=model_dtype,
-        )
-
-    try:
-        model.generation_config = GenerationConfig.from_pretrained(
-            base_model_name,
-            trust_remote_code=True,
-            token=hf_token,
-        )
-    except Exception as e:
-        print(f"[WARNING] Could not load generation_config for {base_model_name}: {e}")
-        model.generation_config = GenerationConfig.from_model_config(config)
-
-    print("[LOAD] Applying LowRank module structure...")
-    apply_lowrank(model, rank_map, state_dict)
-    model.to_empty(device=device)
-
-    audit_buffers(model, state_dict, "[AFTER-TO-EMPTY]")
-
-    print("[LOAD] Loading compressed state dict...")
-    missing, unexpected = model.load_state_dict(
-        state_dict, 
-        strict=True, 
-        assign=True
-    )
-
-    restore_non_persistent_buffers(
-        model=model,
-        saved_buffers=extra_buffers,
+    model, _, _ = load_compressed_model(
+        base_model_name=base_model_name,
+        checkpoint_path=checkpoint_path,
+        model_dtype=dtype,
         device=device,
-        strict=True,
+        hf_token=hf_token,
+        audit=True,
     )
-
-    audit_buffers(model, state_dict, "[AFTER-LOAD]")
-
-    if missing:
-        print(f"[WARNING] Missing keys: {len(missing)}")
-        print(missing[:20])
-
-    if unexpected:
-        print(f"[WARNING] Unexpected keys: {len(unexpected)}")
-        print(unexpected[:20])
-
-    if missing or unexpected:
-        raise RuntimeError(
-            "State dict mismatch. The compressed checkpoint may not match "
-            "the base model or rank_map."
-        )
-    
-    assert_mixed_dtype(
-        model,
-        expected_base_dtype=model_dtype,
-        expected_lowrank_dtype=compressed_dtype,
-    )
-
-    del checkpoint, state_dict, rank_map, extra_buffers
-    cuda_cleanup()
 
     model.eval()
-    model.config.use_cache = True
+    model.config.use_cache = True # pyright: ignore[reportAttributeAccessIssue]
 
-    safe_pad_token_setup(tokenizer, model)
+    safe_pad_token_setup(tokenizer)
 
     return model, tokenizer
 
@@ -230,19 +99,13 @@ def build_prompt(
     prompt: str,
     use_chat_template: bool = False,
     use_alpaca_prompt: bool = False,
-    system_prompt: str | None = None,
-):
+    system_prompt: Optional[str] = None,
+) -> str:
     if use_chat_template and use_alpaca_prompt:
-        raise ValueError("Use either --use_chat_template or --use_alpaca_prompt, not both.")
+        raise ValueError("Use either --use_chat_template or --use_alpaca_prompt, not both")
 
     if use_alpaca_prompt:
-        return (
-            "Below is an instruction that describes a task. Write a response "
-            "that appropriately completes the request.\n\n"
-            "### Instruction:\n"
-            f"{prompt}\n\n"
-            "### Response:\n"
-        )
+        return alpaca_prompt(prompt)
 
     if not use_chat_template:
         return prompt
@@ -255,7 +118,7 @@ def build_prompt(
     messages.append({"role": "user", "content": prompt})
 
     if not hasattr(tokenizer, "apply_chat_template"):
-        raise ValueError("Tokenizer does not support apply_chat_template().")
+        raise ValueError("Tokenizer does not support apply_chat_template()")
 
     return tokenizer.apply_chat_template(
         messages,
@@ -276,7 +139,7 @@ def generate_text(
     top_p: float = 0.95,
     top_k: int = 50,
     repetition_penalty: float = 1.0,
-):
+) -> str:
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -301,7 +164,7 @@ def generate_text(
                 "temperature": temperature,
                 "top_p": top_p,
                 "top_k": top_k,
-            }
+            },
         )
 
     output_ids = model.generate(
@@ -351,7 +214,7 @@ def run_one_model(
     top_p: float,
     top_k: int,
     repetition_penalty: float,
-):
+) -> Tuple[str, str]:
     print("[GEN] Greedy decoding...")
     greedy_output = generate_text(
         model=model,
@@ -386,11 +249,10 @@ def save_result(
     prompt: str,
     greedy_output: str,
     sampling_output: str,
-):
+) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
-    filename = safe_filename(model_label) + ".md"
-    path = os.path.join(output_dir, filename)
+    path = os.path.join(output_dir, f"{safe_filename(model_label)}.md")
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"Model: {model_label}\n")
@@ -411,7 +273,7 @@ def save_result(
     print(f"[SAVE] Saved result to: {path}")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -425,40 +287,40 @@ def main():
         "--compressed_checkpoint",
         type=str,
         default=None,
-        help="Path to one compressed .pt checkpoint."
+        help="Path to one compressed .pt checkpoint",
     )
 
     parser.add_argument(
         "--compressed_folder",
         type=str,
         default=None,
-        help="Folder containing compressed .pt checkpoints to run sequentially.",
+        help="Folder containing compressed .pt checkpoints to run sequentially",
     )
 
     parser.add_argument(
         "--recursive",
         action="store_true",
-        help="When using --compressed_folder, recursively find .pt files.",
+        help="When using --compressed_folder, recursively find .pt files",
     )
 
     parser.add_argument(
         "--include_original",
         action="store_true",
-        help="Also run the original HF model before compressed checkpoints.",
+        help="Also run the original HF model before compressed checkpoints",
     )
 
     parser.add_argument(
         "--tokenizer_path",
         type=str,
         default=None,
-        help="Optional tokenizer path. For compressed models, defaults to checkpoint directory.",
+        help="Optional tokenizer path. For compressed models, defaults to checkpoint directory",
     )
 
     parser.add_argument(
         "--dtype",
         type=str,
         default="bfloat16",
-        choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
+        choices=[ "float32", "fp32", "float16", "fp16", "bfloat16", "bf16" ],
     )
 
     parser.add_argument(
@@ -489,13 +351,13 @@ def main():
         "--output_dir",
         type=str,
         default="./output/text_generation/",
-        help="Folder where .md generations are saved.",
+        help="Folder where .md generations are saved",
     )
 
     parser.add_argument(
         "--use_chat_template",
         action="store_true",
-        help="Use tokenizer.apply_chat_template(). Useful for Qwen2.5-Instruct.",
+        help="Use tokenizer.apply_chat_template(). Useful for Qwen2.5-Instruct",
     )
 
     parser.add_argument(
@@ -504,7 +366,7 @@ def main():
         help=(
             "Wrap --prompt/--prompt_file with the Alpaca instruction template. "
             "Useful for models sequentially updated with the default Alpaca "
-            "finetuning dataset."
+            "finetuning dataset"
         ),
     )
 
@@ -552,8 +414,8 @@ def main():
     elif args.prompt:
         raw_prompt = args.prompt
     else:
-        raise ValueError("Provide --prompt or --prompt_file.")
-    
+        raise ValueError("Provide --prompt or --prompt_file")
+
     checkpoints = []
 
     if args.compressed_checkpoint:
@@ -565,9 +427,38 @@ def main():
     if not args.include_original and not checkpoints:
         raise ValueError(
             "Nothing to run. Provide --compressed_checkpoint, --compressed_folder, "
-            "or use --include_original."
+            "or use --include_original",
         )
-    
+
+    def generate_and_save(model, tokenizer, model_label: str) -> None:
+        final_prompt = build_prompt(
+            tokenizer=tokenizer,
+            prompt=raw_prompt,
+            use_chat_template=args.use_chat_template,
+            use_alpaca_prompt=args.use_alpaca_prompt,
+            system_prompt=args.system_prompt,
+        )
+
+        greedy_output, sampling_output = run_one_model(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=final_prompt,
+            device=args.device,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
+        )
+
+        save_result(
+            output_dir=args.output_dir,
+            model_label=model_label,
+            prompt=raw_prompt,
+            greedy_output=greedy_output,
+            sampling_output=sampling_output,
+        )
+
     if args.include_original:
         print("[RUN] Loading original model...")
         model, tokenizer = load_original_model(
@@ -577,33 +468,7 @@ def main():
             hf_token=args.hf_token,
         )
 
-        final_prompt = build_prompt(
-            tokenizer=tokenizer,
-            prompt=raw_prompt,
-            use_chat_template=args.use_chat_template,
-            use_alpaca_prompt=args.use_alpaca_prompt,
-            system_prompt=args.system_prompt,
-        )
-
-        greedy_output, sampling_output = run_one_model(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=final_prompt,
-            device=args.device,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            repetition_penalty=args.repetition_penalty,
-        )
-
-        save_result(
-            output_dir=args.output_dir,
-            model_label=safe_filename(args.base_model) + "_original",
-            prompt=raw_prompt,
-            greedy_output=greedy_output,
-            sampling_output=sampling_output,
-        )
+        generate_and_save(model, tokenizer, f"{safe_filename(args.base_model)}_original")
 
         del model, tokenizer
         cuda_cleanup()
@@ -613,7 +478,7 @@ def main():
         print(f"[RUN] {idx}/{len(checkpoints)}: {checkpoint_path}")
         print("=" * 100)
 
-        model, tokenizer = load_compressed_model(
+        model, tokenizer = load_compressed_checkpoint(
             base_model_name=args.base_model,
             checkpoint_path=checkpoint_path,
             dtype=args.dtype,
@@ -622,38 +487,12 @@ def main():
             hf_token=args.hf_token,
         )
 
-        final_prompt = build_prompt(
-            tokenizer=tokenizer,
-            prompt=raw_prompt,
-            use_chat_template=args.use_chat_template,
-            use_alpaca_prompt=args.use_alpaca_prompt,
-            system_prompt=args.system_prompt,
-        )
-
-        greedy_output, sampling_output = run_one_model(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=final_prompt,
-            device=args.device,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            repetition_penalty=args.repetition_penalty,
-        )
-
-        save_result(
-            output_dir=args.output_dir,
-            model_label=checkpoint_path,
-            prompt=raw_prompt,
-            greedy_output=greedy_output,
-            sampling_output=sampling_output,
-        )
+        generate_and_save(model, tokenizer, checkpoint_path)
 
         del model, tokenizer
         cuda_cleanup()
 
-    print("[DONE] All generations completed.")
+    print("[DONE] All generations completed")
 
 
 if __name__ == "__main__":
