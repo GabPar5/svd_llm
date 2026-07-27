@@ -4,7 +4,7 @@ import math
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 PERPLEXITY_BENCHMARK_ORDER = [
     "wikitext",
@@ -33,9 +33,17 @@ GENERATION_BENCHMARK_ORDER = [
 
 BENCHMARK_ORDER = PERPLEXITY_BENCHMARK_ORDER + LIKELIHOOD_BENCHMARK_ORDER + GENERATION_BENCHMARK_ORDER
 
+# Value columns as displayed: perplexity, likelihood, summary, generation
+VALUE_COLUMNS = [
+    *PERPLEXITY_BENCHMARK_ORDER,
+    *LIKELIHOOD_BENCHMARK_ORDER,
+    "avg_accuracy",
+    *GENERATION_BENCHMARK_ORDER,
+]
+
 BENCHMARK_ALIASES = {
-    "gsm8k": ["gsm8k", "gsm8k_cot"],
-    "truthfulqa_gen": ["truthfulqa_gen"],
+    "gsm8k": [ "gsm8k", "gsm8k_cot" ],
+    "truthfulqa_gen": [ "truthfulqa_gen" ],
 }
 
 BENCHMARK_LABELS_MD = {
@@ -93,18 +101,10 @@ SCORING_TOKENS = {
     "eff_rank_sq": "eff_rank_sq",
     "entropy": "entropy",
     "entropy_sq": "entropy_sq",
-}
-
-SCORE_ORDER = {
-    "truncation_loss": 0,
-    "truncation_sq": 1,
-    "eff_rank": 2,
-    "eff_rank_sq": 3,
-    "entropy": 4,
-    "entropy_sq": 5,
-    "unknown": 999,
-    "original": -1,
-    "--": 998,
+    "full_norm_tail_entropy": "full_norm_tail_entropy",
+    "full_norm_sq_tail_entropy": "full_norm_sq_tail_entropy",
+    "full_norm_tail_eff_rank": "full_norm_tail_eff_rank",
+    "full_norm_sq_tail_eff_rank": "full_norm_sq_tail_eff_rank",
 }
 
 SCHEME_TOKENS = {
@@ -134,9 +134,6 @@ GENERATION_METRICS = {
     ],
 }
 
-def compressed_rows_only(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [row for row in rows if not row.get("is_original", False)]
-
 def is_float_token(token: str) -> bool:
     try:
         float(token)
@@ -151,7 +148,7 @@ def is_int_token(token: str) -> bool:
 
 def safe_float(value: Any) -> Optional[float]:
     try:
-        value = round(float(value),2)
+        value = round(float(value), 2)
     except Exception:
         return None
 
@@ -227,29 +224,12 @@ def find_scoring(tokens: List[str], start_idx: int) -> Tuple[str, Optional[int],
     """
     Parse a scoring token sequence starting at start_idx.
 
-    Supports:
-      truncation
-      truncation_sq
-      truncation_loss
-      eff_rank
-      eff_rank_sq
-      entropy
-      entropy_sq
+    Every key of SCORING_TOKENS is supported, matched longest-first because score
+    names such as `eff_rank_sq` span several filename tokens.
 
     Returns:
         (scoring_name, scoring_start_idx, scoring_token_count)
     """
-
-    candidates = [
-        "truncation_loss",
-        "truncation_sq",
-        "eff_rank_sq",
-        "entropy_sq",
-        "eff_rank",
-        "truncation",
-        "entropy",
-    ]
-
     for end in range(len(tokens), start_idx, -1):
         cand = "_".join(tokens[start_idx:end])
         if cand in SCORING_TOKENS:
@@ -293,7 +273,7 @@ def parse_filename(path: Path) -> Dict[str, Any]:
 
     has_ratio = any(is_float_token(tok) for tok in tokens)
 
-    # Original model case.
+    # Original model case
     if not has_ratio:
         model_name = "_".join(tokens)
         return {
@@ -377,7 +357,7 @@ def parse_filename(path: Path) -> Dict[str, Any]:
                 bypassed_layers = int(tokens[bypass_idx])
 
     else:
-        # Fallback for malformed names.
+        # Fallback for malformed names
         if scheme_idx is not None and scheme_idx + 1 < len(tokens):
             candidate = tokens[scheme_idx + 1]
             if candidate in GROUPING_TOKENS:
@@ -432,7 +412,7 @@ def pick_generation_metric(benchmark: str, task_result: Dict[str, Any]) -> Tuple
 
 
 def get_task_result(results: Dict[str, Any], benchmark: str) -> Optional[Dict[str, Any]]:
-    for task_name in BENCHMARK_ALIASES.get(benchmark, [benchmark]):
+    for task_name in BENCHMARK_ALIASES.get(benchmark, [ benchmark ]):
         task_result = results.get(task_name)
         if task_result is not None:
             return task_result
@@ -481,13 +461,17 @@ def load_result(path: Path, prefer_lm_eval_model_name: bool = False) -> Dict[str
         if benchmark in ACCURACY_BENCHMARKS and value_float is not None:
             acc_values.append(value_float)
 
-    row["avg_accuracy"] = sum(acc_values) / len(acc_values) if acc_values else None
+    avg_accuracy = None
+    if acc_values:
+        avg_accuracy = sum(acc_values) / len(acc_values)
+
+    row["avg_accuracy"] = avg_accuracy
     row["metric_used"] = metric_used
 
     return row
 
 
-def sort_rows_hierarchical(row: Dict[str, Any]):
+def sort_rows_hierarchical(row: Dict[str, Any]) -> Tuple:
     is_original = row.get("is_original", False)
 
     ratio = row.get("compression_ratio")
@@ -506,33 +490,10 @@ def sort_rows_hierarchical(row: Dict[str, Any]):
     )
 
 
-def group_rows_for_model(rows: List[Dict[str, Any]]):
-    """
-    Returns:
-        original_rows, grouped_rows
-
-    grouped_rows:
-        compression ratio
-          bypassed layers
-            rows
-    """
-
-    original_rows = []
-    grouped = defaultdict(lambda: defaultdict(list))
-
-    for row in rows:
-        if row.get("is_original", False):
-            original_rows.append(row)
-        else:
-            grouped[row.get("compression_ratio")][row.get("bypassed_layers")].append(row)
-
-    return sorted(original_rows, key=sort_rows_hierarchical), grouped
-
-
-def metric_value_for_display(row: Dict[str, Any], benchmark: str) -> str:
-    if benchmark == "wikitext":
-        return fmt_ppl(row.get(benchmark))
-    return fmt_accuracy(row.get(benchmark))
+def metric_value_for_display(row: Dict[str, Any], column: str) -> str:
+    if column == "wikitext":
+        return fmt_ppl(row.get(column))
+    return fmt_accuracy(row.get(column))
 
 
 def best_values(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
@@ -545,24 +506,27 @@ def best_values(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
 
     best = {}
 
-    for benchmark in BENCHMARK_ORDER + ["avg_accuracy"]:
+    for column in VALUE_COLUMNS:
         values = []
 
         for row in rows:
-            value = safe_float(row.get(benchmark))
+            value = safe_float(row.get(column))
             if value is not None:
                 values.append(value)
 
         if not values:
-            best[benchmark] = None
-        elif benchmark == "wikitext":
-            best[benchmark] = min(values)
+            best[column] = None
+        elif column == "wikitext":
+            best[column] = min(values)
         else:
-            best[benchmark] = max(values)
+            best[column] = max(values)
 
     return best
 
-def group_rows_for_model_by_bypass(rows: List[Dict[str, Any]]):
+def group_rows_for_model_by_bypass(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[Any, Dict[Any, List[Dict[str, Any]]]]]:
+    """Split the baseline rows out and group the rest by bypassed layers, then ratio"""
     original_rows = []
     grouped = defaultdict(lambda: defaultdict(list))
 
@@ -588,11 +552,47 @@ def is_best(row: Dict[str, Any], benchmark: str, best: Dict[str, Optional[float]
     return abs(value - best_value) < 1e-12
 
 
-def method_label(row: Dict[str, Any]) -> str:
-    return f"{row['grouping']} / {row['scoring']} / {row['scheme']} / {row['matrices']}"
-
 def markdown_faded(value: Any) -> str:
     return f'<span style="color: #888888;">{markdown_escape(value)}</span>'
+
+
+def markdown_cell(value: str, highlight: bool) -> str:
+    if highlight:
+        return f"**{value}**"
+    return value
+
+
+def markdown_faded_cell(value: str, highlight: bool) -> str:
+    return markdown_faded(value)
+
+
+def latex_cell(value: str, highlight: bool) -> str:
+    if highlight:
+        return rf"\textbf{{{latex_escape(value)}}}"
+    return latex_escape(value)
+
+
+def latex_faded_cell(value: str, highlight: bool) -> str:
+    return rf"\textcolor{{black!45}}{{{latex_escape(value)}}}"
+
+
+def value_cells(
+    row: Dict[str, Any],
+    render: Callable[[str, bool], str],
+    best: Optional[Dict[str, Optional[float]]] = None,
+) -> List[str]:
+    """
+    Formatted value cells of one row, in table order.
+
+    Without `best` nothing is highlighted, which is what baseline rows need.
+    """
+    cells = []
+
+    for column in VALUE_COLUMNS:
+        highlight = best is not None and is_best(row, column, best)
+        cells.append(render(metric_value_for_display(row, column), highlight))
+
+    return cells
 
 def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -> str:
     rows = sorted(rows, key=sort_rows_hierarchical)
@@ -608,45 +608,29 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
 
     headers += [BENCHMARK_LABELS_MD[b] for b in PERPLEXITY_BENCHMARK_ORDER]
     headers += [BENCHMARK_LABELS_MD[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
-    headers += ["Average ↑"]
+    headers += [ "Average ↑" ]
     headers += [BENCHMARK_LABELS_MD[b] for b in GENERATION_BENCHMARK_ORDER]
-    headers += ["File"]
+    headers += [ "File" ]
 
-    lines: List[str] = [f"## {model_name}", ""]
+    lines: List[str] = [ f"## {model_name}", "" ]
 
     for bypass in sorted(grouped.keys()):
         lines.append(f"### Bypassed layers: {bypass}")
         lines.append("")
 
-        # Faded baseline row shown at the top of each bypass-specific table.
+        # Faded baseline row shown at the top of each bypass-specific table
         if original_rows:
             for row in original_rows:
-                row_cells = [
-                    markdown_faded("0%"),
-                    markdown_faded("--"),
-                    markdown_faded("--"),
-                    markdown_faded("--"),
-                    markdown_faded("--"),
-                ]
-
-                for benchmark in PERPLEXITY_BENCHMARK_ORDER:
-                    row_cells.append(markdown_faded(metric_value_for_display(row, benchmark)))
-
-                for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
-                    row_cells.append(markdown_faded(metric_value_for_display(row, benchmark)))
-
-                row_cells.append(markdown_faded(fmt_accuracy(row.get("avg_accuracy"))))
-
-                for benchmark in GENERATION_BENCHMARK_ORDER:
-                    row_cells.append(markdown_faded(metric_value_for_display(row, benchmark)))
-
+                row_cells = [ markdown_faded("0%") ]
+                row_cells += [ markdown_faded("--") ] * 4
+                row_cells += value_cells(row, markdown_faded_cell)
                 row_cells.append(markdown_faded(row.get("file", "--")))
                 lines.append("| " + " | ".join(row_cells) + " |")
 
             lines.append("")
 
         lines.append("| " + " | ".join(headers) + " |")
-        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        lines.append("| " + " | ".join([ "---" ] * len(headers)) + " |")
 
         for ratio in sorted(grouped[bypass].keys(), key=lambda x: -1 if x is None else x):
             local_rows = sorted(grouped[bypass][ratio], key=sort_rows_hierarchical)
@@ -654,37 +638,19 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
 
             first_ratio_row = True
             for row in local_rows:
+                ratio_cell = ""
+                if first_ratio_row:
+                    ratio_cell = fmt_ratio_md(ratio)
+
                 row_cells = [
-                    fmt_ratio_md(ratio) if first_ratio_row else "",
+                    ratio_cell,
                     row.get("grouping", "--"),
                     row.get("scoring", "--"),
                     row.get("scheme", "--"),
                     row.get("matrices", "--"),
                 ]
 
-                for benchmark in PERPLEXITY_BENCHMARK_ORDER:
-                    value = metric_value_for_display(row, benchmark)
-                    if is_best(row, benchmark, ratio_best):
-                        value = f"**{value}**"
-                    row_cells.append(value)
-
-                for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
-                    value = metric_value_for_display(row, benchmark)
-                    if is_best(row, benchmark, ratio_best):
-                        value = f"**{value}**"
-                    row_cells.append(value)
-
-                avg_value = fmt_accuracy(row.get("avg_accuracy"))
-                if is_best(row, "avg_accuracy", ratio_best):
-                    avg_value = f"**{avg_value}**"
-                row_cells.append(avg_value)
-
-                for benchmark in GENERATION_BENCHMARK_ORDER:
-                    value = metric_value_for_display(row, benchmark)
-                    if is_best(row, benchmark, ratio_best):
-                        value = f"**{value}**"
-                    row_cells.append(value)
-
+                row_cells += value_cells(row, markdown_cell, ratio_best)
                 row_cells.append(row.get("file", "--"))
 
                 lines.append("| " + " | ".join(markdown_escape(v) for v in row_cells) + " |")
@@ -693,24 +659,6 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
-
-
-def latex_metric_cell(row: Dict[str, Any], benchmark: str, best: Dict[str, Optional[float]]) -> str:
-    value = metric_value_for_display(row, benchmark)
-
-    if is_best(row, benchmark, best):
-        return rf"\textbf{{{latex_escape(value)}}}"
-
-    return latex_escape(value)
-
-
-def latex_average_cell(row: Dict[str, Any], best: Dict[str, Optional[float]]) -> str:
-    value = fmt_accuracy(row.get("avg_accuracy"))
-
-    if is_best(row, "avg_accuracy", best):
-        return rf"\textbf{{{latex_escape(value)}}}"
-
-    return latex_escape(value)
 
 
 def make_latex_table_for_model(
@@ -756,7 +704,7 @@ def make_latex_table_for_model(
             rf"\multicolumn{{{len(PERPLEXITY_BENCHMARK_ORDER)}}}{{c}}{{Perplexity Benchmarks}} & "
             rf"\multicolumn{{{len(LIKELIHOOD_BENCHMARK_ORDER)}}}{{c}}{{Likelihood Benchmarks}} & "
             r"\multicolumn{1}{c}{Summary} & "
-            rf"\multicolumn{{{len(GENERATION_BENCHMARK_ORDER)}}}{{c}}{{Generation Benchmarks}} \\"
+            rf"\multicolumn{{{len(GENERATION_BENCHMARK_ORDER)}}}{{c}}{{Generation Benchmarks}} \\",
         )
 
         lines.append(
@@ -765,7 +713,7 @@ def make_latex_table_for_model(
             rf"\cmidrule(lr){{{ppl_start_col}-{ppl_end_col}}}"
             rf"\cmidrule(lr){{{likelihood_start_col}-{likelihood_end_col}}}"
             rf"\cmidrule(lr){{{summary_col}-{summary_col}}}"
-            rf"\cmidrule(lr){{{generation_start_col}-{generation_end_col}}}"
+            rf"\cmidrule(lr){{{generation_start_col}-{generation_end_col}}}",
         )
 
         header = [
@@ -778,37 +726,18 @@ def make_latex_table_for_model(
 
         header += [BENCHMARK_LABELS_LATEX[b] for b in PERPLEXITY_BENCHMARK_ORDER]
         header += [BENCHMARK_LABELS_LATEX[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
-        header += [r"Avg. $\uparrow$"]
+        header += [ r"Avg. $\uparrow$" ]
         header += [BENCHMARK_LABELS_LATEX[b] for b in GENERATION_BENCHMARK_ORDER]
 
         lines.append(" & ".join(header) + r" \\")
         lines.append(r"\midrule")
 
-        # Faded baseline row shown at the top of each bypass-specific table.
+        # Faded baseline row shown at the top of each bypass-specific table
         if original_rows:
             for row in original_rows:
-                cells = [
-                    r"\textcolor{black!45}{0\%}",
-                    r"\textcolor{black!45}{--}",
-                    r"\textcolor{black!45}{--}",
-                    r"\textcolor{black!45}{--}",
-                    r"\textcolor{black!45}{--}",
-                ]
-
-                for benchmark in PERPLEXITY_BENCHMARK_ORDER:
-                    value = latex_escape(metric_value_for_display(row, benchmark))
-                    cells.append(rf"\textcolor{{black!45}}{{{value}}}")
-
-                for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
-                    value = latex_escape(metric_value_for_display(row, benchmark))
-                    cells.append(rf"\textcolor{{black!45}}{{{value}}}")
-
-                avg_value = latex_escape(fmt_accuracy(row.get("avg_accuracy")))
-                cells.append(rf"\textcolor{{black!45}}{{{avg_value}}}")
-
-                for benchmark in GENERATION_BENCHMARK_ORDER:
-                    value = latex_escape(metric_value_for_display(row, benchmark))
-                    cells.append(rf"\textcolor{{black!45}}{{{value}}}")
+                cells = [ r"\textcolor{black!45}{0\%}" ]
+                cells += [ r"\textcolor{black!45}{--}" ] * 4
+                cells += value_cells(row, latex_faded_cell)
 
                 lines.append(" & ".join(cells) + r" \\")
             lines.append(r"\midrule")
@@ -821,24 +750,19 @@ def make_latex_table_for_model(
 
             first_ratio_row = True
             for row in local_rows:
+                ratio_cell = ""
+                if first_ratio_row:
+                    ratio_cell = fmt_ratio(ratio)
+
                 cells = [
-                    fmt_ratio(ratio) if first_ratio_row else "",
+                    ratio_cell,
                     latex_escape(row.get("grouping", "--")),
                     latex_escape(row.get("scoring", "--")),
                     latex_escape(row.get("scheme", "--")),
                     latex_escape(row.get("matrices", "--")),
                 ]
 
-                for benchmark in PERPLEXITY_BENCHMARK_ORDER:
-                    cells.append(latex_metric_cell(row, benchmark, ratio_best))
-
-                for benchmark in LIKELIHOOD_BENCHMARK_ORDER:
-                    cells.append(latex_metric_cell(row, benchmark, ratio_best))
-
-                cells.append(latex_average_cell(row, ratio_best))
-
-                for benchmark in GENERATION_BENCHMARK_ORDER:
-                    cells.append(latex_metric_cell(row, benchmark, ratio_best))
+                cells += value_cells(row, latex_cell, ratio_best)
 
                 lines.append(" & ".join(cells) + r" \\")
                 first_ratio_row = False
@@ -861,7 +785,7 @@ def make_latex_table_for_model(
             r"Accuracy-style metrics are reported as percentages; \texttt{acc} is used when available and "
             r"\texttt{acc\_norm} otherwise. Average accuracy excludes generation benchmarks. "
             r"WikiText is reported as token perplexity, where lower is better. "
-            r"Bold values indicate the best result within each compression ratio.}"
+            r"Bold values indicate the best result within each compression ratio.}",
         )
         lines.append(rf"\label{{tab:lm-eval-hierarchical-{label_model}-b{bypass}}}")
         lines.append(r"\end{table*}")
@@ -899,7 +823,7 @@ def build_markdown_report(rows_by_model: Dict[str, List[Dict[str, Any]]]) -> str
         "Hierarchical tables are grouped by compression ratio. "
         "Accuracy-style scores are percentages. `acc` is used when available; otherwise `acc_norm` is used. "
         "Average accuracy excludes generation benchmarks. "
-        "`wikitext` is token perplexity, where lower is better."
+        "`wikitext` is token perplexity, where lower is better.",
     )
     out.append("")
 
@@ -947,15 +871,15 @@ def collect_rows(
     return rows_by_model
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate hierarchical markdown or LaTeX tables from lm-eval JSON result files."
+        description="Generate hierarchical markdown or LaTeX tables from lm-eval JSON result files",
     )
 
     parser.add_argument(
         "input_dir",
         type=Path,
-        help="Directory containing lm-eval JSON files.",
+        help="Directory containing lm-eval JSON files",
     )
 
     parser.add_argument(
@@ -984,7 +908,7 @@ def main():
     parser.add_argument(
         "-f",
         "--format",
-        choices=["markdown", "latex"],
+        choices=[ "markdown", "latex" ],
         default="markdown",
         help="Output format. Default: markdown",
     )
@@ -994,7 +918,7 @@ def main():
         action="store_true",
         help=(
             "Use the model name stored inside the JSON config instead of the filename-derived model name. "
-            "By default, the filename-derived model name is used."
+            "By default, the filename-derived model name is used"
         ),
     )
 
