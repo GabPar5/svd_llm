@@ -8,7 +8,7 @@ import random
 import sys
 import re
 import resource
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 from tqdm import tqdm
 from enum import Enum
 from datasets import load_dataset, load_from_disk, Dataset
@@ -28,7 +28,11 @@ class GroupBy(str, Enum):
 
 class ScoreMetric(str, Enum):
     TRUNCATION="truncation"
+    TRUNCATION_SQ="truncation_sq"
     ENTROPY="entropy"
+    ENTROPY_SQ="entropy_sq"
+    EFF_RANK="eff_rank"
+    EFF_RANK_SQ="eff_rank_sq"
     
     @classmethod
     def _missing_(cls, value):
@@ -214,6 +218,212 @@ def tokenize_dataset(
     )
 
     return chunked.with_format("torch"), max_samples
+
+def tokenize_finetune_dataset(
+        dataset_spec: str,
+        tokenizer,
+        max_samples: int = 50000,
+        cutoff_len: int = 256,
+        seed: Optional[int] = None,
+        train_on_inputs: bool = False,
+        add_eos_token: bool = False,
+        val_set_size: int = 2000,
+        val_split_seed: int = 42,
+):
+    """
+    Tokenize the dataset used by the LoRA sequential update.
+
+    Default usage mirrors upstream SVD-LLM/Alpaca-LoRA:
+    `dataset_spec="yahma/alpaca-cleaned"`, split=train, Alpaca prompt format,
+    and labels masked on the instruction/input part unless train_on_inputs=True.
+    """
+    parts = dataset_spec.split(":")
+    dataset_name = parts[0]
+    dataset_subset = parts[1] if len(parts) > 1 and parts[1] else None
+    dataset_split = parts[2] if len(parts) > 2 and parts[2] else "train"
+
+    print(f"[FINETUNE] Dataset: {dataset_name} | subset={dataset_subset} | split={dataset_split}")
+
+    if os.path.isdir(dataset_name):
+        loaded = load_from_disk(dataset_name)
+        df = loaded[dataset_split] if hasattr(loaded, "keys") and dataset_split in loaded else loaded
+    elif dataset_subset is not None:
+        df = load_dataset(dataset_name, dataset_subset, split=dataset_split)
+    else:
+        df = load_dataset(dataset_name, split=dataset_split)
+
+    sample_limit = max_samples
+    if max_samples is not None and max_samples > 0 and val_set_size > 0:
+        # Keep max_samples as the intended training-set budget; add validation
+        # examples before splitting so default 50k + 2k mirrors upstream better.
+        sample_limit = max_samples + val_set_size
+
+    if sample_limit is not None and sample_limit > 0 and len(df) > sample_limit:
+        df = df.shuffle(seed=seed).select(range(sample_limit)) # pyright: ignore[reportAttributeAccessIssue]
+    else:
+        df = df.shuffle(seed=seed) # pyright: ignore[reportAttributeAccessIssue]
+
+    requested_samples = len(df)
+    print(f"[FINETUNE] Tokenizing up to {requested_samples} samples, cutoff_len={cutoff_len}")
+
+    eval_raw = None
+    actual_val_set_size = 0
+    if val_set_size > 0 and len(df) > 1:
+        actual_val_set_size = min(int(val_set_size), len(df) - 1)
+        if actual_val_set_size != val_set_size:
+            print(
+                f"[FINETUNE][WARNING] Requested val_set_size={val_set_size}, "
+                f"using {actual_val_set_size} to keep a non-empty train split."
+            )
+
+        split = df.train_test_split( # pyright: ignore[reportAttributeAccessIssue]
+            test_size=actual_val_set_size,
+            shuffle=True,
+            seed=val_split_seed,
+        )
+        train_raw = split["train"]
+        eval_raw = split["test"]
+    else:
+        train_raw = df
+
+    def alpaca_prompt(instruction: str, input_text: str = "", output_text: Optional[str] = None) -> str:
+        if input_text and input_text.strip():
+            prompt = (
+                "Below is an instruction that describes a task, paired with an input "
+                "that provides further context. Write a response that appropriately "
+                "completes the request.\n\n"
+                "### Instruction:\n"
+                f"{instruction}\n\n"
+                "### Input:\n"
+                f"{input_text}\n\n"
+                "### Response:\n"
+            )
+        else:
+            prompt = (
+                "Below is an instruction that describes a task. Write a response "
+                "that appropriately completes the request.\n\n"
+                "### Instruction:\n"
+                f"{instruction}\n\n"
+                "### Response:\n"
+            )
+
+        if output_text is not None:
+            prompt += str(output_text)
+        return prompt
+
+    def tokenize_prompt(prompt: str, should_add_eos: bool = True) -> Dict:
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=cutoff_len,
+            padding=False,
+            return_tensors=None,
+        )
+        if (
+            should_add_eos
+            and tokenizer.eos_token_id is not None
+            and len(result["input_ids"]) > 0
+            and result["input_ids"][-1] != tokenizer.eos_token_id
+            and len(result["input_ids"]) < cutoff_len
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    def generate_and_tokenize(data_point: Dict) -> Dict:
+        if "instruction" in data_point and "output" in data_point:
+            instruction = str(data_point.get("instruction") or "")
+            input_text = str(data_point.get("input") or "")
+            output_text = str(data_point.get("output") or "")
+
+            tokenized = tokenize_prompt(
+                alpaca_prompt(instruction, input_text, output_text),
+                should_add_eos=True,
+            )
+            if not train_on_inputs:
+                user_prompt = alpaca_prompt(instruction, input_text, None)
+                tokenized_user = tokenize_prompt(
+                    user_prompt,
+                    should_add_eos=add_eos_token,
+                )
+                user_prompt_len = len(tokenized_user["input_ids"])
+                if add_eos_token and user_prompt_len > 0:
+                    user_prompt_len -= 1
+                tokenized["labels"] = (
+                    [-100] * user_prompt_len
+                    + tokenized["labels"][user_prompt_len:]
+                )
+            return tokenized
+
+        text = None
+        for field in ("text", "sentence", "page", "content"):
+            if field in data_point and data_point[field] is not None:
+                text = str(data_point[field])
+                break
+        if text is None:
+            raise ValueError(
+                "Unsupported finetune dataset format. Expected Alpaca-style "
+                "`instruction`/`input`/`output` fields or a text-like field."
+            )
+        return tokenize_prompt(text, should_add_eos=True)
+
+    def tokenize_and_filter_split(raw_split, split_name: str, allow_empty: bool = False):
+        tokenized = raw_split.map(
+            generate_and_tokenize,
+            remove_columns=raw_split.column_names, # pyright: ignore[reportArgumentType]
+            load_from_cache_file=False,
+            desc=f"Tokenizing {split_name} finetune dataset...",
+        )
+
+        before_filter = len(tokenized)
+        tokenized = tokenized.filter(
+            lambda example: any(label != -100 for label in example["labels"]),
+            load_from_cache_file=False,
+            desc=f"Filtering all-masked {split_name} finetune samples...",
+        )
+        dropped = before_filter - len(tokenized)
+
+        if dropped > 0:
+            print(
+                f"[FINETUNE][WARNING] Dropped {dropped} {split_name} samples "
+                "with all labels masked. This usually means the instruction/input "
+                "alone reached cutoff_len; consider increasing --finetune_cutoff_len."
+            )
+
+        if len(tokenized) == 0 and not allow_empty:
+            raise ValueError(
+                f"All {split_name} finetune samples were filtered because every "
+                "label was -100. Increase --finetune_cutoff_len, use a shorter "
+                "dataset, or set --finetune_train_on_inputs."
+            )
+
+        return tokenized, dropped
+
+    train_dataset, dropped_train = tokenize_and_filter_split(train_raw, "train")
+    eval_dataset = None
+    dropped_eval = 0
+    if eval_raw is not None:
+        eval_dataset, dropped_eval = tokenize_and_filter_split(eval_raw, "validation", allow_empty=True)
+        if len(eval_dataset) == 0:
+            print("[FINETUNE][WARNING] Validation split is empty after filtering; disabling evaluation.")
+            eval_dataset = None
+
+    stats: Dict[str, Any] = {
+        "requested_samples": requested_samples,
+        "train_samples": len(train_dataset),
+        "eval_samples": len(eval_dataset) if eval_dataset is not None else 0,
+        "val_set_size": actual_val_set_size,
+        "dropped_train_all_masked": dropped_train,
+        "dropped_eval_all_masked": dropped_eval,
+    }
+
+    print(
+        "[FINETUNE] Supervised samples after filtering: "
+        f"train={stats['train_samples']} | validation={stats['eval_samples']}"
+    )
+
+    return train_dataset, eval_dataset, stats
 
 def generate_paths(mlp: bool, q: bool, k: bool, v: bool, attention_output: bool, layers_number: int) -> list[str]:
     list_paths=[]
@@ -498,16 +708,13 @@ def _redundancy_from_scores(scores: torch.Tensor, offset: float = 1.5) -> torch.
     # Handle negative values (fallback)
     scores = torch.clamp(scores, min=0.0)
 
-    if offset <= 1.0:
-        raise ValueError("`offset` must be > 1.0")
+    if offset < 0.0:
+        raise ValueError("`offset` must be >= 0.0")
 
     # Shift the score to guarantee it is strictly > 1.0 before ratio allocation.
     weights = 1.0 / torch.log(scores + offset)
     # Handle nan and infinite values (fallback)
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if weights.sum() <= 0:
-        weights = torch.ones_like(weights)
 
     return weights
 
