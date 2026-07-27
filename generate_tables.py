@@ -151,7 +151,7 @@ def is_int_token(token: str) -> bool:
 
 def safe_float(value: Any) -> Optional[float]:
     try:
-        value = float(value)
+        value = round(float(value),2)
     except Exception:
         return None
 
