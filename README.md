@@ -247,6 +247,8 @@ The removal budget is preserved in parameters, not in average ratio: bypassed la
 
 `wikitext` and `c4` are measured with the repository's own perplexity routine, which reproduces the SVD-LLM paper methodology (documents concatenated into one stream, non-overlapping chunks, `exp(mean NLL)` over all tokens). All other tasks go through lm-evaluation-harness, and both result sets are merged into a single JSON.
 
+`wikitext` reads `wikitext-2-raw-v1:test` (4358 documents). `c4` reads a single validation shard of `allenai/c4` (`en/c4-validation.00000-of-00008.json.gz`, 45576 documents), which is what upstream SVD-LLM loads; the full `en` validation split is ~364k documents and cannot be concatenated whole. Because the shard is ~10x wikitext, a `c4` evaluation costs noticeably more wall-clock than a `wikitext` one.
+
 ---
 
 ## Output Layout

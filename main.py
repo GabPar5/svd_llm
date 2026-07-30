@@ -875,26 +875,34 @@ if __name__ == "__main__":
         results = {}
 
         # Perplexity tasks bypass lm-eval to stay comparable with the SVD-LLM paper
-        # TODO c4 task: the c4 entry still re-evaluates wikitext
         ppl_tasks = {
-            "wikitext": ("wikitext", "wikitext-2-raw-v1", "test"),
-            "c4": ("wikitext", "wikitext-2-raw-v1", "test"),
+            "wikitext": {
+                "dataset_name": "wikitext",
+                "subset": "wikitext-2-raw-v1",
+                "split": "test",
+            },
+            # A single validation shard, which is what upstream SVD-LLM loads. The
+            # full en/validation split is ~364k documents and cannot be joined
+            "c4": {
+                "dataset_name": "allenai/c4",
+                "subset": None,
+                "split": "validation",
+                "data_files": { "validation": "en/c4-validation.00000-of-00008.json.gz" },
+            },
         }
         ppl_results = {}
 
-        for task_name, (ppl_dataset, ppl_subset, ppl_split) in ppl_tasks.items():
+        for task_name, ppl_kwargs in ppl_tasks.items():
             if task_name not in tasks_list:
                 continue
 
             ppl_results[task_name] = ppl_eval(
                 model,
                 tokenizer,
-                dataset_name=ppl_dataset,
-                subset=ppl_subset,
-                split=ppl_split,
                 eval_max_length=max_length,
                 batch_size=args.eval_batch_size,
                 device=args.device,
+                **ppl_kwargs,
             )
             cuda_cleanup()
 

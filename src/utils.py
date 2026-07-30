@@ -1687,11 +1687,12 @@ def ppl_eval(
         model: nn.Module,
         tokenizer,
         dataset_name: str = "wikitext",
-        subset: str = "wikitext-2-raw-v1",
+        subset: Optional[str] = "wikitext-2-raw-v1",
         split: str = "test",
         eval_max_length: int = 2048,
         batch_size: Union[int, str] = "auto",
-        device: str = "cuda"
+        device: str = "cuda",
+        data_files: Optional[Dict[str, str]] = None
 ) -> float:
     """
     Evaluates perplexity using the exact same methodology as the SVD-LLM paper.
@@ -1709,7 +1710,14 @@ def ppl_eval(
       4. Batches containing non-finite logits (NaN or inf) are skipped.
     """
     # Concatenate all samples with "\n\n"
-    data = load_dataset(path=dataset_name, name=subset, split=split, num_proc=8)
+    # `data_files` pins a specific shard for datasets whose split is too large to
+    # join whole, so `num_proc` is dropped there to keep the single-file read simple
+    if data_files is None:
+        data = load_dataset(path=dataset_name, name=subset, split=split, num_proc=8)
+    else:
+        data = load_dataset(path=dataset_name, name=subset, split=split, data_files=data_files)
+
+    print(f"[PPL] {dataset_name} | subset={subset} | split={split} | documents={len(data):,}") # pyright: ignore
     text = "\n\n".join(data["text"]) # pyright: ignore
     encodings = tokenizer(text, truncation=False, padding=False, return_tensors="pt")
 
