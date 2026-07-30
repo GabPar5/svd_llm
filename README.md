@@ -205,6 +205,13 @@ The removal budget is preserved in parameters, not in average ratio: bypassed la
 | `--whitening_end_layer` | `int` | `None` | Last decoder layer of the chunk (exclusive); activations are checkpointed so the next chunk resumes. |
 | `--pin_cpu_offload` | `flag` | `False` | Pin CPU-offloaded activations and use non-blocking transfers. Useful on large-RAM systems, but pins many GB of host memory. |
 
+Two derived caches are written beside the whitening matrices they come from:
+
+- **`layer_importance.pt`** — Block Influence per decoder block, `1 - E[cos(x_in, x_out)]`. It is accumulated inside the whitening replay, which already holds each block's input and output, so it costs no extra forward pass and is collected on every run regardless of the score metric. Chunked runs merge by layer index because raw sums are stored rather than means.
+- **`spectra/`** — the raw singular values of each whitened matrix, cached before the `sqrt(n_tokens)` rescale. Every score metric is derivable from the spectrum, so one cache serves all of them and a repeated score pass skips the decomposition entirely (watch the `[SPECTRA]` line for the hit rate).
+
+Both are validated on load against model name, whitening version and `n_tokens`, and are ignored rather than trusted when they were built for a different configuration.
+
 ### Sequential Low-Rank Update
 
 | Argument | Type | Default | Description |
@@ -258,9 +265,13 @@ Everything lands under `--save_path`:
 ```
 output/
 ├── models/<model>/                 # compressed .pt checkpoints + tokenizer
+│   └── <run_name>.config.json      # run configuration + realized allocation
 ├── eval/<model>/<run_name>.json    # merged evaluation results
+│   └── <run_name>.config.json      # same sidecar, read by generate_tables.py
 ├── logs/<model>/<run_name>.log     # full stdout of the compression run
 ├── whitening_matrices/<model>/<v1|v2>/
+│   ├── layer_importance.pt          # Block Influence per decoder block
+│   └── spectra/                     # cached raw singular values, one per matrix
 ├── activation_checkpoints/<model>/<v1|v2>/
 ├── calibration_datasets/           # tokenized calibration data cache
 └── sequential_lora_trainer/        # HF Trainer checkpoints of the LoRA update

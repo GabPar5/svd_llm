@@ -4,6 +4,7 @@ import math
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ.pop("XLA_PYTHON_CLIENT_MEM_FRACTION", None)
@@ -115,7 +116,7 @@ def get_whitening_matrices(
 
     version_str = "v2" if is_v2 else "v1"
 
-    wm_dir = os.path.join(save_path, "whitening_matrices", sanitize_model_name(model_name), version_str)
+    wm_dir = whitening_dir(save_path, model_name, version_str)
     os.makedirs(wm_dir, exist_ok=True)
 
     act_ckpt_dir = os.path.join(save_path, "activation_checkpoints", sanitize_model_name(model_name), version_str)
@@ -173,6 +174,11 @@ def get_whitening_matrices(
 
     whitening_matrices_paths: Dict[str, str] = {}
 
+    # Block Influence per decoder block, accumulated as raw sums so that chunked
+    # runs merge exactly. Always collected, so a cached whitening directory is
+    # never missing the end-to-end signal a later allocation might ask for
+    layer_importance: Dict[int, Dict[str, float]] = {}
+
     # PHASE 2: replay decoder layers
     for idx in tqdm(range(loop_start_layer, end_layer), desc="Computing whitening matrices..."):
         should_save_this_layer = start_layer <= idx < end_layer
@@ -198,6 +204,9 @@ def get_whitening_matrices(
                 handles.append(la.register_forward_hook(hook))
 
         # Replay every calibration batch through this decoder layer
+        cos_sum = 0.0
+        cos_tokens = 0
+
         with torch.no_grad():
             for j, entry in enumerate(captured):
                 inp_j = inps[j].to(device)
@@ -207,11 +216,29 @@ def get_whitening_matrices(
 
                 # Run sample through the decoder layer and save output
                 out = layer(inp_j, use_cache=False, **kwargs)
-                outs[j] = decoder_layer_output(out).detach().cpu()
+                hidden = decoder_layer_output(out).detach()
 
-                del inp_j, out, kwargs
+                # Block Influence rides along on this replay: the end-to-end
+                # signal needs exactly the block input and output already in
+                # hand, so it costs no extra forward pass. Reduced per batch,
+                # never held as a per-token vector across the calibration set
+                cos = F.cosine_similarity(
+                    inp_j.reshape(-1, inp_j.shape[-1]).to(torch.float32),
+                    hidden.reshape(-1, hidden.shape[-1]).to(torch.float32),
+                    dim=-1,
+                )
+                cos_sum += float(cos.to(torch.float64).sum().item())
+                cos_tokens += int(cos.numel())
+
+                outs[j] = hidden.cpu()
+
+                del inp_j, out, hidden, cos, kwargs
 
             torch.cuda.synchronize()
+
+        block_influence = block_influence_from_sums(cos_sum, cos_tokens)
+        layer_importance[idx] = { "cos_sum": cos_sum, "tokens": cos_tokens }
+        print(f"[IMPORTANCE] Layer {idx} block influence: {block_influence:.6f} over {cos_tokens:,} tokens")
 
         # Remove registered forward hooks from decoder layer
         for h in handles:
@@ -410,6 +437,9 @@ def get_whitening_matrices(
 
     del inps, outs, captured
     cuda_cleanup()
+
+    if layer_importance:
+        save_layer_importance(wm_dir, model_name, version_str, n_tokens, layer_importance)
 
     print(
         f"[WHITENING] Done for layer range [{start_layer}, {end_layer}). "
@@ -1619,6 +1649,10 @@ def compress_svd_llm(
     # Overall count of tokens of the calibration dataset
     n_calibration_tokens = max(max_length * dataset["max_samples"], 1)
 
+    # Directory the whitening artifacts actually came from. Derived caches
+    # (spectra, layer importance) live beside the artifacts they were built from
+    wm_source_dir = whitening_dir(save_path or "./tmp", model_name, version_str)
+
     whitening_matrices: Optional[Dict[str, str]] = None
     if whitening_mat_path:
         whitening_mat_actual_path = os.path.join(
@@ -1629,6 +1663,7 @@ def compress_svd_llm(
         if os.path.isdir(whitening_mat_actual_path):
             # Build the loading dictionary (individual .pt files saved by `get_whitening_matrices`)
             print(f"[DEBUG] Loading whitening matrix paths from directory: {whitening_mat_actual_path}")
+            wm_source_dir = whitening_mat_actual_path
             whitening_matrices = {
                 lstr: os.path.join(whitening_mat_actual_path, lstr.replace(".", "_") + ".pt")
                 for lstr in layers_str
@@ -1707,6 +1742,10 @@ def compress_svd_llm(
             num_layers=num_decoder_layers,
         ).active_ratio
         print(f"[BUDGET] Score probe ratio for active layers: {score_probe_ratio:.6f}")
+
+        # Counts how much of the score pass was served from the spectra cache
+        cached_spectra = 0
+
         with torch.no_grad():
             for i, (layer, attr) in tqdm(
                 enumerate(zip(layers_list, attributes)),
@@ -1723,33 +1762,50 @@ def compress_svd_llm(
                 if is_bypassed:
                     continue
 
-                # Get weight and normalized whitening matrix
                 layer_attr = getattr(layer, attr)
-                W = layer_attr.weight.detach().to(device, dtype=torch.float64)
+                out_features, in_features = layer_attr.weight.shape
 
-                if is_v2:
-                    # Perform SVD on whitening matrix (S)
-                    U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
+                W = whitening_matrix = WS = U_s = L_s = L_s_sqrt = D = None
 
-                    # Auxiliary matrix
-                    L_s_sqrt = torch.sqrt(L_s.clamp_min(eps))
+                # Every score metric is derivable from the spectrum, so a cached
+                # one serves any metric and skips the decomposition entirely.
+                # The weight is only promoted to fp64 on device when it is needed
+                L = load_spectrum(wm_source_dir, layers_str[i], n_calibration_tokens)
+                is_cached = L is not None
 
-                    # Perform SVD on W x U_s x sqrt(L_s)
-                    C_sqrt = U_s * L_s_sqrt.unsqueeze(0)
-                    D = torch.matmul(W, C_sqrt)
-                    # Calculate singular values only
-                    L = torch.linalg.svdvals(D)
+                if is_cached:
+                    L = L.to(device, dtype=torch.float64) # pyright: ignore[reportOptionalMemberAccess]
+                    cached_spectra += 1
                 else:
-                    whitening_matrix = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
-                    # Perform SVD on W x Chol(XXT)
-                    WS = torch.matmul(W, whitening_matrix) # pyright: ignore[reportArgumentType]
-                    # Calculate singular values only
-                    L = torch.linalg.svdvals(WS)
+                    W = layer_attr.weight.detach().to(device, dtype=torch.float64)
+
+                    if is_v2:
+                        # Perform SVD on whitening matrix (S)
+                        U_s, L_s = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
+
+                        # Auxiliary matrix
+                        L_s_sqrt = torch.sqrt(L_s.clamp_min(eps))
+
+                        # Perform SVD on W x U_s x sqrt(L_s)
+                        C_sqrt = U_s * L_s_sqrt.unsqueeze(0)
+                        D = torch.matmul(W, C_sqrt)
+                        # Calculate singular values only
+                        L = torch.linalg.svdvals(D)
+                    else:
+                        whitening_matrix = load_whitening_data(whitening_matrices, layers_str[i], device, keep=True)
+                        # Perform SVD on W x Chol(XXT)
+                        WS = torch.matmul(W, whitening_matrix) # pyright: ignore[reportArgumentType]
+                        # Calculate singular values only
+                        L = torch.linalg.svdvals(WS)
+
+                    # Cache the raw spectrum, before any rescaling, so it stays
+                    # valid independently of how scores are normalized later
+                    save_spectrum(wm_source_dir, layers_str[i], L, n_calibration_tokens)
 
                 # Compute a tentative rank under the uniform target ratio
                 rank = int(
-                    (W.shape[0] * W.shape[1] * (1.0 - score_probe_ratio))
-                    / (W.shape[0] + W.shape[1]),
+                    (out_features * in_features * (1.0 - score_probe_ratio))
+                    / (out_features + in_features),
                 )
                 rank = max(1, min(rank, L.shape[0] - 1))
 
@@ -1763,6 +1819,11 @@ def compress_svd_llm(
                 # Free up vram and ram
                 W = whitening_matrix = WS = L = U_s = L_s = L_s_sqrt = D = None
                 del W, whitening_matrix, WS, L, U_s, L_s, L_s_sqrt, D
+
+        print(
+            f"[SPECTRA] {cached_spectra}/{len(score_map)} spectra served from cache "
+            f"in {spectra_dir(wm_source_dir)}",
+        )
 
         # Allocate compression ratios to each layer based on score metric
         ratio_map = allocate_ratios(

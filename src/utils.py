@@ -24,6 +24,17 @@ from .modules import *
 # Threshold above which cuSOLVER 32-bit indexing overflows
 SOLVER_GPU_MAX_DIM = 32000
 
+# Sidecar recording how a run was configured, written next to every artifact
+RUN_CONFIG_SUFFIX = ".config.json"
+RUN_CONFIG_SCHEMA_VERSION = 1
+
+# Never persisted to disk, the sidecar is committed alongside results
+REDACTED_ARG_KEYS = ( "hf_token", )
+
+# Cached beside the whitening artifacts they were derived from
+LAYER_IMPORTANCE_FILENAME = "layer_importance.pt"
+SPECTRA_DIRNAME = "spectra"
+
 # Decoder kwargs captured at layer 0 and replayed for every other decoder layer
 CAPTURED_DECODER_KWARGS = (
     "attention_mask",
@@ -787,6 +798,189 @@ def decoder_layer_output(out: Any) -> torch.Tensor:
     if isinstance(out, tuple):
         return out[0]
     return out
+
+def whitening_dir(base_path: str, model_name: str, version_str: str) -> str:
+    """The one place the whitening artifact layout is spelled out"""
+    return os.path.join(base_path, "whitening_matrices", sanitize_model_name(model_name), version_str)
+
+def layer_importance_path(wm_dir: str) -> str:
+    return os.path.join(wm_dir, LAYER_IMPORTANCE_FILENAME)
+
+def block_influence_from_sums(cos_sum: float, tokens: int) -> float:
+    """
+    Block Influence of one decoder block: 1 - E[cos(x_in, x_out)].
+
+    High values mean the block rotates the residual stream a lot, so it is doing
+    more work and is a worse compression target. Sums are kept rather than the
+    mean so chunked whitening runs can merge exactly.
+    """
+    if tokens <= 0:
+        return 0.0
+    return 1.0 - (cos_sum / tokens)
+
+def save_layer_importance(
+        wm_dir: str,
+        model_name: str,
+        version_str: str,
+        n_tokens: int,
+        per_layer: Dict[int, Dict[str, float]]
+) -> str:
+    """
+    Persist per-block Block Influence, merging with whatever an earlier chunk left.
+
+    Chunked whitening runs cover disjoint layer ranges, so entries accumulate
+    across runs instead of replacing one another.
+    """
+    os.makedirs(wm_dir, exist_ok=True)
+    path = layer_importance_path(wm_dir)
+
+    merged: Dict[int, Dict[str, float]] = {}
+    existing = None
+
+    if os.path.exists(path):
+        try:
+            existing = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as error:
+            print(f"[IMPORTANCE][WARNING] Overwriting unreadable {path}: {error}")
+            existing = None
+
+    is_reusable = (
+        isinstance(existing, dict)
+        and existing.get("model_name") == model_name
+        and existing.get("version") == version_str
+        and int(existing.get("n_tokens", -1)) == int(n_tokens)
+    )
+    if is_reusable:
+        merged.update(existing.get("per_layer", {})) # pyright: ignore[reportOptionalMemberAccess]
+    elif existing is not None:
+        print(f"[IMPORTANCE][WARNING] Discarding {path}, it was built for another configuration")
+
+    merged.update(per_layer)
+
+    torch.save(
+        {
+            "model_name": model_name,
+            "version": version_str,
+            "n_tokens": int(n_tokens),
+            "metric": "block_influence",
+            "per_layer": merged,
+        },
+        path,
+    )
+
+    print(f"[IMPORTANCE] Saved Block Influence for {len(merged)} decoder blocks -> {path}")
+
+    return path
+
+def load_layer_importance(
+        wm_dir: str,
+        model_name: str,
+        version_str: str,
+        n_tokens: int,
+        num_layers: Optional[int] = None
+) -> Optional[Dict[int, float]]:
+    """
+    Read cached Block Influence, validated against the run that produced it.
+
+    Returns None when absent, stale, or incomplete, so callers can fall back
+    rather than silently allocating on another configuration's signal.
+    """
+    path = layer_importance_path(wm_dir)
+
+    if not os.path.exists(path):
+        return None
+
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        print(f"[IMPORTANCE][WARNING] Could not read {path}: {error}")
+        return None
+
+    def reject(reason: str) -> None:
+        print(f"[IMPORTANCE][WARNING] Ignoring {path}: {reason}")
+
+    if not isinstance(blob, dict):
+        reject("unexpected file structure")
+        return None
+
+    if blob.get("model_name") != model_name:
+        reject(f"built for model {blob.get('model_name')}")
+        return None
+
+    if blob.get("version") != version_str:
+        reject(f"built for whitening version {blob.get('version')}")
+        return None
+
+    if int(blob.get("n_tokens", -1)) != int(n_tokens):
+        reject(f"built for n_tokens={blob.get('n_tokens')}, expected {n_tokens}")
+        return None
+
+    per_layer = blob.get("per_layer", {})
+    importance = {
+        int(idx): block_influence_from_sums(float(entry["cos_sum"]), int(entry["tokens"]))
+        for idx, entry in per_layer.items()
+    }
+
+    if num_layers is not None and len(importance) < num_layers:
+        reject(f"only {len(importance)}/{num_layers} decoder blocks recorded")
+        return None
+
+    return importance
+
+def spectra_dir(wm_dir: str) -> str:
+    return os.path.join(wm_dir, SPECTRA_DIRNAME)
+
+def spectrum_path(wm_dir: str, key: str) -> str:
+    return os.path.join(spectra_dir(wm_dir), key.replace(".", "_") + ".pt")
+
+def save_spectrum(wm_dir: str, key: str, singular_values: torch.Tensor, n_tokens: int) -> str:
+    """
+    Cache the raw singular values of one whitened matrix.
+
+    Raw rather than rescaled: every score metric is derivable from the spectrum,
+    so caching it once makes re-scoring under any metric free, and it keeps the
+    cache valid independently of how scores are normalized later on.
+    """
+    directory = spectra_dir(wm_dir)
+    os.makedirs(directory, exist_ok=True)
+    path = spectrum_path(wm_dir, key)
+
+    torch.save(
+        {
+            "key": key,
+            "n_tokens": int(n_tokens),
+            "singular_values": singular_values.detach().to(torch.float64).cpu(),
+        },
+        path,
+    )
+
+    return path
+
+def load_spectrum(wm_dir: str, key: str, n_tokens: int) -> Optional[torch.Tensor]:
+    """Read a cached raw spectrum, or None when it is absent or built elsewhere"""
+    path = spectrum_path(wm_dir, key)
+
+    if not os.path.exists(path):
+        return None
+
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        print(f"[SPECTRA][WARNING] Could not read {path}: {error}")
+        return None
+
+    if not isinstance(blob, dict) or blob.get("key") != key:
+        print(f"[SPECTRA][WARNING] Ignoring {path}: it describes another matrix")
+        return None
+
+    if int(blob.get("n_tokens", -1)) != int(n_tokens):
+        print(
+            f"[SPECTRA][WARNING] Ignoring {path}: built for "
+            f"n_tokens={blob.get('n_tokens')}, expected {n_tokens}",
+        )
+        return None
+
+    return blob["singular_values"]
 
 def load_whitening_data(
         whitening_matrix_paths: Dict[str, str],
