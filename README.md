@@ -278,6 +278,18 @@ For example `Qwen_Qwen2.5_7B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_2_v2`.
 
 The `<bypassed>` token is a bare integer when only `--bypass_early_layers` is used, and becomes `byp<early>-<late>` once `--bypass_late_layers` is set. `_cap<max_ratio>` appears only when `--max_ratio` leaves its `0.9` default. Both rules exist so that run names predating these options stay byte-identical.
 
+### Run Configuration Sidecar
+
+The filename is parsed positionally and cannot carry every dimension of a run, so each run also writes `<run_name>.config.json` next to its checkpoint and next to its evaluation JSON:
+
+- `args` — the resolved command line (`--hf_token` is never persisted).
+- `allocation` — target vs **realized** removal, per-matrix `ratio_map`, and the bypassed/active matrix counts. Written by the compression step, so it exists even for runs that never evaluate.
+- `checkpoint_metadata` — the same metadata embedded in the `.pt`.
+
+`generate_tables.py` prefers this sidecar over `parse_filename` and falls back to filename parsing for runs that predate it, so old results keep tabulating unchanged. Sidecars are skipped when the input directory is globbed for results.
+
+A run whose realized ratio drifts from its target by more than 0.1% prints a `[BUDGET][WARNING]`; allocation policies are only comparable at equal realized compression, so use `allocation.realized_overall_ratio` rather than the requested `--compression_ratio` when comparing.
+
 ---
 
 ## Helper Scripts

@@ -618,6 +618,15 @@ if __name__ == "__main__":
         model = model.to(args.device)
         print(model)
 
+        # Record the arguments beside the checkpoint the compression just wrote,
+        # so a compress-only run is self-describing without an evaluation
+        if args.save_path:
+            save_run_config(
+                directory=os.path.join(args.save_path, "models", sanitize_model_name(args.model)),
+                run_name=model_name,
+                config={ "args": sanitize_run_args(vars(args)) },
+            )
+
         cuda_cleanup()
         vram_usage("After loading compressed model")
 
@@ -961,5 +970,21 @@ if __name__ == "__main__":
 
         with open(os.path.join(model_eval_path, f"{model_name}.json"), "w") as f:
             json.dump(results, f, default=handle_non_serializable, indent=2)
+
+        # generate_tables.py reads this in preference to parsing the filename
+        eval_config = { "args": sanitize_run_args(vars(args)) }
+        compression_config_path = run_config_path(
+            os.path.join(args.save_path, "models", sanitize_model_name(args.model)),
+            model_name,
+        )
+        if os.path.exists(compression_config_path):
+            with open(compression_config_path, "r", encoding="utf-8") as config_file:
+                eval_config = {**json.load(config_file), **eval_config}
+
+        save_run_config(
+            directory=model_eval_path,
+            run_name=model_name,
+            config=eval_config,
+        )
 
         vram_usage("After evaluation")

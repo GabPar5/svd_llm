@@ -1812,6 +1812,48 @@ def compress_svd_llm(
         print(f"  - Actual removed:                {actual_removed:,.0f}")
         print("-" * 80 + "\n")
 
+    # Recomputed here because only the homogeneous branch keeps a budget around;
+    # this is pure arithmetic over the param map, so it costs nothing
+    allocation_budget = compute_active_budget(
+        layers_str=layers_str,
+        param_count_map=param_count_map,
+        target_ratio=ratio,
+        bypass_early_layers=bypass_early_layers,
+        bypass_ratio=bypass_ratio,
+        max_ratio=max_ratio,
+        target_total_params=target_total_params,
+        bypass_late_layers=bypass_late_layers,
+        num_layers=num_decoder_layers,
+    )
+    allocation_summary = summarize_allocation(
+        ratio_map=ratio_map,
+        param_count_map=param_count_map,
+        layers_str=layers_str,
+        target_ratio=ratio,
+        selected_total_params=selected_total_params,
+        target_total_params=target_total_params,
+        bypassed_keys=allocation_budget.bypassed_keys,
+        active_keys=allocation_budget.active_keys,
+    )
+
+    # Allocation policies are only comparable at equal realized compression, so a
+    # drifting budget has to be visible rather than silently reported as on-target
+    target_removed_params = allocation_summary["target_removed_params"]
+    relative_drift = (
+        abs(allocation_summary["actual_removed_params"] - target_removed_params)
+        / max(1.0, target_removed_params)
+    )
+    if relative_drift > 1e-3:
+        print(
+            f"[BUDGET][WARNING] Realized removal deviates from target by "
+            f"{relative_drift:.4%}. "
+            f"target={target_removed_params:,.0f}, "
+            f"actual={allocation_summary['actual_removed_params']:,.0f}. "
+            f"Comparisons against other runs must use the realized ratio",
+        )
+
+    print(f"[BUDGET] Realized overall ratio: {allocation_summary['realized_overall_ratio']:.6f}")
+
     # Compress layers using the calculated compression ratios
     vram_usage("Before performing layer compression")
     with torch.no_grad():
@@ -2152,6 +2194,18 @@ def compress_svd_llm(
             checkpoint_path=os.path.join(save_path_model, f"{run_name}.pt"),
             rank_map=rank_map,
             metadata=metadata,
+        )
+
+        # Keep the checkpoint self-describing even when the run never evaluates
+        save_run_config(
+            directory=save_path_model,
+            run_name=run_name,
+            config={
+                "allocation": allocation_summary,
+                "checkpoint_metadata": {
+                    k: v for k, v in metadata.items() if k != "rank_map_preview"
+                },
+            },
         )
 
     cuda_cleanup()

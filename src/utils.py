@@ -1,4 +1,5 @@
 import gc
+import json
 import math
 import os
 import psutil
@@ -1540,6 +1541,82 @@ def build_run_name(
     ]
 
     return "".join(parts)
+
+def sanitize_run_args(args_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop credentials before a run configuration is written next to results"""
+    return {k: v for k, v in args_dict.items() if k not in REDACTED_ARG_KEYS}
+
+def run_config_path(directory: str, run_name: str) -> str:
+    return os.path.join(directory, f"{run_name}{RUN_CONFIG_SUFFIX}")
+
+def save_run_config(directory: str, run_name: str, config: Dict[str, Any]) -> str:
+    """
+    Write, or merge into, the sidecar describing how a run was configured.
+
+    The filename can only carry a handful of tokens and is parsed positionally,
+    so it cannot express every dimension of a run. This sidecar is the
+    authoritative record instead, and `generate_tables.py` prefers it over
+    `parse_filename`. Writers are additive: the compression step records the
+    realized allocation, the entry point records the resolved arguments.
+    """
+    os.makedirs(directory, exist_ok=True)
+    path = run_config_path(directory, run_name)
+
+    merged: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as config_file:
+                merged = json.load(config_file)
+        except (OSError, ValueError) as error:
+            print(f"[CONFIG][WARNING] Overwriting unreadable sidecar {path}: {error}")
+            merged = {}
+
+    merged.update(config)
+    merged["run_name"] = run_name
+    merged["schema_version"] = RUN_CONFIG_SCHEMA_VERSION
+
+    with open(path, "w", encoding="utf-8") as config_file:
+        json.dump(merged, config_file, indent=2, default=str)
+
+    print(f"[CONFIG] Wrote run config: {path}")
+
+    return path
+
+def summarize_allocation(
+        ratio_map: Dict[str, float],
+        param_count_map: Dict[str, int],
+        layers_str: List[str],
+        target_ratio: float,
+        selected_total_params: int,
+        target_total_params: int,
+        bypassed_keys: List[str],
+        active_keys: List[str]
+) -> Dict[str, Any]:
+    """
+    Realized allocation facts, recorded so results can be checked against target.
+
+    Allocation policies are compared at a fixed budget, so a run whose realized
+    ratio drifted from its target is not comparable to one that hit it. Keeping
+    both numbers next to the results makes that visible instead of implicit.
+    """
+    actual_removed = sum(param_count_map[k] * ratio_map.get(k, 0.0) for k in layers_str)
+    assigned_ratios = [ratio_map.get(k, 0.0) for k in layers_str]
+
+    return {
+        "target_ratio": target_ratio,
+        "selected_params": selected_total_params,
+        "target_total_params": target_total_params,
+        "target_removed_params": target_ratio * target_total_params,
+        "actual_removed_params": actual_removed,
+        "realized_selected_ratio": actual_removed / selected_total_params if selected_total_params else 0.0,
+        "realized_overall_ratio": actual_removed / target_total_params if target_total_params else 0.0,
+        "num_matrices": len(layers_str),
+        "num_bypassed_matrices": len(bypassed_keys),
+        "num_active_matrices": len(active_keys),
+        "min_assigned_ratio": min(assigned_ratios) if assigned_ratios else 0.0,
+        "max_assigned_ratio": max(assigned_ratios) if assigned_ratios else 0.0,
+        "ratio_map": ratio_map,
+    }
 
 def save_compressed_checkpoint(
         model: nn.Module,
