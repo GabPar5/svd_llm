@@ -1243,7 +1243,9 @@ def allocate_ratios(
         bypass_early_layers: int = 2,
         bypass_ratio: float = 0.0,
         max_ratio: float = 0.9,
-        target_total_params: Optional[int] = None
+        target_total_params: Optional[int] = None,
+        bypass_late_layers: int = -1,
+        num_layers: Optional[int] = None
 ) -> Dict[str, float]:
     """
     Redistributes compression budget within each weight group.
@@ -1252,8 +1254,9 @@ def allocate_ratios(
     Within each group, matrices with higher score get a lower
     compression ratio and vice versa.
 
-    Early layers (defined by bypass_early_layers) are mathematically isolated
-    from redistribution and strictly assigned the bypass_ratio. A bypass_ratio
+    Bypassed layers (the first `bypass_early_layers` and the last
+    `bypass_late_layers`, either or both) are mathematically isolated from
+    redistribution and strictly assigned the bypass_ratio. A bypass_ratio
     of 0.0 means 0% parameter removal (no compression) for those layers.
     In case some layers are bypassed, it still preserves
     the global target_ratio across the entire model,
@@ -1273,7 +1276,11 @@ def allocate_ratios(
 
     print(f"\n[BUDGET] Parameter-aware redistribution: {group_criterion.value.upper()}")
     print(f"[BUDGET] Global target ratio: {target_ratio:.6f}")
-    print(f"[BUDGET] Bypassing first {bypass_early_layers} layers with ratio {bypass_ratio:.6f}")
+    print(
+        f"[BUDGET] Bypassing first {bypass_early_layers} and last "
+        f"{bypass_late_layers} layers with ratio {bypass_ratio:.6f}",
+    )
+    print(f"[BUDGET] Per-matrix max ratio: {max_ratio:.6f}")
 
     budget = compute_active_budget(
         layers_str=layers_str,
@@ -1283,6 +1290,8 @@ def allocate_ratios(
         bypass_ratio=bypass_ratio,
         max_ratio=max_ratio,
         target_total_params=target_total_params,
+        bypass_late_layers=bypass_late_layers,
+        num_layers=num_layers,
     )
 
     selected_total_params = budget.selected_params
@@ -1456,7 +1465,9 @@ def compress_svd_llm(
         whitening_start_layer: int = 0,
         whitening_end_layer: Optional[int] = None,
         bypass_early_layers: int = 2,
+        bypass_late_layers: int = -1,
         bypass_ratio: float = 0.0,
+        max_ratio: float = 0.9,
         ratio_scope: Literal["selected", "all"] = "selected",
         offset: float = 1.5,
         eps: float = 1e-6,
@@ -1534,6 +1545,9 @@ def compress_svd_llm(
     print("=== FINAL DATASET STRUCTURE ===")
     print(calibration_dataset)
 
+    # Decoder depth, needed to resolve the last-N bypass window
+    num_decoder_layers = model.config.num_hidden_layers
+
     # Get list of sublayers that we want to compress
     layers_str = generate_paths(
         compress_mlp,
@@ -1541,7 +1555,7 @@ def compress_svd_llm(
         compress_att_k,
         compress_att_v,
         compress_att_out,
-        layers_number=model.config.num_hidden_layers,
+        layers_number=num_decoder_layers,
     )
     if len(layers_str) == 0:
         raise ValueError("No layers selected for compression")
@@ -1687,8 +1701,10 @@ def compress_svd_llm(
             target_ratio=ratio,
             bypass_early_layers=bypass_early_layers,
             bypass_ratio=bypass_ratio,
-            max_ratio=0.9,
+            max_ratio=max_ratio,
             target_total_params=target_total_params,
+            bypass_late_layers=bypass_late_layers,
+            num_layers=num_decoder_layers,
         ).active_ratio
         print(f"[BUDGET] Score probe ratio for active layers: {score_probe_ratio:.6f}")
         with torch.no_grad():
@@ -1698,7 +1714,13 @@ def compress_svd_llm(
                 desc=f"Step {steps_counter}/{steps}: Computing scores...",
             ):
                 # Skip scoring phase for bypassed layers
-                if is_bypassed_key(layers_str[i], bypass_early_layers):
+                is_bypassed = is_bypassed_key(
+                    layers_str[i],
+                    bypass_early_layers,
+                    bypass_late_layers,
+                    num_decoder_layers,
+                )
+                if is_bypassed:
                     continue
 
                 # Get weight and normalized whitening matrix
@@ -1753,8 +1775,10 @@ def compress_svd_llm(
             group_patterns=group_patterns,
             bypass_early_layers=bypass_early_layers,
             bypass_ratio=bypass_ratio,
-            max_ratio=0.9,
+            max_ratio=max_ratio,
             target_total_params=target_total_params,
+            bypass_late_layers=bypass_late_layers,
+            num_layers=num_decoder_layers,
         )
         torch.cuda.empty_cache()
         steps_counter += 1
@@ -1767,8 +1791,10 @@ def compress_svd_llm(
             target_ratio=ratio,
             bypass_early_layers=bypass_early_layers,
             bypass_ratio=bypass_ratio,
-            max_ratio=0.9,
+            max_ratio=max_ratio,
             target_total_params=target_total_params,
+            bypass_late_layers=bypass_late_layers,
+            num_layers=num_decoder_layers,
         )
         active_target_ratio = budget.active_ratio
 
@@ -2087,6 +2113,8 @@ def compress_svd_llm(
             sequential_update=sequential_update,
             sequential_update_method=sequential_update_method,
             is_v2=is_v2,
+            bypass_late_layers=bypass_late_layers,
+            max_ratio=max_ratio,
         )
 
         is_lora_update = sequential_update and sequential_update_method == "lora"

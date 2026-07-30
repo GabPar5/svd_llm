@@ -555,9 +555,33 @@ def get_layer_idx_from_key(key: str) -> int:
     match = re.search(r"\.layers\.(\d+)\.", key)
     return int(match.group(1)) if match else -1
 
-def is_bypassed_key(key: str, bypass_early_layers: int) -> bool:
+def is_bypassed_key(
+        key: str,
+        bypass_early_layers: int,
+        bypass_late_layers: int = -1,
+        num_layers: Optional[int] = None
+) -> bool:
+    """
+    Whether a matrix lives in a decoder layer excluded from redistribution.
+
+    Both ends can be bypassed in the same run. Resolving the tail needs the
+    decoder depth, so the late test is inert when `num_layers` is unknown.
+    """
     idx = get_layer_idx_from_key(key)
-    return 0 <= idx < bypass_early_layers
+
+    if idx < 0:
+        return False
+
+    if idx < bypass_early_layers:
+        return True
+
+    is_late_bypassed = (
+        bypass_late_layers > 0
+        and num_layers is not None
+        and idx >= num_layers - bypass_late_layers
+    )
+
+    return is_late_bypassed
 
 def make_captured_meta(captured: List[Dict]) -> List[Dict]:
     """Store only reusable metadata, not the layer input tensor itself"""
@@ -828,7 +852,9 @@ def compute_active_budget(
         bypass_early_layers: int,
         bypass_ratio: float,
         max_ratio: float = 0.9,
-        target_total_params: Optional[int] = None
+        target_total_params: Optional[int] = None,
+        bypass_late_layers: int = -1,
+        num_layers: Optional[int] = None
 ) -> ActiveBudget:
     """
     Split the global removal target between bypassed and active matrices.
@@ -844,8 +870,14 @@ def compute_active_budget(
 
     target_removed = target_ratio * target_total_params
 
-    bypassed_keys = [k for k in layers_str if is_bypassed_key(k, bypass_early_layers)]
-    active_keys = [k for k in layers_str if not is_bypassed_key(k, bypass_early_layers)]
+    bypassed_keys = [
+        k for k in layers_str
+        if is_bypassed_key(k, bypass_early_layers, bypass_late_layers, num_layers)
+    ]
+    active_keys = [
+        k for k in layers_str
+        if not is_bypassed_key(k, bypass_early_layers, bypass_late_layers, num_layers)
+    ]
 
     bypassed_removed = sum(param_count_map[k] * bypass_ratio for k in bypassed_keys)
     active_params = sum(param_count_map[k] for k in active_keys)
@@ -1445,7 +1477,9 @@ def build_run_name(
         bypass_early_layers: int,
         sequential_update: bool,
         sequential_update_method: str,
-        is_v2: bool
+        is_v2: bool,
+        bypass_late_layers: int = -1,
+        max_ratio: float = 0.9
 ) -> str:
     """
     Encode a whole compression configuration into one filename token.
@@ -1453,6 +1487,9 @@ def build_run_name(
     This name identifies the checkpoint, the evaluation JSON and the log file of
     a run, and `generate_tables.py` parses it back to label the result tables,
     so it has to stay stable.
+
+    Dimensions added after the original layout only emit a token when they leave
+    their default, which keeps every pre-existing run name byte-identical.
     """
     # Enum members hold their value as a plain string, keep the token stable
     group_criterion = str(getattr(group_criterion, "value", group_criterion))
@@ -1474,6 +1511,16 @@ def build_run_name(
         score_metric_str = "_" + score_metric.replace("|", "")
         group_criterion_str = f"_{group_criterion}"
 
+    # The bare-integer bypass token is kept whenever only the early end is used,
+    # so names already on disk keep parsing; both ends need a prefixed form
+    bypass_str = ""
+    if bypass_late_layers > 0:
+        bypass_str = f"_byp{max(0, bypass_early_layers)}-{bypass_late_layers}"
+    elif bypass_early_layers >= 0:
+        bypass_str = f"_{bypass_early_layers}"
+
+    max_ratio_str = "" if max_ratio == 0.9 else f"_cap{round(max_ratio, 2)}"
+
     parts = [
         sanitize_model_name(model_name),
         "_q" if compress_att_q else "",
@@ -1486,7 +1533,8 @@ def build_run_name(
         "_het" if heterogeneous else "_hom",
         group_criterion_str,
         score_metric_str,
-        f"_{bypass_early_layers}" if bypass_early_layers >= 0 else "",
+        bypass_str,
+        max_ratio_str,
         f"_upd_{sequential_update_method}" if sequential_update else "",
         "_v2" if is_v2 else "",
     ]

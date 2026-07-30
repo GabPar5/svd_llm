@@ -347,10 +347,22 @@ if __name__ == "__main__":
         help='Number of starting layers which bypass heterogeneous compression (or compression at all)',
     )
     parser.add_argument(
+        '--bypass_late_layers',
+        type=int,
+        default=-1,
+        help='Number of ending layers which bypass heterogeneous compression (or compression at all). Can be combined with --bypass_early_layers',
+    )
+    parser.add_argument(
         '--bypass_ratio',
         type=float,
         default=0.0,
-        help='Compression ratio for the bypassed layers',
+        help='Compression ratio for the bypassed layers, applied to both ends',
+    )
+    parser.add_argument(
+        '--max_ratio',
+        type=float,
+        default=0.9,
+        help='Upper bound on the compression ratio any single matrix may receive, shared by every allocation policy',
     )
     parser.add_argument(
         '--group_criterion',
@@ -525,6 +537,8 @@ if __name__ == "__main__":
             sequential_update=args.sequential_update,
             sequential_update_method=args.sequential_update_method,
             is_v2=args.run_v2,
+            bypass_late_layers=args.bypass_late_layers,
+            max_ratio=args.max_ratio,
         )
 
         dataset_name, dataset_subset, dataset_split = parse_dataset_spec(args.calibration_dataset)
@@ -573,7 +587,9 @@ if __name__ == "__main__":
             whitening_start_layer = args.whitening_start_layer,
             whitening_end_layer = args.whitening_end_layer,
             bypass_early_layers = args.bypass_early_layers,
+            bypass_late_layers = args.bypass_late_layers,
             bypass_ratio = args.bypass_ratio,
+            max_ratio = args.max_ratio,
             ratio_scope=args.ratio_scope,
             offset=args.offset,
             sequential_update=args.sequential_update,

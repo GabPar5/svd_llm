@@ -185,9 +185,11 @@ At least one target must be selected. `--use_compressed` without `--compressed_m
 | `--group_patterns` | `str` | see `--help` | Group definitions for `--group_criterion type`, as `groupName:weightType1,weightType2;...`. |
 | `--offset` | `float` | `1.5` | Offset added to scores so that `log(score + offset)` stays defined. |
 | `--bypass_early_layers` | `int` | `-1` | Number of initial decoder layers exempted from redistribution (`-1` disables the exemption). |
-| `--bypass_ratio` | `float` | `0.0` | Ratio assigned to the bypassed layers; `0.0` leaves them uncompressed. |
+| `--bypass_late_layers` | `int` | `-1` | Number of final decoder layers exempted from redistribution (`-1` disables the exemption). Can be combined with `--bypass_early_layers` to protect both ends in the same run. |
+| `--bypass_ratio` | `float` | `0.0` | Ratio assigned to the bypassed layers at either end; `0.0` leaves them uncompressed. |
+| `--max_ratio` | `float` | `0.9` | Upper bound on the ratio any single matrix may receive, shared by every allocation policy. |
 
-The removal budget is preserved in parameters, not in average ratio: bypassed layers are charged at `--bypass_ratio` and the remaining budget is redistributed over the active matrices, capped at 90% per matrix.
+The removal budget is preserved in parameters, not in average ratio: bypassed layers are charged at `--bypass_ratio` and the remaining budget is redistributed over the active matrices, capped at `--max_ratio` per matrix.
 
 ### Whitening & Calibration
 
@@ -267,10 +269,12 @@ output/
 Checkpoint, log and result filenames encode the whole configuration:
 
 ```
-<model>[_q][_k][_v][_out][_mlp]_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_upd_<method>][_v2]
+<model>[_q][_k][_v][_out][_mlp]_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_cap<max_ratio>][_upd_<method>][_v2]
 ```
 
 For example `Qwen_Qwen2.5_7B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_2_v2`. `generate_tables.py` parses this convention back into table columns, so keep the two in sync when changing it.
+
+The `<bypassed>` token is a bare integer when only `--bypass_early_layers` is used, and becomes `byp<early>-<late>` once `--bypass_late_layers` is set. `_cap<max_ratio>` appears only when `--max_ratio` leaves its `0.9` default. Both rules exist so that run names predating these options stay byte-identical.
 
 ---
 
