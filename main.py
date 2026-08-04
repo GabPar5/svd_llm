@@ -368,7 +368,28 @@ if __name__ == "__main__":
         '--group_criterion',
         type=str,
         default="type",
-        help='Criterion used to group weight matrices in heterogeneous setting. Possible values are "type", "global" and "decoder"',
+        choices=[criterion.value for criterion in GroupBy],
+        help=(
+            'Criterion used to group weight matrices in heterogeneous setting. "hierarchical" groups by decoder '
+            'block like "decoder" and additionally lets --outer_allocation score whole blocks by Block Influence'
+        ),
+    )
+    parser.add_argument(
+        '--inner_allocation',
+        type=str,
+        default=InnerAllocation.WATERFILL.value,
+        choices=[policy.value for policy in INNER_POLICIES],
+        help='Policy that splits a group budget across the matrices inside it. Only used in heterogeneous setting',
+    )
+    parser.add_argument(
+        '--outer_allocation',
+        type=str,
+        default=OuterAllocation.PARAM_SHARE.value,
+        choices=[policy.value for policy in OUTER_POLICIES],
+        help=(
+            'Policy that splits the budget across groups. "waterfill" needs --group_criterion hierarchical, since '
+            'only that criterion scores whole decoder blocks'
+        ),
     )
     parser.add_argument(
         '--group_patterns',
@@ -387,14 +408,44 @@ if __name__ == "__main__":
             "variants \"full_norm_tail_entropy\", \"full_norm_sq_tail_entropy\", "
             "\"full_norm_tail_eff_rank\" and \"full_norm_sq_tail_eff_rank\", plus "
             "\"norm|p\" for the p-Schatten norm of the truncated tail, where p is a "
-            "number, \"inf\" or \"-inf\""
+            "number, \"inf\" or \"-inf\". Prefixing any of them as "
+            "\"composite|<local>|block_influence\" fuses that spectral score with the "
+            "end-to-end influence of the decoder block, weighted by --fusion_alpha"
+        ),
+    )
+    parser.add_argument(
+        '--fusion_alpha',
+        type=float,
+        default=0.5,
+        help=(
+            'Weight of the end-to-end half of a composite score metric, in [0, 1]. 0 keeps the local score alone '
+            '(in log form), 1 the block influence alone. Ignored by non-composite metrics'
         ),
     )
     parser.add_argument(
         '--offset',
         type=float,
         default=1.5,
-        help='Offset added to scores to avoid log(x) with x <= 1',
+        help='Offset added to scores to avoid log(x) with x <= 1. Read by the "waterfill" inner policy',
+    )
+    parser.add_argument(
+        '--outer_offset',
+        type=float,
+        default=1.5,
+        help=(
+            'Same offset, applied to the per-block Block Influence by the "waterfill" outer policy. Kept separate '
+            'from --offset so that tuning how matrices compete inside a block cannot change how blocks compete'
+        ),
+    )
+    parser.add_argument(
+        '--softmax_temp',
+        type=float,
+        default=1.0,
+        help=(
+            'Temperature of the "softmax_temp" inner policy. Scores are min-max normalized to [0, 1] within each '
+            'group first, so the largest allocation weight exceeds the smallest by exp(1 / softmax_temp): 1.0 is '
+            'nearly uniform, 0.2 spreads moderately, 0.05 strongly'
+        ),
     )
     parser.add_argument(
         '--hf_token',
@@ -539,6 +590,8 @@ if __name__ == "__main__":
             is_v2=args.run_v2,
             bypass_late_layers=args.bypass_late_layers,
             max_ratio=args.max_ratio,
+            inner_allocation=args.inner_allocation,
+            outer_allocation=args.outer_allocation,
         )
 
         dataset_name, dataset_subset, dataset_split = parse_dataset_spec(args.calibration_dataset)
@@ -581,6 +634,8 @@ if __name__ == "__main__":
             score_metric=args.score_metric,
             heterogeneous = args.het,
             group_criterion = args.group_criterion,
+            inner_allocation = args.inner_allocation,
+            outer_allocation = args.outer_allocation,
             group_patterns = group_patterns_dict,
             hf_token = args.hf_token,
             whitening_only = args.whitening_only,
@@ -592,6 +647,9 @@ if __name__ == "__main__":
             max_ratio = args.max_ratio,
             ratio_scope=args.ratio_scope,
             offset=args.offset,
+            softmax_temp=args.softmax_temp,
+            outer_offset=args.outer_offset,
+            fusion_alpha=args.fusion_alpha,
             sequential_update=args.sequential_update,
             sequential_update_ridge=args.sequential_update_ridge,
             sequential_update_method=args.sequential_update_method,

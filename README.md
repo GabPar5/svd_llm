@@ -59,6 +59,27 @@ python main.py \
     --eval_tasks "wikitext,arc_easy,piqa|0"
 ```
 
+### Compress with the Hierarchical Allocator
+
+Split the budget across decoder blocks by their end-to-end Block Influence, then across each block's matrices by their local spectral scores:
+
+```bash
+python main.py \
+    --model "Qwen/Qwen2.5-7B" \
+    --save_path "./output" \
+    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
+    --compression_ratio 0.2 \
+    --het \
+    --group_criterion hierarchical \
+    --outer_allocation waterfill \
+    --inner_allocation waterfill \
+    --score_metric truncation \
+    --evaluate \
+    --eval_tasks "wikitext|0"
+```
+
+The Block Influence comes from the whitening cache, so this needs a whitening run to have happened first. Explore the allocation offline with `allocation_report.py` before spending GPU time on it.
+
 ### Evaluate a Compressed Model
 
 If you have already compressed a model and saved the `.pt` checkpoint, you can bypass the compression stage:
@@ -180,16 +201,61 @@ At least one target must be selected. `--use_compressed` without `--compressed_m
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--het` | `flag` | `False` | Enable heterogeneous compression ratio allocation. |
-| `--score_metric` | `str` | `truncation` | Weight importance metric: `truncation`, `entropy`, `eff_rank`, each with a squared-spectrum variant (`_sq`); the tail variants `full_norm_tail_entropy`, `full_norm_sq_tail_entropy`, `full_norm_tail_eff_rank`, `full_norm_sq_tail_eff_rank`; or `norm\|p` for the p-Schatten norm of the truncated tail, with `p` a number, `inf` or `-inf`. |
-| `--group_criterion` | `str` | `type` | Grouping used for redistribution: `type`, `global` or `decoder`. |
+| `--score_metric` | `str` | `truncation` | Weight importance metric: `truncation`, `entropy`, `eff_rank`, each with a squared-spectrum variant (`_sq`); the tail variants `full_norm_tail_entropy`, `full_norm_sq_tail_entropy`, `full_norm_tail_eff_rank`, `full_norm_sq_tail_eff_rank`; or `norm\|p` for the p-Schatten norm of the truncated tail, with `p` a number, `inf` or `-inf`. Any of them can be wrapped as `composite\|<local>\|block_influence`. |
+| `--fusion_alpha` | `float` | `0.5` | Weight of the end-to-end half of a composite metric, in `[0,1]`. Ignored by non-composite metrics. |
+| `--group_criterion` | `str` | `type` | Grouping used for redistribution: `type`, `global`, `decoder` or `hierarchical`. |
+| `--inner_allocation` | `str` | `waterfill` | Policy that splits a group's budget across the matrices inside it: `waterfill`, `drank_lagrangian`, `swift_pool` or `softmax_temp`. |
+| `--outer_allocation` | `str` | `param_share` | Policy that splits the budget across groups: `param_share` or `waterfill`. The latter requires `--group_criterion hierarchical`. |
 | `--group_patterns` | `str` | see `--help` | Group definitions for `--group_criterion type`, as `groupName:weightType1,weightType2;...`. |
-| `--offset` | `float` | `1.5` | Offset added to scores so that `log(score + offset)` stays defined. |
+| `--offset` | `float` | `1.5` | Offset added to scores so that `log(score + offset)` stays defined. Read by the `waterfill` inner policy. |
+| `--outer_offset` | `float` | `1.5` | The same offset applied to Block Influence by the `waterfill` outer policy. Kept separate so tuning how matrices compete inside a block cannot change how blocks compete. |
+| `--softmax_temp` | `float` | `1.0` | Temperature of `softmax_temp`. Scores are min-max normalized to `[0,1]` per group first, so the largest allocation weight exceeds the smallest by `exp(1 / softmax_temp)`. |
 | `--bypass_early_layers` | `int` | `-1` | Number of initial decoder layers exempted from redistribution (`-1` disables the exemption). |
 | `--bypass_late_layers` | `int` | `-1` | Number of final decoder layers exempted from redistribution (`-1` disables the exemption). Can be combined with `--bypass_early_layers` to protect both ends in the same run. |
 | `--bypass_ratio` | `float` | `0.0` | Ratio assigned to the bypassed layers at either end; `0.0` leaves them uncompressed. |
 | `--max_ratio` | `float` | `0.9` | Upper bound on the ratio any single matrix may receive, shared by every allocation policy. |
 
 The removal budget is preserved in parameters, not in average ratio: bypassed layers are charged at `--bypass_ratio` and the remaining budget is redistributed over the active matrices, capped at `--max_ratio` per matrix.
+
+Allocation is split into a shell and two pluggable policies. `allocate_ratios` owns grouping, the budget split and every `[BUDGET]` line; an **outer** policy then divides the budget across groups and an **inner** policy divides each group's share across its matrices. A policy declares what it needs — data and knobs alike — as ordinary named parameters, and the shell hands each one only what it declares, which is also how the run configuration sidecar records the knobs that actually shaped an allocation. Adding a policy therefore means writing the function and registering it in `INNER_POLICIES` / `OUTER_POLICIES`; the CLI advertises the registry, so no unimplemented choice is ever offered.
+
+#### Inner policies
+
+| Policy | Origin | Rule | Family |
+| --- | --- | --- | --- |
+| `waterfill` | SVD-LLM V2 Alg. 1, parameter-weighted | `ratio ∝ 1 / log(score + offset)` | ratio space |
+| `softmax_temp` | MoDeGPT Eq. 10-11 | `ratio ∝ softmax(−score / temp)`, the entropy-regularized optimum | ratio space |
+| `swift_pool` | Swift-SVD Alg. 2 | `ratio = max_ratio − pool · score / Σ(score · params)`, linear buy-back from the cap | ratio space |
+| `drank_lagrangian` | D-Rank Eq. 3-7 | `rank ∝ sqrt(score / ω)` with `ω = out + in`, the Lagrangian optimum of `Σ score/rank` | rank space |
+
+Every policy preserves the removal budget in parameters, `Σ paramsᵢ · ratioᵢ = budget`. Where a source preserves the *mean ratio* instead (SVD-LLM V2 and MoDeGPT both do), the parameter-weighted form here reduces to the original whenever the matrices in a group are the same size.
+
+The two families differ in what a score that carries no information implies. A ratio-space policy leaves every matrix at the flat ratio; `drank_lagrangian` does not, because one rank of a small matrix buys the same accuracy for fewer parameters, so it keeps favouring cheap-per-rank matrices regardless. On a group of identical shapes — which is what `--group_criterion type` produces, and what D-Rank itself assumes — the two families coincide. On a mixed group the bias is strong: at a 0.2 target with `--group_criterion decoder`, `drank_lagrangian` drives the attention projections to nearly dense and loads the budget onto the MLP.
+
+`swift_pool` drops Swift-SVD's `δ` rank floor in favour of the shared `--max_ratio`, which is a far lower floor than the paper's `δ = 0.5` (an effective cap of 0.6 at a 0.2 target, against 0.9), so it runs more aggressively than the original. Its `s = β^α · log(e + ε)^(1−α)` is a *score*, not part of the policy; reproducing Swift-SVD means pairing it with a composite score metric rather than a raw truncation score. The paper's 11-candidate grid search over `α` is not implemented — at about an hour per compression and evaluation it is not affordable.
+
+#### Composite scores
+
+`--score_metric composite|<local>|block_influence` fuses a per-matrix spectral score with the per-block Block Influence, following Swift-SVD Eq. 12:
+
+```
+s = β^α · log(e + local)^(1 − α)
+```
+
+`β` is min-max normalized across decoder blocks and shifted into `[1,2]`, and the local score passes through `log(e + ·)` so that both factors stay at or above 1 whatever metric produced it — a block can only ever raise a matrix's score, never zero it out. `--fusion_alpha 0` leaves the local score alone in log form, which is Swift-SVD's local-only candidate; `1` leaves the block importance alone. The composite fuses *after* the score pass, so `compute_spectrum_score` stays purely spectral and the pass itself is unchanged. The local half may carry its own separator (`composite|norm|3|block_influence`) — the grammar splits from the right.
+
+This is the scalar counterpart of `--group_criterion hierarchical`, and comparing the two is the point: the hierarchical allocator keeps the two signals separate at two granularities, while the composite collapses them into one number for a flat allocator.
+
+Two effects to expect rather than be surprised by:
+
+- **The fused score is much flatter than the raw one.** `β^0.5` spans `[1, 1.41]` while `log(e + local)` is typically 5 to 8 for a truncation score. On a small fixture the per-matrix ratio spread fell from a standard deviation of `0.111` to `0.021`. Under the same `--offset` a composite allocation therefore sits closer to homogeneous, which is a property of the fusion and not evidence that the second signal adds nothing. Pick an `--offset` for composite runs with `allocation_report.py` before spending GPU time.
+- **A per-block score cannot differentiate inside a block.** With `--group_criterion decoder` or `hierarchical`, `--fusion_alpha 1` makes every matrix in a block share a score and the allocation becomes exactly homogeneous. That is precisely the argument for the hierarchical allocator: an end-to-end signal can only do work at the outer level. `allocate_ratios` prints a `[BUDGET][WARNING]` whenever scores vary by less than 0.1% inside every group, so this cannot go unnoticed mid-run.
+
+#### The hierarchical outer level
+
+`--group_criterion hierarchical` groups by decoder block, exactly like `decoder`, and additionally exposes a per-block score to the outer policy: the **Block Influence** cached during whitening. With `--outer_allocation waterfill`, blocks that transform the residual stream more are asked for less removal and the budget they give up flows to the rest; each block's share is then divided among its matrices by the inner policy on local spectral scores. Two signals, two granularities.
+
+With the default `--outer_allocation param_share` the outer level expresses no preference and `hierarchical` reproduces `decoder` to the digit, which is the controlled baseline the outer level is measured against.
 
 ### Whitening & Calibration
 
@@ -273,6 +339,7 @@ output/
 │   ├── layer_importance.pt          # Block Influence per decoder block
 │   └── spectra/                     # cached raw singular values, one per matrix
 ├── activation_checkpoints/<model>/<v1|v2>/
+├── allocation_reports/<model>/      # CSV written by allocation_report.py
 ├── calibration_datasets/           # tokenized calibration data cache
 └── sequential_lora_trainer/        # HF Trainer checkpoints of the LoRA update
 ```
@@ -282,19 +349,19 @@ output/
 Checkpoint, log and result filenames encode the whole configuration:
 
 ```
-<model>[_q][_k][_v][_out][_mlp]_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_cap<max_ratio>][_upd_<method>][_v2]
+<model>[_q][_k][_v][_out][_mlp]_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_<inner_allocation>][_out<outer_allocation>][_cap<max_ratio>][_upd_<method>][_v2]
 ```
 
 For example `Qwen_Qwen2.5_7B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_2_v2`. `generate_tables.py` parses this convention back into table columns, so keep the two in sync when changing it.
 
-The `<bypassed>` token is a bare integer when only `--bypass_early_layers` is used, and becomes `byp<early>-<late>` once `--bypass_late_layers` is set. `_cap<max_ratio>` appears only when `--max_ratio` leaves its `0.9` default. Both rules exist so that run names predating these options stay byte-identical.
+The `<bypassed>` token is a bare integer when only `--bypass_early_layers` is used, and becomes `byp<early>-<late>` once `--bypass_late_layers` is set. `_<inner_allocation>` and `_out<outer_allocation>` appear only for a heterogeneous run that leaves the `waterfill` / `param_share` defaults, and both sit after `<bypassed>` so that token stays where `parse_filename` looks for it. `_cap<max_ratio>` appears only when `--max_ratio` leaves its `0.9` default. Every one of these rules exists so that run names predating the option stay byte-identical.
 
 ### Run Configuration Sidecar
 
 The filename is parsed positionally and cannot carry every dimension of a run, so each run also writes `<run_name>.config.json` next to its checkpoint and next to its evaluation JSON:
 
 - `args` — the resolved command line (`--hf_token` is never persisted).
-- `allocation` — target vs **realized** removal, per-matrix `ratio_map`, and the bypassed/active matrix counts. Written by the compression step, so it exists even for runs that never evaluate.
+- `allocation` — target vs **realized** removal, per-matrix `ratio_map`, the bypassed/active matrix counts, and the two policies together with the knobs that actually applied to them. Written by the compression step, so it exists even for runs that never evaluate.
 - `checkpoint_metadata` — the same metadata embedded in the `.pt`.
 
 `generate_tables.py` prefers this sidecar over `parse_filename` and falls back to filename parsing for runs that predate it, so old results keep tabulating unchanged. Sidecars are skipped when the input directory is globbed for results.
@@ -304,6 +371,40 @@ A run whose realized ratio drifts from its target by more than 0.1% prints a `[B
 ---
 
 ## Helper Scripts
+
+### `allocation_report.py`
+
+Explores compression-ratio allocations offline, from the spectra and Block Influence cached beside the whitening matrices. It replays the real `allocate_ratios` for any allocator × score × knob combination without a GPU and without loading model weights — matrix shapes come from the model config, every score is re-derived from its cached spectrum — so a whole sweep takes seconds against roughly an hour for one compression + evaluation run.
+
+```bash
+python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
+    --compression_ratio 0.2 --group_criterion decoder \
+    --sweep "score_metric=truncation,eff_rank_sq,entropy" \
+    --sweep "offset=1.5,3.0"
+```
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--model` | `str` | — | Model the spectra were cached for. Only its config is read. |
+| `--save_path` | `str` | `./output` | Root holding `whitening_matrices/`. |
+| `--whitening_mat_path` | `str` | `None` | Whitening directory to read, overriding the one derived from `--save_path` and `--model`. |
+| `--run_v2` | `flag` | `False` | Read the V2 artifacts instead of V1. |
+| `--compress_*` | `flag` | all | Restrict the report to some matrix families. Unlike `main.py`, giving none covers them all. |
+| `--sweep KEY=V1,V2` | `str` | `[]` | Sweep one knob over several values, repeatable, taken as a cartesian product. |
+| `--out_dir` | `str` | under `--save_path` | Where the CSV report is written. |
+| `--plots` | `flag` | `False` | Also render a PNG preview, when matplotlib happens to be installed. |
+
+Every allocation flag of `main.py` is accepted as the base configuration, and `--compression_ratio`, `--group_criterion`, `--inner_allocation`, `--outer_allocation`, `--score_metric`, `--offset`, `--outer_offset`, `--softmax_temp`, `--fusion_alpha`, `--max_ratio`, `--bypass_early_layers`, `--bypass_late_layers` and `--bypass_ratio` can be swept.
+
+Output is CSV rather than figures, so `pgfplots` consumes it directly in the thesis: `summary.csv` (one row per variant, with ratio dispersion and the score-to-ratio correlation), `matrices.csv` (per matrix: score, ratio, rank, truncation loss), `layers.csv` (per decoder layer, with its Block Influence) and `budget/<variant>.log` (the captured `[BUDGET]` instrumentation). Variants are ranked by **predicted truncation loss**, the total squared spectral energy the allocation discards, which after whitening is the theoretical activation reconstruction error — a proxy for ranking at equal budget, not a perplexity, since it ignores how errors compound across layers.
+
+Each variant is also checked against the invariants any policy must satisfy: realized removal matches the budget, ratios stay within `[0, --max_ratio]`, and the *value* of a constant score never changes the allocation. Two further checks apply only to ratio-space policies, which read nothing but the score: no group may give more removal to a higher-scoring matrix, and a constant score must collapse the allocation onto the flat ratio (the latter also requires a neutral outer level, since Block Influence is not flattened by it). A rank-space policy is exempt from both — it also prices a rank at `out + in`, and on a group of mixed shapes that can outweigh the score ordering, which is the family's bias rather than a defect.
+
+For every policy the mean Spearman correlation between score and assigned ratio is reported as a `score_ratio_rho` column instead: `−1` means the allocation is perfectly monotone in the score, and values closer to zero measure how much the shape weighting or the per-matrix cap pulls it away.
+
+Violations are reported per variant and the script exits non-zero; a budget drift usually means the configuration is infeasible (`--max_ratio` too low to reach the target once bypassed layers are charged), which is exactly what it is there to surface.
+
+The script also reports the Spearman correlation between Block Influence and normalized effective rank per matrix family. Swift-SVD reports these as negatively correlated, which is what justifies fusing them into one composite score; confirming the sign on the model at hand is a precondition for using that fusion.
 
 ### `generate_tables.py`
 

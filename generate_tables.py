@@ -87,6 +87,7 @@ MATRIX_TOKEN_MAP = {
 GROUPING_TOKENS = {
     "global": "global",
     "decoder": "decoder",
+    "hierarchical": "hierarchical",
     "type": "matrix_type",
     "matrix": "matrix",
     "matrix_type": "matrix",
@@ -106,6 +107,32 @@ SCORING_TOKENS = {
     "full_norm_tail_eff_rank": "full_norm_tail_eff_rank",
     "full_norm_sq_tail_eff_rank": "full_norm_sq_tail_eff_rank",
 }
+
+# Local halves a composite metric can fuse, and what it can fuse them with
+COMPOSITE_LOCAL_TOKENS = (
+    "truncation",
+    "truncation_sq",
+    "entropy",
+    "entropy_sq",
+    "eff_rank",
+    "eff_rank_sq",
+    "full_norm_tail_entropy",
+    "full_norm_sq_tail_entropy",
+    "full_norm_tail_eff_rank",
+    "full_norm_sq_tail_eff_rank",
+)
+END_TO_END_TOKENS = ( "block_influence", )
+
+# Both spellings resolve to the same label: the sidecar records the flag
+# verbatim, while a filename cannot hold its separator and joins with "_".
+# `norm|p` composites are left out because p is unbounded; those rows fall back
+# to the sidecar, which is preferred anyway
+SCORING_TOKENS.update({
+    spelling: f"composite_{local}_{end_to_end}"
+    for local in COMPOSITE_LOCAL_TOKENS
+    for end_to_end in END_TO_END_TOKENS
+    for spelling in ( f"composite|{local}|{end_to_end}", f"composite_{local}_{end_to_end}" )
+})
 
 SCHEME_TOKENS = {
     "het": "het",
@@ -246,6 +273,13 @@ def find_scoring(tokens: List[str], start_idx: int) -> Tuple[str, Optional[int],
         cand = "_".join(tokens[start_idx:end])
         if cand in SCORING_TOKENS:
             return SCORING_TOKENS[cand], start_idx, end - start_idx
+
+    # A composite name embeds its local half ("composite_truncation_..."), which
+    # the token-by-token fallback would happily mistake for the whole metric and
+    # then read the bypass count off the wrong position. An unrecognized
+    # composite is reported as such and left to the sidecar
+    if start_idx < len(tokens) and tokens[start_idx] == "composite":
+        return "unknown", None, 0
 
     # Fallback: scan token by token
     for i in range(start_idx, len(tokens)):

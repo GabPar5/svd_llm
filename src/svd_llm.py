@@ -1262,211 +1262,6 @@ def run_local_u_update(
 
     return model, updated_rank_map
 
-def allocate_ratios(
-        group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]],
-        score_map: Dict,
-        layers_str: List[str],
-        target_ratio: float,
-        param_count_map: Dict[str, int],
-        offset: float = 1.5,
-        group_patterns: Dict[str, List[str]] | None = None,
-        bypass_early_layers: int = 2,
-        bypass_ratio: float = 0.0,
-        max_ratio: float = 0.9,
-        target_total_params: Optional[int] = None,
-        bypass_late_layers: int = -1,
-        num_layers: Optional[int] = None
-) -> Dict[str, float]:
-    """
-    Redistributes compression budget within each weight group.
-    Groups: MLP (gate, up, down), Q proj, K proj, V proj, Attention out proj.
-
-    Within each group, matrices with higher score get a lower
-    compression ratio and vice versa.
-
-    Bypassed layers (the first `bypass_early_layers` and the last
-    `bypass_late_layers`, either or both) are mathematically isolated from
-    redistribution and strictly assigned the bypass_ratio. A bypass_ratio
-    of 0.0 means 0% parameter removal (no compression) for those layers.
-    In case some layers are bypassed, it still preserves
-    the global target_ratio across the entire model,
-    giving a higher compression ratio to allowed layers.
-
-    For same-shape TYPE groups, this reduces to the usual V2 behavior.
-    For GLOBAL and DECODER groups, this preserves actual removed parameters.
-    """
-    if isinstance(group_criterion, str):
-        try:
-            group_criterion = GroupBy(group_criterion)
-        except ValueError:
-            raise ValueError(
-                f"Invalid `group_criterion`: '{group_criterion}'. "
-                f"Expected one of: {[e.value for e in GroupBy]}",
-            )
-
-    print(f"\n[BUDGET] Parameter-aware redistribution: {group_criterion.value.upper()}")
-    print(f"[BUDGET] Global target ratio: {target_ratio:.6f}")
-    print(
-        f"[BUDGET] Bypassing first {bypass_early_layers} and last "
-        f"{bypass_late_layers} layers with ratio {bypass_ratio:.6f}",
-    )
-    print(f"[BUDGET] Per-matrix max ratio: {max_ratio:.6f}")
-
-    budget = compute_active_budget(
-        layers_str=layers_str,
-        param_count_map=param_count_map,
-        target_ratio=target_ratio,
-        bypass_early_layers=bypass_early_layers,
-        bypass_ratio=bypass_ratio,
-        max_ratio=max_ratio,
-        target_total_params=target_total_params,
-        bypass_late_layers=bypass_late_layers,
-        num_layers=num_layers,
-    )
-
-    selected_total_params = budget.selected_params
-    target_total_params = budget.target_total_params
-    active_keys = budget.active_keys
-    active_budget = budget.active_budget
-    active_target_ratio = budget.active_ratio
-
-    # Bypassed matrices are pinned before any redistribution happens
-    ratio_map: Dict[str, float] = {k: bypass_ratio for k in budget.bypassed_keys}
-
-    print(f"[BUDGET] Selected params:           {selected_total_params:,}")
-    print(f"[BUDGET] Target denominator params: {target_total_params:,}")
-    print(f"[BUDGET] Target removed params:     {budget.target_removed:,.0f}")
-    print(f"[BUDGET] Bypassed matrices:         {len(budget.bypassed_keys)}")
-    print(f"[BUDGET] Bypassed removed params:   {budget.bypassed_removed:,.0f}")
-    print(f"[BUDGET] Active matrices:           {len(active_keys)}")
-    print(f"[BUDGET] Active params:             {budget.active_params:,}")
-    print(f"[BUDGET] Active budget:             {active_budget:,.0f}")
-    print(f"[BUDGET] Active target ratio:       {active_target_ratio:.6f}")
-
-    groups: Dict[str, List[str]] = defaultdict(list)
-    missing_score_keys = []
-    unmatched_keys = []
-
-    match group_criterion:
-        case GroupBy.GLOBAL:
-            for key in active_keys:
-                if key in score_map:
-                    groups["global"].append(key)
-                else:
-                    missing_score_keys.append(key)
-
-        case GroupBy.DECODER:
-            for key in active_keys:
-                if key not in score_map:
-                    missing_score_keys.append(key)
-                    continue
-
-                layer_idx = get_layer_idx_from_key(key)
-                groups[f"layer_{layer_idx}"].append(key)
-
-        case GroupBy.TYPE:
-            if group_patterns is None:
-                raise ValueError("`group_patterns` required for GroupBy.TYPE")
-
-            for key in active_keys:
-                if key not in score_map:
-                    missing_score_keys.append(key)
-                    continue
-
-                group_name = None
-                for name, patterns in group_patterns.items():
-                    if any(p in key for p in patterns):
-                        group_name = name
-                        break
-
-                if group_name is None:
-                    unmatched_keys.append(key)
-                else:
-                    groups[group_name].append(key)
-
-    grouped_keys = set()
-    for keys in groups.values():
-        grouped_keys.update(keys)
-
-    fallback_keys = [k for k in active_keys if k not in grouped_keys]
-
-    # Fallback keys get the active target ratio
-    fallback_removed = 0.0
-    for k in fallback_keys:
-        ratio_map[k] = active_target_ratio
-        fallback_removed += param_count_map[k] * active_target_ratio
-
-    remaining_budget = max(0.0, active_budget - fallback_removed)
-    grouped_params = sum(param_count_map[k] for k in grouped_keys)
-
-    print(f"[BUDGET] Grouped active params:    {grouped_params:,}")
-    print(f"[BUDGET] Fallback keys:            {len(fallback_keys)}")
-    print(f"[BUDGET] Remaining group budget:   {remaining_budget:,.0f}")
-
-    for group_name, keys in groups.items():
-        if not keys:
-            print(f"  [GROUP: {group_name}] Empty")
-            continue
-
-        group_params = sum(param_count_map[k] for k in keys)
-
-        # Allocate the global active budget to groups proportional to params
-        group_budget = (
-            remaining_budget * group_params / grouped_params
-            if grouped_params > 0
-            else 0.0
-        )
-
-        # TODO understand well how it works
-        group_ratio_map = allocate_param_weighted_group(
-            keys=keys,
-            score_map=score_map,
-            param_count_map=param_count_map,
-            group_budget=group_budget,
-            max_ratio=max_ratio,
-            offset=offset,
-        )
-
-        ratio_map.update(group_ratio_map)
-
-        actual_group_removed = sum(
-            param_count_map[k] * ratio_map[k]
-            for k in keys
-        )
-
-        print(
-            f"  [GROUP: {group_name}] "
-            f"matrices={len(keys):>3} | "
-            f"params={group_params:>14,} | "
-            f"budget={group_budget:>14,.0f} | "
-            f"actual_removed~{actual_group_removed:>14,.0f}",
-        )
-
-        for k in keys:
-            print(
-                f"    - {k:<55} "
-                f"| params={param_count_map[k]:>12,} "
-                f"| ratio={ratio_map[k]:.6f} "
-                f"| score={score_map[k]:.6f} (+ offset = {(score_map[k] + offset):.6f})",
-            )
-
-    actual_removed = sum(
-        param_count_map[k] * ratio_map.get(k, 0.0)
-        for k in layers_str
-    )
-
-    print("\n[BUDGET] Allocation Summary:")
-    print(f"  - Target overall ratio:                 {target_ratio:.6f}")
-    print(f"  - Actual selected ratio approx: {actual_removed / selected_total_params:.6f}")
-    print(f"  - Actual overall ratio approx:  {actual_removed / target_total_params:.6f}")
-    print(f"  - Target removed:               {budget.target_removed:,.0f}")
-    print(f"  - Actual removed:               {actual_removed:,.0f}")
-    print(f"  - Missing score keys:           {len(missing_score_keys)}")
-    print(f"  - Unmatched keys:               {len(unmatched_keys)}")
-    print("-" * 80 + "\n")
-
-    return ratio_map
-
 # Compress model with SVD-LLM
 def compress_svd_llm(
         model_name: str,
@@ -1488,7 +1283,9 @@ def compress_svd_llm(
         compress_att_out: bool = False,
         score_metric: Union[ScoreMetric, Literal["truncation", "truncation_sq", "entropy", "entropy_sq", "eff_rank", "eff_rank_sq", "norm|p"]] = "truncation",
         heterogeneous: bool = False,
-        group_criterion: Union[GroupBy, Literal["global", "decoder", "type"]] = "type",
+        group_criterion: Union[GroupBy, Literal["global", "decoder", "type", "hierarchical"]] = "type",
+        inner_allocation: Union[InnerAllocation, str] = InnerAllocation.WATERFILL,
+        outer_allocation: Union[OuterAllocation, str] = OuterAllocation.PARAM_SHARE,
         group_patterns: Dict[str, List[str]] | None = None,
         hf_token: Optional[str] = None,
         whitening_only: bool = False,
@@ -1500,6 +1297,9 @@ def compress_svd_llm(
         max_ratio: float = 0.9,
         ratio_scope: Literal["selected", "all"] = "selected",
         offset: float = 1.5,
+        softmax_temp: float = 1.0,
+        outer_offset: float = 1.5,
+        fusion_alpha: float = 0.5,
         eps: float = 1e-6,
         sequential_update: bool = False,
         sequential_update_ridge: float = 1e-6,
@@ -1597,6 +1397,13 @@ def compress_svd_llm(
         layers_list=layers_list,
         attributes=attributes,
         include_bias=False,
+    )
+
+    # Rank-space policies price a rank at out + in, which the counts do not carry
+    shape_map = build_shape_map(
+        layers_str=layers_str,
+        layers_list=layers_list,
+        attributes=attributes,
     )
 
     # Overall count of parameters of sublayers that we want to compress
@@ -1712,7 +1519,28 @@ def compress_svd_llm(
     # TODO put all into one loop, exclude scoring pass for homogeneous. Perform only one svd of D, there's no need of doing one svdvals and one svd
     # TODO try with covariance matrix - done, to monitor
     # Compression ratio allocation
+    allocation_policies = None
+
     if heterogeneous:
+        # Resolved up front so an unknown policy fails before the score pass,
+        # and so the run records the knobs that actually shaped its allocation
+        allocation_policies = resolve_allocation_policies(
+            inner_allocation,
+            outer_allocation,
+            allocation_knobs(offset=offset, softmax_temp=softmax_temp, outer_offset=outer_offset),
+        )
+
+        # The outer level of the hierarchical allocator scores whole decoder
+        # blocks, which is what Block Influence measures; it rode along on the
+        # whitening replay, so this is a read rather than another forward pass
+        importance_map = load_layer_importance(
+            wm_dir=wm_source_dir,
+            model_name=model_name,
+            version_str=version_str,
+            n_tokens=n_calibration_tokens,
+            num_layers=num_decoder_layers,
+        )
+
         # Compute SVD for all layers and collect score metric
         vram_usage("Before performing scores calculation")
 
@@ -1727,6 +1555,18 @@ def compress_svd_llm(
                 )
 
         print(f"\n[DEBUG] Score metric is: {score_metric.value.upper()}")
+
+        # A composite metric scores the spectrum with its local half and fuses
+        # the block-level signal in afterwards, so the pass itself is unchanged
+        composite_metric = parse_composite_metric(score_metric)
+        local_score_metric = score_metric
+
+        if composite_metric is not None:
+            local_score_metric = composite_metric.local
+            print(
+                f"[DEBUG] Composite score: {local_score_metric.value} fused with "
+                f"{composite_metric.end_to_end} at alpha={fusion_alpha}",
+            )
 
         score_map = {}
         steps: int = 2
@@ -1814,7 +1654,7 @@ def compress_svd_llm(
                 L = L * math.sqrt(n_calibration_tokens)
 
                 # Calculate score metric
-                score_map[layers_str[i]] = compute_spectrum_score(score_metric, L, rank, eps)
+                score_map[layers_str[i]] = compute_spectrum_score(local_score_metric, L, rank, eps)
 
                 # Free up vram and ram
                 W = whitening_matrix = WS = L = U_s = L_s = L_s_sqrt = D = None
@@ -1824,6 +1664,13 @@ def compress_svd_llm(
             f"[SPECTRA] {cached_spectra}/{len(score_map)} spectra served from cache "
             f"in {spectra_dir(wm_source_dir)}",
         )
+
+        if composite_metric is not None:
+            score_map = compose_scores(score_map, importance_map, fusion_alpha)
+            print(
+                f"[SCORE] Fused {len(score_map)} local scores with Block Influence, "
+                f"range [{min(score_map.values()):.6f}, {max(score_map.values()):.6f}]",
+            )
 
         # Allocate compression ratios to each layer based on score metric
         ratio_map = allocate_ratios(
@@ -1840,6 +1687,12 @@ def compress_svd_llm(
             target_total_params=target_total_params,
             bypass_late_layers=bypass_late_layers,
             num_layers=num_decoder_layers,
+            inner_allocation=inner_allocation,
+            outer_allocation=outer_allocation,
+            shape_map=shape_map,
+            importance_map=importance_map,
+            softmax_temp=softmax_temp,
+            outer_offset=outer_offset,
         )
         torch.cuda.empty_cache()
         steps_counter += 1
@@ -1895,6 +1748,7 @@ def compress_svd_llm(
         target_total_params=target_total_params,
         bypassed_keys=allocation_budget.bypassed_keys,
         active_keys=allocation_budget.active_keys,
+        policies=allocation_policies,
     )
 
     # Allocation policies are only comparable at equal realized compression, so a
