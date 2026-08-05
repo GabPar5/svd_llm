@@ -26,7 +26,7 @@ from collections import defaultdict
 from contextlib import redirect_stdout
 from scipy.stats import spearmanr
 from transformers import AutoConfig # pyright: ignore[reportPrivateImportUsage]
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 # Deviation from the target removal above which a variant is not comparable to
 # the others, matching the threshold `compress_svd_llm` warns at
@@ -90,7 +90,9 @@ class VariantResult(NamedTuple):
     score_map: Dict[str, float]
     budget_log: str
     realized_ratio: float
-    predicted_loss: float
+    objectives: Dict[str, float]
+    target_removed: float
+    active_keys: List[str]
     checks: List[str]
     score_ratio_rho: float
 
@@ -179,7 +181,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument('--out_dir', type=str, default=None, help='Where to write the CSV report, defaults under --save_path')
-    parser.add_argument('--plots', action='store_true', help='Also render PNG previews, when matplotlib is installed')
+    parser.add_argument(
+        '--plots',
+        action='store_true',
+        help='Also render PNG previews of every figure, when matplotlib is installed. The figure CSVs are written either way',
+    )
 
     return parser.parse_args()
 
@@ -396,29 +402,323 @@ def build_score_map(
     return score_map
 
 
-def predicted_truncation_loss(inputs: Inputs, ratio_map: Dict[str, float]) -> float:
-    """
-    Total squared energy the allocation throws away, summed over all matrices.
+def rescaled_spectrum(inputs: Inputs, key: str) -> torch.Tensor:
+    """Undo the cache's normalization, exactly as the score pass does"""
+    return inputs.spectra[key].to(torch.float64) * math.sqrt(inputs.n_calibration_tokens)
 
-    After whitening this is the theoretical activation reconstruction error, so
-    it ranks allocations at equal budget without compressing anything. It is a
-    proxy, not a perplexity: it ignores how errors compound across layers.
-    """
-    total = 0.0
 
-    for key, ratio in ratio_map.items():
+def retained_ranks(inputs: Inputs, ratio_map: Dict[str, float]) -> Dict[str, int]:
+    """
+    Rank each matrix keeps under an allocation.
+
+    A ratio of exactly 0.0 leaves the layer dense, so it keeps its whole
+    spectrum rather than dropping out of the accounting: an allocation that
+    spends its budget elsewhere has to be credited for what it left alone.
+    """
+    ranks: Dict[str, int] = {}
+
+    for key in inputs.layers_str:
         spectrum = inputs.spectra.get(key)
 
-        # A ratio of exactly 0.0 leaves the layer dense, no SVD and no loss
-        if spectrum is None or ratio <= 0.0:
+        if spectrum is None:
+            continue
+
+        ratio = ratio_map.get(key, 0.0)
+
+        if ratio <= 0.0:
+            ranks[key] = len(spectrum)
             continue
 
         out_features, in_features = inputs.shapes[key]
-        rank = truncation_rank(out_features, in_features, ratio, len(spectrum))
-        rescaled = spectrum.to(torch.float64) * math.sqrt(inputs.n_calibration_tokens)
-        total += float(rescaled[rank:].pow(2).sum().item())
+        ranks[key] = truncation_rank(out_features, in_features, ratio, len(spectrum))
+
+    return ranks
+
+
+def objective_frobenius_tail(inputs: Inputs, ratio_map: Dict[str, float]) -> float:
+    """Squared energy discarded, summed over matrices. The whitened reconstruction error"""
+    return sum(
+        float(rescaled_spectrum(inputs, key)[rank:].pow(2).sum())
+        for key, rank in retained_ranks(inputs, ratio_map).items()
+    )
+
+
+def objective_nuclear_tail(inputs: Inputs, ratio_map: Dict[str, float]) -> float:
+    """Discarded magnitude rather than energy, so a long thin tail costs more"""
+    return sum(
+        float(rescaled_spectrum(inputs, key)[rank:].sum())
+        for key, rank in retained_ranks(inputs, ratio_map).items()
+    )
+
+
+def objective_spectral_tail(inputs: Inputs, ratio_map: Dict[str, float]) -> float:
+    """
+    Largest single direction any matrix throws away.
+
+    A minimax rather than a sum, so unlike every other objective here it is
+    driven by the one worst matrix and ignores how the rest were treated.
+    """
+    worst = 0.0
+
+    for key, rank in retained_ranks(inputs, ratio_map).items():
+        spectrum = rescaled_spectrum(inputs, key)
+
+        if rank < len(spectrum):
+            worst = max(worst, float(spectrum[rank]))
+
+    return worst
+
+
+def objective_relative_energy_lost(inputs: Inputs, ratio_map: Dict[str, float]) -> float:
+    """
+    Mean per-matrix fraction of energy discarded.
+
+    Scale free, which is what separates it from the Frobenius tail: there the
+    few largest matrices dominate the total whatever happens to the rest.
+    """
+    fractions = []
+
+    for key, rank in retained_ranks(inputs, ratio_map).items():
+        energy = inputs.spectra[key].to(torch.float64).pow(2)
+        total = float(energy.sum())
+
+        if total > 0.0:
+            fractions.append(float(energy[rank:].sum()) / total)
+
+    return sum(fractions) / len(fractions) if fractions else 0.0
+
+
+def objective_eff_rank_lost(inputs: Inputs, ratio_map: Dict[str, float]) -> float:
+    """
+    Mean per-matrix fraction of effective rank lost.
+
+    Measures how much of the spectrum's *diversity* the truncation removes,
+    which a matrix with one dominant direction can lose almost none of even
+    under a heavy ratio.
+    """
+    losses = []
+
+    for key, rank in retained_ranks(inputs, ratio_map).items():
+        spectrum = inputs.spectra[key].to(torch.float64)
+        full = float(torch.exp(spectrum_entropy(normalized_spectrum(spectrum, squared=True))))
+        kept = float(torch.exp(spectrum_entropy(normalized_spectrum(spectrum[:rank], squared=True))))
+
+        if full > 0.0:
+            losses.append(1.0 - kept / full)
+
+    return sum(losses) / len(losses) if losses else 0.0
+
+
+def objective_influence_tail(inputs: Inputs, ratio_map: Dict[str, float]) -> float:
+    """
+    Relative energy discarded, weighted by the Block Influence of each block.
+
+    The only objective here that is not a function of the spectra alone. Block
+    Influence is measured on the dense model's residual stream, so no local
+    score can reproduce it, which is what makes this the one end-to-end reading
+    available without a GPU.
+    """
+    if not inputs.importance:
+        return float("nan")
+
+    total = 0.0
+
+    for key, rank in retained_ranks(inputs, ratio_map).items():
+        influence = inputs.importance.get(get_layer_idx_from_key(key))
+
+        if influence is None:
+            continue
+
+        energy = inputs.spectra[key].to(torch.float64).pow(2)
+        denominator = float(energy.sum())
+
+        if denominator > 0.0:
+            total += influence * float(energy[rank:].sum()) / denominator
 
     return total
+
+
+def marginal_frobenius(inputs: Inputs, key: str) -> torch.Tensor:
+    return rescaled_spectrum(inputs, key).pow(2)
+
+
+def marginal_nuclear(inputs: Inputs, key: str) -> torch.Tensor:
+    return rescaled_spectrum(inputs, key)
+
+
+def marginal_relative_energy(inputs: Inputs, key: str) -> torch.Tensor:
+    energy = inputs.spectra[key].to(torch.float64).pow(2)
+    total = float(energy.sum())
+    scale = len([k for k in inputs.layers_str if k in inputs.spectra])
+    return energy / (total * scale) if total > 0.0 and scale else torch.zeros_like(energy)
+
+
+def marginal_influence(inputs: Inputs, key: str) -> torch.Tensor:
+    energy = inputs.spectra[key].to(torch.float64).pow(2)
+    total = float(energy.sum())
+    influence = (inputs.importance or {}).get(get_layer_idx_from_key(key), 0.0)
+    return energy * influence / total if total > 0.0 else torch.zeros_like(energy)
+
+
+class Objective(NamedTuple):
+    """
+    One way of pricing an allocation. All are oriented so that lower is better.
+
+    `marginal` gives the loss of discarding each singular direction of a matrix,
+    and only an objective that is a plain sum over directions has one. Those are
+    exactly the objectives the greedy oracle below can solve.
+
+    `circular_with` names the score metrics that optimize this objective by
+    construction. A variant scored by one of them starts with a structural
+    advantage here, which is the whole reason the report never ranks on a single
+    objective.
+    """
+    name: str
+    aggregate: Callable[[Inputs, Dict[str, float]], float]
+    marginal: Optional[Callable[[Inputs, str], torch.Tensor]]
+    circular_with: str
+
+
+OBJECTIVES = (
+    Objective("frobenius_tail", objective_frobenius_tail, marginal_frobenius, "truncation, truncation_sq"),
+    Objective("nuclear_tail", objective_nuclear_tail, marginal_nuclear, "norm|1"),
+    Objective("spectral_tail", objective_spectral_tail, None, "norm|inf"),
+    Objective("relative_energy_lost", objective_relative_energy_lost, marginal_relative_energy, "-"),
+    Objective("eff_rank_lost", objective_eff_rank_lost, None, "eff_rank, eff_rank_sq"),
+    Objective("influence_tail", objective_influence_tail, marginal_influence, "composite|...|block_influence"),
+)
+
+
+def oracle_cost(
+        inputs: Inputs,
+        objective: Objective,
+        target_removed: float,
+        active_keys: List[str],
+        max_ratio: float
+) -> float:
+    """
+    Lowest this objective can reach over the same matrices, budget and cap.
+
+    An additive objective is minimized by discarding directions in ascending
+    order of loss per parameter removed. The loss of a direction decreases with
+    its index, so that ordering always discards a contiguous tail from each
+    matrix and the result is realizable as a rank truncation.
+
+    What it ignores is the grouping: it may spend the whole budget on a handful
+    of matrices and leave the rest dense. These objectives really are minimized
+    by that degenerate allocation, so the ratio to the bound runs to six figures
+    and says nothing about how good an allocation is in absolute terms.
+
+    Its use is normalization across budgets. A sweep over `compression_ratio`
+    moves the raw objective by orders of magnitude, which drowns the difference
+    between two policies at the same ratio; dividing by the bound removes the
+    budget's own contribution and leaves them comparable. Within one budget the
+    bound is a constant, so it never reorders anything.
+    """
+    if objective.marginal is None or not math.isfinite(target_removed):
+        return float("nan")
+
+    weights: List[torch.Tensor] = []
+    costs: List[torch.Tensor] = []
+
+    for key in active_keys:
+        if key not in inputs.spectra:
+            continue
+
+        out_features, in_features = inputs.shapes[key]
+        # The cap bounds how far any single matrix may be truncated, and it
+        # already clamps the rank to at least 1, so the leading direction is
+        # never discardable
+        floor_rank = truncation_rank(out_features, in_features, max_ratio, len(inputs.spectra[key]))
+        weight = objective.marginal(inputs, key)[floor_rank:]
+
+        if not len(weight):
+            continue
+
+        weights.append(weight)
+        costs.append(torch.full_like(weight, float(out_features + in_features)))
+
+    if not weights:
+        return float("nan")
+
+    weight = torch.cat(weights)
+    cost = torch.cat(costs)
+    order = torch.argsort(weight / cost)
+    cumulative = torch.cumsum(cost[order], dim=0)
+    taken = int(torch.searchsorted(cumulative, torch.tensor(target_removed, dtype=torch.float64)).item()) + 1
+
+    return float(weight[order][:taken].sum())
+
+
+def mean_objective_rank(ranks: Dict[str, Dict[str, float]], variant_name: str) -> float:
+    """
+    Average rank of one variant across the objectives that could price it.
+
+    Averaging ranks rather than values is what makes the objectives comparable
+    at all: they carry different units and span different orders of magnitude,
+    so no weighted sum of them would mean anything.
+    """
+    values = [
+        ranks[objective.name][variant_name] for objective in OBJECTIVES
+        if not math.isnan(ranks[objective.name][variant_name])
+    ]
+
+    return sum(values) / len(values) if values else float("nan")
+
+
+def compute_oracles(
+        inputs: Inputs,
+        variants: List[Variant],
+        results: Dict[str, VariantResult]
+) -> Dict[str, Dict[str, float]]:
+    """
+    Lower bound per variant per objective, at that variant's own budget.
+
+    A sweep over `compression_ratio` gives its variants different budgets, so
+    one oracle per objective would not be comparable across them. The bound only
+    depends on the budget, which is what the cache keys on.
+    """
+    cache: Dict[Tuple[str, int, float, int], float] = {}
+    oracles: Dict[str, Dict[str, float]] = {}
+
+    for variant in variants:
+        result = results[variant.name]
+        target = result.target_removed
+        max_ratio = variant.config["max_ratio"]
+        per_objective: Dict[str, float] = {}
+
+        for objective in OBJECTIVES:
+            cache_key = (
+                objective.name,
+                int(round(target)) if math.isfinite(target) else -1,
+                max_ratio,
+                hash(tuple(sorted(result.active_keys))),
+            )
+
+            if cache_key not in cache:
+                cache[cache_key] = oracle_cost(inputs, objective, target, result.active_keys, max_ratio)
+
+            per_objective[objective.name] = cache[cache_key]
+
+        oracles[variant.name] = per_objective
+
+    return oracles
+
+
+def rank_variants(values: Dict[str, float]) -> Dict[str, float]:
+    """
+    Competition ranks over one objective, 1 being best, ties sharing a rank.
+
+    NaN stays NaN rather than sorting to an end, so a variant an objective could
+    not price does not silently look either best or worst at it.
+    """
+    finite = {name: value for name, value in values.items() if not math.isnan(value)}
+    ordered = sorted(finite.values())
+
+    return {
+        name: float(ordered.index(value) + 1) if name in finite else float("nan")
+        for name, value in values.items()
+    }
 
 
 def allocate(inputs: Inputs, config: Dict[str, Any], group_patterns: Dict[str, List[str]], score_map: Dict[str, float]) -> Tuple[Dict[str, float], str]:
@@ -575,7 +875,9 @@ def evaluate_variant(
         score_map=score_map,
         budget_log=budget_log,
         realized_ratio=removed / inputs.target_total_params if inputs.target_total_params else 0.0,
-        predicted_loss=predicted_truncation_loss(inputs, ratio_map),
+        objectives={objective.name: objective.aggregate(inputs, ratio_map) for objective in OBJECTIVES},
+        target_removed=budget.target_removed,
+        active_keys=list(budget.active_keys),
         checks=checks,
         score_ratio_rho=score_ratio_rho,
     )
@@ -586,7 +888,9 @@ def write_reports(
         inputs: Inputs,
         variants: List[Variant],
         results: Dict[str, VariantResult],
-        baseline_loss: float
+        ranks: Dict[str, Dict[str, float]],
+        mean_rank: Dict[str, float],
+        oracles: Dict[str, Dict[str, float]]
 ) -> None:
     """One row per variant, per matrix and per decoder layer, ready for pgfplots"""
     os.makedirs(out_dir, exist_ok=True)
@@ -596,9 +900,14 @@ def write_reports(
     summary_path = os.path.join(out_dir, "summary.csv")
     with open(summary_path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
+        objective_columns = [
+            column
+            for objective in OBJECTIVES
+            for column in ( objective.name, f"{objective.name}_rank", f"{objective.name}_oracle_ratio" )
+        ]
         writer.writerow([
             "variant", *sorted(SWEEPABLE), "outer_allocation", "ratio_scope",
-            "realized_ratio", "predicted_loss", "loss_vs_best",
+            "realized_ratio", "mean_rank", *objective_columns,
             "min_ratio", "max_ratio_assigned", "mean_ratio", "ratio_std",
             "score_ratio_rho", "checks",
         ])
@@ -610,14 +919,32 @@ def write_reports(
                 dtype=torch.float64,
             )
 
+            objective_cells: List[str] = []
+            for objective in OBJECTIVES:
+                value = result.objectives[objective.name]
+                rank = ranks[objective.name][variant.name]
+                oracle = oracles[variant.name][objective.name]
+                gap = ""
+
+                # Only meaningful where a lower bound exists and is not
+                # zero, which rules out the non-additive objectives
+                if math.isfinite(value) and math.isfinite(oracle) and oracle > 0.0:
+                    gap = f"{value / oracle:.6f}"
+
+                objective_cells += [
+                    f"{value:.6e}" if math.isfinite(value) else "",
+                    f"{rank:.0f}" if not math.isnan(rank) else "",
+                    gap,
+                ]
+
             writer.writerow([
                 variant.name,
                 *[variant.config[key] for key in sorted(SWEEPABLE)],
                 variant.config["outer_allocation"],
                 variant.config["ratio_scope"],
                 f"{result.realized_ratio:.6f}",
-                f"{result.predicted_loss:.6e}",
-                f"{result.predicted_loss / baseline_loss:.6f}" if baseline_loss > 0 else "",
+                f"{mean_rank[variant.name]:.4f}" if not math.isnan(mean_rank[variant.name]) else "",
+                *objective_cells,
                 f"{ratios.min().item():.6f}",
                 f"{ratios.max().item():.6f}",
                 f"{ratios.mean().item():.6f}",
@@ -749,35 +1076,310 @@ def report_importance(inputs: Inputs) -> None:
     )
 
 
-def render_plots(out_dir: str, inputs: Inputs, variants: List[Variant], results: Dict[str, VariantResult]) -> None:
-    """PNG previews, when matplotlib is around. The CSV is the real deliverable"""
+def load_pyplot() -> Optional[Any]:
+    """`pyplot` on the Agg backend, or None when matplotlib is not installed"""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         print(
-            "\n[REPORT] matplotlib is not installed, so no PNG was rendered. "
-            "The CSV files feed pgfplots directly, which is what the thesis uses",
+            "\n[REPORT] matplotlib is not installed, so no PNG was rendered. Every figure "
+            "still wrote its CSV, which is what the thesis consumes through pgfplots",
         )
+        return None
+
+    return plt
+
+
+def write_figure_csv(fig_dir: str, name: str, header: List[str], rows: List[List[Any]]) -> None:
+    with open(os.path.join(fig_dir, f"{name}.csv"), "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def save_figure(fig_dir: str, name: str, figure: Any, plt: Any) -> None:
+    figure.tight_layout()
+    figure.savefig(os.path.join(fig_dir, f"{name}.png"), dpi=150)
+    plt.close(figure)
+
+
+def present_matrix_types(inputs: Inputs) -> List[str]:
+    """The matrix families this report actually covers, in a stable order"""
+    present = {matrix_type_of(key) for key in inputs.layers_str}
+    return [matrix_type for matrix_type in MATRIX_TYPES if matrix_type in present]
+
+
+def keys_by_layer(inputs: Inputs) -> Dict[int, List[str]]:
+    per_layer: Dict[int, List[str]] = defaultdict(list)
+
+    for key in inputs.layers_str:
+        per_layer[get_layer_idx_from_key(key)].append(key)
+
+    return per_layer
+
+
+def swept_keys(variants: List[Variant]) -> List[str]:
+    """Knobs that actually vary across the sweep, which is what a curve plots against"""
+    return [
+        key for key in sorted(SWEEPABLE)
+        if len({variant.config[key] for variant in variants}) > 1
+    ]
+
+
+def normalized_effective_rank(spectrum: torch.Tensor) -> float:
+    """Effective rank as a fraction of the full rank, so shapes stay comparable"""
+    spectrum = spectrum.to(torch.float64)
+    return float(torch.exp(spectrum_entropy(normalized_spectrum(spectrum, squared=True)))) / len(spectrum)
+
+
+def figure_scores_by_depth(fig_dir: str, inputs: Inputs, variants: List[Variant], results: Dict[str, VariantResult], plt: Any) -> None:
+    """
+    Score against decoder depth, one line per matrix family.
+
+    Min-max normalized within each family, because the raw scores of a q
+    projection and a down projection differ by orders of magnitude and would
+    otherwise plot as two flat lines at opposite ends.
+    """
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        score_map = results[variant.name].score_map
+
+        for matrix_type in present_matrix_types(inputs):
+            scored = [
+                ( get_layer_idx_from_key(key), score_map[key] )
+                for key in inputs.layers_str
+                if matrix_type_of(key) == matrix_type and key in score_map
+            ]
+
+            if not scored:
+                continue
+
+            values = [value for _, value in scored]
+            lowest, span = min(values), max(values) - min(values)
+
+            for layer, value in sorted(scored):
+                normalized = (value - lowest) / span if span > 0 else 0.5
+                rows.append([ variant.name, layer, matrix_type, f"{value:.6e}", f"{normalized:.6f}" ])
+
+    write_figure_csv(fig_dir, "scores_by_depth", [ "variant", "layer", "matrix_type", "score", "normalized_score" ], rows)
+
+    if plt is None or not rows:
+        return
+
+    # One panel per variant would not fit a page for a wide sweep, so the plot
+    # shows the first variant and the CSV carries the rest
+    variant_name = variants[0].name
+    figure, axis = plt.subplots(figsize=(9, 5))
+
+    for matrix_type in present_matrix_types(inputs):
+        points = sorted(
+            ( int(row[1]), float(row[4]) ) for row in rows
+            if row[0] == variant_name and row[2] == matrix_type
+        )
+
+        if points:
+            axis.plot([p[0] for p in points], [p[1] for p in points], marker="o", markersize=3, label=matrix_type)
+
+    axis.set_xlabel("decoder layer")
+    axis.set_ylabel("normalized score")
+    axis.set_title(f"Score across depth per matrix family ({variant_name})")
+    axis.grid(alpha=0.3)
+    axis.legend(fontsize=7)
+    save_figure(fig_dir, "scores_by_depth", figure, plt)
+
+
+def figure_influence_by_depth(fig_dir: str, inputs: Inputs, plt: Any) -> None:
+    """Block Influence against depth, with spectral redundancy on the second axis"""
+    if not inputs.importance:
+        return
+
+    per_layer = keys_by_layer(inputs)
+    rows: List[List[Any]] = []
+
+    for layer in sorted(per_layer):
+        influence = inputs.importance.get(layer)
+
+        if influence is None:
+            continue
+
+        ranks = [normalized_effective_rank(inputs.spectra[key]) for key in per_layer[layer] if key in inputs.spectra]
+        mean_rank = sum(ranks) / len(ranks) if ranks else float("nan")
+        rows.append([ layer, f"{influence:.6f}", f"{mean_rank:.6f}" if ranks else "" ])
+
+    write_figure_csv(fig_dir, "influence_by_depth", [ "layer", "block_influence", "mean_normalized_eff_rank" ], rows)
+
+    if plt is None or not rows:
+        return
+
+    layers = [int(row[0]) for row in rows]
+    figure, axis = plt.subplots(figsize=(9, 5))
+    axis.plot(layers, [float(row[1]) for row in rows], marker="o", markersize=3, color="tab:blue", label="Block Influence")
+    axis.set_xlabel("decoder layer")
+    axis.set_ylabel("Block Influence", color="tab:blue")
+    axis.grid(alpha=0.3)
+
+    twin = axis.twinx()
+    ranks = [float(row[2]) for row in rows if row[2]]
+
+    if len(ranks) == len(rows):
+        twin.plot(layers, ranks, marker="s", markersize=3, color="tab:red", label="normalized effective rank")
+        twin.set_ylabel("normalized effective rank", color="tab:red")
+
+    axis.set_title("Block Influence and spectral redundancy across depth")
+    save_figure(fig_dir, "influence_by_depth", figure, plt)
+
+
+def figure_influence_vs_effrank(fig_dir: str, inputs: Inputs, plt: Any) -> None:
+    """
+    The Swift-SVD Fig. 3 relationship, per matrix family.
+
+    A negative rho is what justifies fusing the two signals into one composite
+    score, so this figure is the gate on every composite run.
+    """
+    if not inputs.importance:
+        return
+
+    rows: List[List[Any]] = []
+    correlations: Dict[str, float] = {}
+
+    for matrix_type in present_matrix_types(inputs):
+        influences: List[float] = []
+        effective_ranks: List[float] = []
+
+        for key in inputs.layers_str:
+            if matrix_type_of(key) != matrix_type or key not in inputs.spectra:
+                continue
+
+            layer = get_layer_idx_from_key(key)
+            influence = inputs.importance.get(layer)
+
+            if influence is None:
+                continue
+
+            effective_rank = normalized_effective_rank(inputs.spectra[key])
+            influences.append(influence)
+            effective_ranks.append(effective_rank)
+            rows.append([ matrix_type, layer, f"{influence:.6f}", f"{effective_rank:.6f}" ])
+
+        correlations[matrix_type] = spearman(influences, effective_ranks)
+
+    write_figure_csv(fig_dir, "influence_vs_effrank", [ "matrix_type", "layer", "block_influence", "normalized_eff_rank" ], rows)
+    write_figure_csv(
+        fig_dir,
+        "influence_vs_effrank_rho",
+        [ "matrix_type", "spearman_rho" ],
+        [ [ matrix_type, f"{rho:+.6f}" ] for matrix_type, rho in correlations.items() if not math.isnan(rho) ],
+    )
+
+    if plt is None or not rows:
+        return
+
+    types = present_matrix_types(inputs)
+    columns = min(4, len(types))
+    figure_rows = math.ceil(len(types) / columns)
+    figure, axes = plt.subplots(figure_rows, columns, figsize=(3.2 * columns, 3.0 * figure_rows), squeeze=False)
+
+    for index, matrix_type in enumerate(types):
+        axis = axes[index // columns][index % columns]
+        points = [ ( float(row[2]), float(row[3]) ) for row in rows if row[0] == matrix_type ]
+        axis.scatter([p[0] for p in points], [p[1] for p in points], s=12, alpha=0.7)
+        rho = correlations.get(matrix_type, float("nan"))
+        axis.set_title(f"{matrix_type}\nrho={rho:+.3f}" if not math.isnan(rho) else matrix_type, fontsize=8)
+        axis.set_xlabel("Block Influence", fontsize=7)
+        axis.set_ylabel("norm. eff. rank", fontsize=7)
+        axis.tick_params(labelsize=6)
+        axis.grid(alpha=0.3)
+
+    for index in range(len(types), figure_rows * columns):
+        axes[index // columns][index % columns].axis("off")
+
+    save_figure(fig_dir, "influence_vs_effrank", figure, plt)
+
+
+def figure_spectra(fig_dir: str, inputs: Inputs, plt: Any) -> None:
+    """
+    Singular value spectra on a log axis, for one representative block.
+
+    Every spectrum would be hundreds of thousands of CSV rows, so this samples
+    the first, middle and last block and thins each spectrum.
+    """
+    per_layer = keys_by_layer(inputs)
+    layers = sorted(per_layer)
+
+    if not layers:
+        return
+
+    sampled = sorted({ layers[0], layers[len(layers) // 2], layers[-1] })
+    rows: List[List[Any]] = []
+
+    for layer in sampled:
+        for key in per_layer[layer]:
+            spectrum = inputs.spectra.get(key)
+
+            if spectrum is None:
+                continue
+
+            spectrum = rescaled_spectrum(inputs, key)
+            step = max(1, len(spectrum) // 256)
+
+            for index in range(0, len(spectrum), step):
+                rows.append([ layer, matrix_type_of(key), index, f"{float(spectrum[index]):.6e}" ])
+
+    write_figure_csv(fig_dir, "spectra", [ "layer", "matrix_type", "index", "singular_value" ], rows)
+
+    if plt is None or not rows:
+        return
+
+    middle = sampled[len(sampled) // 2]
+    figure, axis = plt.subplots(figsize=(9, 5))
+
+    for matrix_type in present_matrix_types(inputs):
+        points = sorted(
+            ( int(row[2]), float(row[3]) ) for row in rows
+            if row[0] == middle and row[1] == matrix_type
+        )
+
+        if points:
+            axis.plot([p[0] for p in points], [p[1] for p in points], label=matrix_type)
+
+    axis.set_yscale("log")
+    axis.set_xlabel("singular value index")
+    axis.set_ylabel("singular value")
+    axis.set_title(f"Whitened spectra, decoder block {middle}")
+    axis.grid(alpha=0.3)
+    axis.legend(fontsize=7)
+    save_figure(fig_dir, "spectra", figure, plt)
+
+
+def figure_layer_ratios(fig_dir: str, inputs: Inputs, variants: List[Variant], results: Dict[str, VariantResult], plt: Any) -> None:
+    """Parameter-weighted removal ratio against depth, one line per variant"""
+    per_layer = keys_by_layer(inputs)
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        ratio_map = results[variant.name].ratio_map
+
+        for layer in sorted(per_layer):
+            keys = per_layer[layer]
+            params = sum(inputs.param_count_map[key] for key in keys)
+            removed = sum(inputs.param_count_map[key] * ratio_map.get(key, 0.0) for key in keys)
+            rows.append([ variant.name, layer, f"{removed / params:.6f}" if params else "" ])
+
+    write_figure_csv(fig_dir, "layer_ratios", [ "variant", "layer", "layer_ratio" ], rows)
+
+    if plt is None or not rows:
         return
 
     figure, axis = plt.subplots(figsize=(9, 5))
 
     for variant in variants:
-        result = results[variant.name]
-        per_layer: Dict[int, List[str]] = defaultdict(list)
+        points = sorted(( int(row[1]), float(row[2]) ) for row in rows if row[0] == variant.name and row[2])
 
-        for key in inputs.layers_str:
-            per_layer[get_layer_idx_from_key(key)].append(key)
-
-        layers = sorted(per_layer)
-        ratios = [
-            sum(inputs.param_count_map[key] * result.ratio_map.get(key, 0.0) for key in per_layer[layer])
-            / sum(inputs.param_count_map[key] for key in per_layer[layer])
-            for layer in layers
-        ]
-        axis.plot(layers, ratios, marker="o", markersize=3, label=variant.name)
+        if points:
+            axis.plot([p[0] for p in points], [p[1] for p in points], marker="o", markersize=3, label=variant.name)
 
     axis.set_xlabel("decoder layer")
     axis.set_ylabel("parameter-weighted removal ratio")
@@ -787,12 +1389,337 @@ def render_plots(out_dir: str, inputs: Inputs, variants: List[Variant], results:
     if len(variants) <= 8:
         axis.legend(fontsize=7)
 
-    path = os.path.join(out_dir, "layer_ratios.png")
-    figure.tight_layout()
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
+    save_figure(fig_dir, "layer_ratios", figure, plt)
 
-    print(f"[REPORT] Wrote {path}")
+
+def figure_ratio_heatmap(fig_dir: str, inputs: Inputs, variants: List[Variant], results: Dict[str, VariantResult], plt: Any) -> None:
+    """Layer by matrix family, the whole allocation of a variant in one panel"""
+    types = present_matrix_types(inputs)
+    per_layer = keys_by_layer(inputs)
+    layers = sorted(per_layer)
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        ratio_map = results[variant.name].ratio_map
+
+        for layer in layers:
+            for matrix_type in types:
+                matching = [key for key in per_layer[layer] if matrix_type_of(key) == matrix_type]
+
+                if matching:
+                    rows.append([ variant.name, layer, matrix_type, f"{ratio_map.get(matching[0], 0.0):.6f}" ])
+
+    write_figure_csv(fig_dir, "ratio_heatmap", [ "variant", "layer", "matrix_type", "ratio" ], rows)
+
+    if plt is None or not rows:
+        return
+
+    shown = variants[:6]
+    figure, axes = plt.subplots(len(shown), 1, figsize=(10, 2.2 * len(shown)), squeeze=False)
+
+    for index, variant in enumerate(shown):
+        axis = axes[index][0]
+        ratio_map = results[variant.name].ratio_map
+        grid = [
+            [
+                next(
+                    ( ratio_map.get(key, 0.0) for key in per_layer[layer] if matrix_type_of(key) == matrix_type ),
+                    float("nan"),
+                )
+                for layer in layers
+            ]
+            for matrix_type in types
+        ]
+        image = axis.imshow(grid, aspect="auto", origin="lower", cmap="viridis")
+        axis.set_yticks(range(len(types)))
+        axis.set_yticklabels(types, fontsize=6)
+        axis.set_title(variant.name, fontsize=8)
+        axis.set_xlabel("decoder layer", fontsize=7)
+        figure.colorbar(image, ax=axis, label="ratio")
+
+    save_figure(fig_dir, "ratio_heatmap", figure, plt)
+
+
+def figure_ratio_by_type(fig_dir: str, inputs: Inputs, variants: List[Variant], results: Dict[str, VariantResult], plt: Any) -> None:
+    """
+    Mean ratio each matrix family receives, per variant.
+
+    Where a rank-space policy shows its bias: it prices a rank at out + in, so
+    on a group of mixed shapes it can compress a family harder than its score
+    alone would justify.
+    """
+    types = present_matrix_types(inputs)
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        ratio_map = results[variant.name].ratio_map
+
+        for matrix_type in types:
+            keys = [key for key in inputs.layers_str if matrix_type_of(key) == matrix_type]
+            params = sum(inputs.param_count_map[key] for key in keys)
+            removed = sum(inputs.param_count_map[key] * ratio_map.get(key, 0.0) for key in keys)
+            rows.append([ variant.name, matrix_type, f"{removed / params:.6f}" if params else "" ])
+
+    write_figure_csv(fig_dir, "ratio_by_type", [ "variant", "matrix_type", "mean_ratio" ], rows)
+
+    if plt is None or not rows:
+        return
+
+    shown = variants[:8]
+    width = 0.8 / max(1, len(shown))
+    figure, axis = plt.subplots(figsize=(10, 5))
+
+    for index, variant in enumerate(shown):
+        values = [
+            float(row[2]) for matrix_type in types
+            for row in rows if row[0] == variant.name and row[1] == matrix_type and row[2]
+        ]
+        positions = [position + index * width for position in range(len(values))]
+        axis.bar(positions, values, width=width, label=variant.name)
+
+    axis.set_xticks([position + 0.4 for position in range(len(types))])
+    axis.set_xticklabels(types, rotation=30, ha="right", fontsize=7)
+    axis.set_ylabel("mean removal ratio")
+    axis.set_title("Ratio per matrix family")
+    axis.grid(alpha=0.3, axis="y")
+    axis.legend(fontsize=7)
+    save_figure(fig_dir, "ratio_by_type", figure, plt)
+
+
+def figure_cap_binding(fig_dir: str, inputs: Inputs, variants: List[Variant], results: Dict[str, VariantResult], plt: Any) -> None:
+    """
+    How many matrices the per-matrix cap actually pins.
+
+    A cap that binds nothing cannot change an allocation, which is what makes
+    this the cheap way to choose the caps worth spending GPU time on.
+    """
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        ratio_map = results[variant.name].ratio_map
+        cap = variant.config["max_ratio"]
+        assigned = [ratio_map[key] for key in inputs.layers_str if key in ratio_map]
+        pinned = sum(1 for ratio in assigned if ratio >= cap - RATIO_TOLERANCE)
+        rows.append([
+            variant.name,
+            f"{cap:.4f}",
+            len(assigned),
+            pinned,
+            f"{pinned / len(assigned):.6f}" if assigned else "",
+        ])
+
+    write_figure_csv(fig_dir, "cap_binding", [ "variant", "max_ratio", "matrices", "pinned_at_cap", "fraction_pinned" ], rows)
+
+    if plt is None or not rows:
+        return
+
+    figure, axis = plt.subplots(figsize=(10, 5))
+    axis.bar(range(len(rows)), [float(row[4]) if row[4] else 0.0 for row in rows])
+    axis.set_xticks(range(len(rows)))
+    axis.set_xticklabels([row[0] for row in rows], rotation=45, ha="right", fontsize=6)
+    axis.set_ylabel("fraction of matrices pinned at the cap")
+    axis.set_title("Where --max_ratio binds")
+    axis.grid(alpha=0.3, axis="y")
+    save_figure(fig_dir, "cap_binding", figure, plt)
+
+
+def figure_objectives(fig_dir: str, variants: List[Variant], results: Dict[str, VariantResult], ranks: Dict[str, Dict[str, float]], plt: Any) -> None:
+    """
+    Every variant priced under every objective.
+
+    Reading it by row shows whether a variant is broadly good or only good at
+    the objective its own score metric optimizes.
+    """
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        for objective in OBJECTIVES:
+            value = results[variant.name].objectives[objective.name]
+            best = min(
+                (results[other.name].objectives[objective.name] for other in variants
+                 if math.isfinite(results[other.name].objectives[objective.name])),
+                default=float("nan"),
+            )
+            rows.append([
+                variant.name,
+                objective.name,
+                f"{value:.6e}" if math.isfinite(value) else "",
+                f"{ranks[objective.name][variant.name]:.0f}" if not math.isnan(ranks[objective.name][variant.name]) else "",
+                f"{value / best:.6f}" if math.isfinite(value) and math.isfinite(best) and best > 0 else "",
+                objective.circular_with,
+            ])
+
+    write_figure_csv(
+        fig_dir,
+        "objectives",
+        [ "variant", "objective", "value", "rank", "value_vs_best", "circular_with" ],
+        rows,
+    )
+
+    if plt is None or len(variants) < 2:
+        return
+
+    names = [objective.name for objective in OBJECTIVES]
+    grid = [
+        [ ranks[objective.name][variant.name] for objective in OBJECTIVES ]
+        for variant in variants
+    ]
+    figure, axis = plt.subplots(figsize=(1.3 * len(names) + 4, 0.4 * len(variants) + 2))
+    image = axis.imshow(grid, aspect="auto", cmap="RdYlGn_r")
+    axis.set_xticks(range(len(names)))
+    axis.set_xticklabels(names, rotation=30, ha="right", fontsize=7)
+    axis.set_yticks(range(len(variants)))
+    axis.set_yticklabels([variant.name for variant in variants], fontsize=6)
+    axis.set_title("Rank per objective, 1 is best")
+    figure.colorbar(image, ax=axis, label="rank")
+    save_figure(fig_dir, "objectives", figure, plt)
+
+
+def figure_oracle_gap(fig_dir: str, variants: List[Variant], results: Dict[str, VariantResult], oracles: Dict[str, Dict[str, float]], plt: Any) -> None:
+    """How far each allocation sits above the best achievable value of an objective"""
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        for objective in OBJECTIVES:
+            value = results[variant.name].objectives[objective.name]
+            oracle = oracles[variant.name][objective.name]
+            gap = ""
+
+            if math.isfinite(value) and math.isfinite(oracle) and oracle > 0.0:
+                gap = f"{value / oracle:.6f}"
+
+            rows.append([
+                variant.name,
+                objective.name,
+                f"{value:.6e}" if math.isfinite(value) else "",
+                f"{oracle:.6e}" if math.isfinite(oracle) else "",
+                gap,
+            ])
+
+    write_figure_csv(fig_dir, "oracle_gap", [ "variant", "objective", "value", "oracle", "oracle_ratio" ], rows)
+
+    if plt is None:
+        return
+
+    priced = [objective for objective in OBJECTIVES if objective.marginal is not None]
+
+    if not priced:
+        return
+
+    width = 0.8 / len(priced)
+    figure, axis = plt.subplots(figsize=(10, 5))
+
+    for index, objective in enumerate(priced):
+        gaps = []
+        for variant in variants:
+            row = next(row for row in rows if row[0] == variant.name and row[1] == objective.name)
+            gaps.append(float(row[4]) if row[4] else 1.0)
+
+        axis.bar([position + index * width for position in range(len(variants))], gaps, width=width, label=objective.name)
+
+    axis.set_xticks([position + 0.4 for position in range(len(variants))])
+    axis.set_xticklabels([variant.name for variant in variants], rotation=45, ha="right", fontsize=6)
+    axis.set_yscale("log")
+    axis.set_ylabel("value / lower bound (log)")
+    axis.set_title("Distance to the best achievable value at the same budget and cap")
+    axis.grid(alpha=0.3, axis="y")
+    axis.legend(fontsize=7)
+    save_figure(fig_dir, "oracle_gap", figure, plt)
+
+
+def figure_dispersion(fig_dir: str, inputs: Inputs, variants: List[Variant], results: Dict[str, VariantResult], plt: Any) -> None:
+    """
+    How widely an allocation spreads its ratios.
+
+    Comparing two policies at their default knobs compares their shape and their
+    aggressiveness at once. Matching dispersion first is what isolates the shape,
+    and reading it off this figure costs no GPU time.
+    """
+    swept = swept_keys(variants)
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        ratios = torch.tensor(
+            [results[variant.name].ratio_map.get(key, 0.0) for key in inputs.layers_str],
+            dtype=torch.float64,
+        )
+        quantiles = torch.tensor([ 0.1, 0.9 ], dtype=torch.float64)
+        low, high = torch.quantile(ratios, quantiles).tolist() if len(ratios) else ( float("nan"), float("nan") )
+        rows.append([
+            variant.name,
+            *[variant.config[key] for key in swept],
+            f"{float(ratios.std()):.6f}",
+            f"{float(ratios.min()):.6f}",
+            f"{float(ratios.max()):.6f}",
+            f"{low:.6f}",
+            f"{high:.6f}",
+        ])
+
+    write_figure_csv(
+        fig_dir,
+        "dispersion",
+        [ "variant", *swept, "ratio_std", "ratio_min", "ratio_max", "ratio_p10", "ratio_p90" ],
+        rows,
+    )
+
+    if plt is None or not rows:
+        return
+
+    figure, axis = plt.subplots(figsize=(10, 5))
+    deviations = [float(row[len(swept) + 1]) for row in rows]
+
+    # A single swept knob gives a curve worth reading; anything else is a
+    # comparison of unordered configurations, so bars say more than a line
+    if len(swept) == 1:
+        pairs = sorted(zip([row[1] for row in rows], deviations), key=lambda item: str(item[0]))
+        axis.plot([str(value) for value, _ in pairs], [deviation for _, deviation in pairs], marker="o")
+        axis.set_xlabel(swept[0])
+    else:
+        axis.bar(range(len(rows)), deviations)
+        axis.set_xticks(range(len(rows)))
+        axis.set_xticklabels([row[0] for row in rows], rotation=45, ha="right", fontsize=6)
+
+    axis.set_ylabel("standard deviation of the per-matrix ratio")
+    axis.set_title("Allocation dispersion")
+    axis.grid(alpha=0.3, axis="y")
+    save_figure(fig_dir, "dispersion", figure, plt)
+
+
+def write_figures(
+        out_dir: str,
+        inputs: Inputs,
+        variants: List[Variant],
+        results: Dict[str, VariantResult],
+        ranks: Dict[str, Dict[str, float]],
+        oracles: Dict[str, Dict[str, float]],
+        render: bool
+) -> None:
+    """
+    One tidy CSV per figure, plus a PNG preview when matplotlib is installed.
+
+    The CSV is the deliverable: the thesis renders these through pgfplots so the
+    figures carry its fonts, and matplotlib stays an optional convenience.
+    """
+    fig_dir = os.path.join(out_dir, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    plt = load_pyplot() if render else None
+
+    figure_scores_by_depth(fig_dir, inputs, variants, results, plt)
+    figure_influence_by_depth(fig_dir, inputs, plt)
+    figure_influence_vs_effrank(fig_dir, inputs, plt)
+    figure_spectra(fig_dir, inputs, plt)
+
+    figure_layer_ratios(fig_dir, inputs, variants, results, plt)
+    figure_ratio_heatmap(fig_dir, inputs, variants, results, plt)
+    figure_ratio_by_type(fig_dir, inputs, variants, results, plt)
+    figure_cap_binding(fig_dir, inputs, variants, results, plt)
+
+    figure_objectives(fig_dir, variants, results, ranks, plt)
+    figure_oracle_gap(fig_dir, variants, results, oracles, plt)
+    figure_dispersion(fig_dir, inputs, variants, results, plt)
+
+    print(f"[REPORT] Wrote figure data under {fig_dir}")
 
 
 def main() -> None:
@@ -823,31 +1750,46 @@ def main() -> None:
                 score_map={},
                 budget_log=f"rejected: {error}\n",
                 realized_ratio=float("nan"),
-                predicted_loss=float("nan"),
+                objectives={objective.name: float("nan") for objective in OBJECTIVES},
+                target_removed=float("nan"),
+                active_keys=[],
                 checks=[f"rejected: {error}"],
                 score_ratio_rho=float("nan"),
             )
 
-    losses = [result.predicted_loss for result in results.values() if not math.isnan(result.predicted_loss)]
-    baseline = min(losses) if losses else float("nan")
+    ranks = {
+        objective.name: rank_variants({name: result.objectives[objective.name] for name, result in results.items()})
+        for objective in OBJECTIVES
+    }
+    mean_rank = {name: mean_objective_rank(ranks, name) for name in results}
+    oracles = compute_oracles(inputs, variants, results)
 
-    print(f"\n{'variant':<48} {'realized':>9} {'pred. loss':>13} {'vs best':>8}  checks")
-    for variant in variants:
+    header = " ".join(f"{objective.name[:6]:>6}" for objective in OBJECTIVES)
+    print(f"\n{'variant':<42} {'realized':>9} {'mean rk':>8}  {header}  checks")
+
+    for variant in sorted(variants, key=lambda item: mean_rank[item.name] if not math.isnan(mean_rank[item.name]) else 1e9):
         result = results[variant.name]
-        relative = result.predicted_loss / baseline if baseline > 0 else float("nan")
-        status = "ok" if not result.checks else "; ".join(result.checks)
-        print(
-            f"{variant.name:<48} {result.realized_ratio:>9.4f} "
-            f"{result.predicted_loss:>13.4e} {relative:>8.4f}  {status}",
+        cells = " ".join(
+            f"{ranks[objective.name][variant.name]:>6.0f}"
+            if not math.isnan(ranks[objective.name][variant.name]) else f"{'-':>6}"
+            for objective in OBJECTIVES
         )
+        status = "ok" if not result.checks else "; ".join(result.checks)
+        print(f"{variant.name:<42} {result.realized_ratio:>9.4f} {mean_rank[variant.name]:>8.2f}  {cells}  {status}")
+
+    print(
+        "\n  Cells are ranks, 1 being best, so a variant that wins one column and trails the\n"
+        "  rest is winning on its own terms. Each objective and the score metric that\n"
+        "  optimizes it by construction:",
+    )
+    for objective in OBJECTIVES:
+        print(f"    {objective.name:<22} circular with {objective.circular_with}")
 
     report_importance(inputs)
 
     out_dir = args.out_dir or os.path.join(args.save_path, "allocation_reports", sanitize_model_name(args.model))
-    write_reports(out_dir, inputs, variants, results, baseline)
-
-    if args.plots:
-        render_plots(out_dir, inputs, variants, results)
+    write_reports(out_dir, inputs, variants, results, ranks, mean_rank, oracles)
+    write_figures(out_dir, inputs, variants, results, ranks, oracles, render=args.plots)
 
     failed = [variant.name for variant in variants if results[variant.name].checks]
 

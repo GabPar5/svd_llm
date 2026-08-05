@@ -409,11 +409,36 @@ python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
 | `--compress_*` | `flag` | all | Restrict the report to some matrix families. Unlike `main.py`, giving none covers them all. |
 | `--sweep KEY=V1,V2` | `str` | `[]` | Sweep one knob over several values, repeatable, taken as a cartesian product. |
 | `--out_dir` | `str` | under `--save_path` | Where the CSV report is written. |
-| `--plots` | `flag` | `False` | Also render a PNG preview, when matplotlib happens to be installed. |
+| `--plots` | `flag` | `False` | Also render a PNG of every figure, when matplotlib happens to be installed. The figure CSVs are written either way. |
 
 Every allocation flag of `main.py` is accepted as the base configuration, and `--compression_ratio`, `--group_criterion`, `--inner_allocation`, `--outer_allocation`, `--score_metric`, `--offset`, `--outer_offset`, `--softmax_temp`, `--fusion_alpha`, `--max_ratio`, `--bypass_early_layers`, `--bypass_late_layers` and `--bypass_ratio` can be swept.
 
-Output is CSV rather than figures, so `pgfplots` consumes it directly in the thesis: `summary.csv` (one row per variant, with ratio dispersion and the score-to-ratio correlation), `matrices.csv` (per matrix: score, ratio, rank, truncation loss), `layers.csv` (per decoder layer, with its Block Influence) and `budget/<variant>.log` (the captured `[BUDGET]` instrumentation). Variants are ranked by **predicted truncation loss**, the total squared spectral energy the allocation discards, which after whitening is the theoretical activation reconstruction error — a proxy for ranking at equal budget, not a perplexity, since it ignores how errors compound across layers.
+Output is CSV rather than figures, so `pgfplots` consumes it directly in the thesis: `summary.csv` (one row per variant), `matrices.csv` (per matrix: score, ratio, rank, truncation loss), `layers.csv` (per decoder layer, with its Block Influence), `budget/<variant>.log` (the captured `[BUDGET]` instrumentation) and `figures/*.csv` (one tidy table per figure).
+
+#### Objectives
+
+Variants are **not** ranked by a single number. An allocation is priced under six objectives, all oriented so that lower is better, and ordered by its mean rank across them:
+
+| Objective | Measures | Optimized by construction by |
+|---|---|---|
+| `frobenius_tail` | squared energy discarded, summed | `truncation`, `truncation_sq` |
+| `nuclear_tail` | discarded magnitude rather than energy | `norm\|1` |
+| `spectral_tail` | largest single discarded direction, a minimax | `norm\|inf` |
+| `relative_energy_lost` | mean per-matrix fraction of energy dropped, scale free | — |
+| `eff_rank_lost` | mean per-matrix fraction of effective rank lost | `eff_rank`, `eff_rank_sq` |
+| `influence_tail` | relative energy dropped, weighted by each block's Block Influence | `composite\|...\|block_influence` |
+
+The right-hand column is the reason for the panel. `frobenius_tail` **is** the `truncation_sq` score summed over matrices, so ranking on it alone hands the truncation scores a win by definition. Reading a row across all six separates a variant that is broadly good from one that only wins the objective its own score metric optimizes, and that distinction is a reportable result rather than a hidden confound.
+
+`influence_tail` is the only objective that is not a function of the spectra alone: Block Influence is measured on the dense model's residual stream, so no local score can reproduce it. It is the one end-to-end reading available without a GPU.
+
+Each objective that is a plain sum over singular directions also carries `<objective>_oracle_ratio`, its value divided by the lowest reachable at the same budget, cap and active matrices (greedy in ascending loss per parameter removed, which is exact). The bound ignores the grouping, so it may spend the whole budget on a few matrices and the ratio runs to six figures — it says nothing in absolute terms. Its use is comparing **across budgets**: a `--sweep compression_ratio=0.2,0.5` moves the raw objective by orders of magnitude, and dividing by the bound removes the budget's own contribution. Within one budget the bound is constant and never reorders anything.
+
+#### Figures
+
+Each writes `figures/<name>.csv` always, and `figures/<name>.png` when `--plots` is given and matplotlib is installed:
+
+`scores_by_depth`, `influence_by_depth`, `influence_vs_effrank` (+ its `_rho` companion), `spectra`, `layer_ratios`, `ratio_heatmap`, `ratio_by_type`, `cap_binding`, `objectives`, `oracle_gap`, `dispersion`.
 
 Each variant is also checked against the invariants any policy must satisfy: realized removal matches the budget, ratios stay within `[0, --max_ratio]`, and the *value* of a constant score never changes the allocation. Two further checks apply only to ratio-space policies, which read nothing but the score: no group may give more removal to a higher-scoring matrix, and a constant score must collapse the allocation onto the flat ratio (the latter also requires a neutral outer level, since Block Influence is not flattened by it). A rank-space policy is exempt from both — it also prices a rank at `out + in`, and on a group of mixed shapes that can outweigh the score ordering, which is the family's bias rather than a defect.
 
