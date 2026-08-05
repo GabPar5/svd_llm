@@ -34,8 +34,9 @@ python main.py --model "Qwen/Qwen2.5-7B" --use_compressed \
 # Run the sequential low-rank update on a TAW-only checkpoint (requires --use_compressed + path)
 python main.py ... --update_taw_only --sequential_update_method lora --sequential_lora_backend trainer
 
-# Experiment grid: reads args/base_args.json and args/experiments.json (both gitignored), runs main.py per config
-python run_experiments.py
+# Experiment grid: merges args/base_args.json into each entry of a stage file (both gitignored), runs main.py per config.
+# EXPERIMENTS.md documents the stages; --dry_run previews, and an unresolved "__PLACEHOLDER__" aborts before the first run
+python run_experiments.py args/experiments_stage2_score_grouping.json
 
 # Explore allocations offline from the cached spectra, no GPU, seconds per sweep
 python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \

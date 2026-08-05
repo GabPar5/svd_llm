@@ -133,8 +133,8 @@ The updated checkpoint is saved next to the original one with a `_sequpd_<method
 
 `run_experiments.py` runs `main.py` once per configuration, sequentially, continuing after a failed run. It reads two files (both gitignored):
 
-- `args/base_args.json` — arguments shared by every run
-- `args/experiments.json` — a list of dictionaries, each overriding the base arguments for one run
+- `args/base_args.json` — arguments shared by every run, overridable with `--base`
+- a stage file — a list of dictionaries, each overriding the base arguments for one run, passed as the positional argument and defaulting to `args/experiments.json`
 
 `args/base_args.json`:
 
@@ -161,8 +161,12 @@ The updated checkpoint is saved next to the original one with a `_sequpd_<method
 Boolean `true` emits the bare flag, `null` drops the argument, anything else is passed as `--key value`.
 
 ```bash
-python run_experiments.py
+python run_experiments.py                                          # args/experiments.json
+python run_experiments.py args/experiments_stage2_score_grouping.json
+python run_experiments.py args/experiments_stage3_policies.json --dry_run
 ```
+
+A stage file may carry placeholders such as `__BEST_GROUPING__` for values that only the preceding stage's results can supply. Any string argument containing `__` aborts the whole stage before the first run, so an unfilled placeholder cannot quietly compress the wrong configuration. `EXPERIMENTS.md` describes the staged grid itself: what each stage answers, what to inspect, and which placeholder its results resolve.
 
 ---
 
