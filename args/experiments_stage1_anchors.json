@@ -1,0 +1,11 @@
+[
+  {
+    "--use_compressed": false
+  },
+  {
+    "--compression_ratio": 0.2
+  },
+  {
+    "--compression_ratio": 0.5
+  }
+]

@@ -1,0 +1,30 @@
+[
+  {
+    "--compressed_model_path": "__CKPT_HOM_0.2__",
+    "--update_taw_only": true,
+    "--sequential_update_method": "lora",
+    "--sequential_lora_backend": "trainer",
+    "--finetune_dataset": "yahma/alpaca-cleaned"
+  },
+  {
+    "--compressed_model_path": "__CKPT_HOM_0.5__",
+    "--update_taw_only": true,
+    "--sequential_update_method": "lora",
+    "--sequential_lora_backend": "trainer",
+    "--finetune_dataset": "yahma/alpaca-cleaned"
+  },
+  {
+    "--compressed_model_path": "__CKPT_HET_0.2__",
+    "--update_taw_only": true,
+    "--sequential_update_method": "lora",
+    "--sequential_lora_backend": "trainer",
+    "--finetune_dataset": "yahma/alpaca-cleaned"
+  },
+  {
+    "--compressed_model_path": "__CKPT_HET_0.5__",
+    "--update_taw_only": true,
+    "--sequential_update_method": "lora",
+    "--sequential_lora_backend": "trainer",
+    "--finetune_dataset": "yahma/alpaca-cleaned"
+  }
+]

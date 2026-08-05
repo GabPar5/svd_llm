@@ -131,10 +131,12 @@ The updated checkpoint is saved next to the original one with a `_sequpd_<method
 
 ### Run a Grid of Experiments
 
-`run_experiments.py` runs `main.py` once per configuration, sequentially, continuing after a failed run. It reads two files (both gitignored):
+`run_experiments.py` runs `main.py` once per configuration, sequentially, continuing after a failed run. It reads two files, both tracked under `args/`:
 
 - `args/base_args.json` — arguments shared by every run, overridable with `--base`
 - a stage file — a list of dictionaries, each overriding the base arguments for one run, passed as the positional argument and defaulting to `args/experiments.json`
+
+Since `args/` is committed, **never put `--hf_token` in one of these files**: pass it on the command line or export it in the environment.
 
 `args/base_args.json`:
 

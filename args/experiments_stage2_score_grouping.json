@@ -1,0 +1,110 @@
+[
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "global",
+    "--score_metric": "truncation"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "global",
+    "--score_metric": "entropy"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "global",
+    "--score_metric": "eff_rank"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "truncation"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "entropy"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "eff_rank"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "truncation"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "entropy"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "eff_rank"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "global",
+    "--score_metric": "truncation"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "global",
+    "--score_metric": "entropy"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "global",
+    "--score_metric": "eff_rank"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "truncation"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "entropy"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "eff_rank"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "truncation"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "entropy"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "eff_rank"
+  }
+]

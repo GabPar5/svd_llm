@@ -1,0 +1,38 @@
+[
+  {
+    "--use_compressed": false,
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  },
+  {
+    "--compressed_model_path": "__CKPT_HOM_0.2__",
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  },
+  {
+    "--compressed_model_path": "__CKPT_HOM_0.5__",
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  },
+  {
+    "--compressed_model_path": "__CKPT_BEST_SCORE_0.2__",
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  },
+  {
+    "--compressed_model_path": "__CKPT_BEST_SCORE_0.5__",
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  },
+  {
+    "--compressed_model_path": "__CKPT_BEST_POLICY_0.2__",
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  },
+  {
+    "--compressed_model_path": "__CKPT_BEST_POLICY_0.5__",
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  },
+  {
+    "--compressed_model_path": "__CKPT_BEST_BYPASS_0.2__",
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  },
+  {
+    "--compressed_model_path": "__CKPT_BEST_COMPOSITE_0.2__",
+    "--eval_tasks": "arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0"
+  }
+]

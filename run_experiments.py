@@ -13,6 +13,14 @@ DEFAULT_EXPERIMENTS = Path("args/experiments.json")
 PLACEHOLDER_MARKER = "__"
 
 def load_json(path: Path) -> Any:
+    if not path.exists():
+        available = sorted(sibling.name for sibling in path.parent.glob("experiments_*.json"))
+        known = "\n".join(f"  {name}" for name in available)
+        raise SystemExit(
+            f"No such file: {path}\n"
+            + (f"\nStage files in {path.parent}:\n{known}" if available else ""),
+        )
+
     with path.open() as json_file:
         return json.load(json_file)
 
