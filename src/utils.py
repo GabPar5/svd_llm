@@ -1,4 +1,6 @@
 import gc
+import inspect
+import json
 import math
 import os
 import psutil
@@ -17,11 +19,49 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig # pyright: ignore[reportPrivateImportUsage]
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional, Tuple, Type, Union
 from .modules import *
 
 # Threshold above which cuSOLVER 32-bit indexing overflows
 SOLVER_GPU_MAX_DIM = 32000
+
+# Enough to bracket and then resolve a scale to double precision
+MAX_BISECTION_STEPS = 128
+
+# A score metric of the form `composite|<local>|<end_to_end>` fuses a per-matrix
+# spectral score with a per-block one, instead of reading the spectrum alone
+COMPOSITE_PREFIX = "composite|"
+END_TO_END_SCORES = ( "block_influence", )
+
+# Relative score spread inside a group below which the allocation is homogeneous
+# in all but name, whatever policy is asked for
+DEGENERATE_SCORE_SPREAD = 1e-3
+
+# Sidecar recording how a run was configured, written next to every artifact
+RUN_CONFIG_SUFFIX = ".config.json"
+RUN_CONFIG_SCHEMA_VERSION = 1
+
+# Policy knobs a run name has to distinguish, as (knob, filename prefix, default).
+# Sweeping one of these leaves every other token untouched, so without a token of
+# its own the whole sweep would collapse onto a single checkpoint
+KNOB_FILENAME_TOKENS = (
+    ( "offset", "off", 1.5 ),
+    ( "softmax_temp", "temp", 1.0 ),
+    ( "outer_offset", "ooff", 1.5 ),
+)
+
+# Defaults of the remaining swept knobs, kept beside the ones above so that
+# "emit only when non-default" reads from one place
+DEFAULT_FUSION_ALPHA = 0.5
+DEFAULT_BYPASS_RATIO = 0.0
+DEFAULT_SEED = 6363
+
+# Never persisted to disk, the sidecar is committed alongside results
+REDACTED_ARG_KEYS = ( "hf_token", )
+
+# Cached beside the whitening artifacts they were derived from
+LAYER_IMPORTANCE_FILENAME = "layer_importance.pt"
+SPECTRA_DIRNAME = "spectra"
 
 # Decoder kwargs captured at layer 0 and replayed for every other decoder layer
 CAPTURED_DECODER_KWARGS = (
@@ -39,6 +79,30 @@ class GroupBy(str, Enum):
     GLOBAL="global"
     DECODER="decoder"
     TYPE="type"
+    HIERARCHICAL="hierarchical"
+
+class InnerAllocation(str, Enum):
+    """
+    How a removal budget is split across the matrices sitting inside one group.
+
+    `WATERFILL` allocates in ratio space and is the V2-derived baseline the rest
+    are measured against; the others allocate in rank space or from an explicit
+    optimization objective, so they carry a different implicit bias.
+    """
+    WATERFILL="waterfill"
+    DRANK_LAGRANGIAN="drank_lagrangian"
+    SWIFT_POOL="swift_pool"
+    SOFTMAX_TEMP="softmax_temp"
+
+class OuterAllocation(str, Enum):
+    """
+    How a removal budget is split across groups before any group is filled.
+
+    `PARAM_SHARE` gives every group the same average ratio, so it expresses no
+    preference of its own and leaves the whole decision to the inner policy.
+    """
+    PARAM_SHARE="param_share"
+    WATERFILL="waterfill"
 
 class ScoreMetric(str, Enum):
     TRUNCATION="truncation"
@@ -57,16 +121,38 @@ class ScoreMetric(str, Enum):
         if not isinstance(value, str):
             return None
 
-        if re.fullmatch(r"norm\|(\d+|inf|-inf)", value):
+        def register(name: str):
             obj = str.__new__(cls, value)
             obj._value_ = value
-            # Standardize the name (e.g., "norm|-inf" becomes "NORM_INF_NEG")
-            name = value.upper().replace("|", "_").replace("-", "NEG_")
             obj._name_ = name
 
             # Cache it to ensure ScoreMetric("norm|2") is ScoreMetric("norm|2")
             cls._value2member_map_[value] = obj
             return obj
+
+        if re.fullmatch(r"norm\|(\d+|inf|-inf)", value):
+            # Standardize the name (e.g., "norm|-inf" becomes "NORM_INF_NEG")
+            return register(value.upper().replace("|", "_").replace("-", "NEG_"))
+
+        if value.startswith(COMPOSITE_PREFIX):
+            # Split from the right, so a local metric carrying its own separator
+            # ("composite|norm|2|block_influence") still reads unambiguously
+            local, _, end_to_end = value[len(COMPOSITE_PREFIX):].rpartition("|")
+
+            is_valid = (
+                bool(local)
+                and not local.startswith(COMPOSITE_PREFIX)
+                and end_to_end in END_TO_END_SCORES
+            )
+            if not is_valid:
+                return None
+
+            try:
+                cls(local)
+            except ValueError:
+                return None
+
+            return register(value.upper().replace("|", "_"))
 
         return super()._missing_(value)
 
@@ -512,6 +598,34 @@ def generate_paths(mlp: bool, q: bool, k: bool, v: bool, attention_output: bool,
             list_paths += [f'model.layers.{layers_number - 1 - i}.self_attn.o_proj' for i in range(layers_number)]
     return list_paths
 
+def matrix_shapes_from_config(config: Any) -> Dict[str, Tuple[int, int]]:
+    """
+    (out_features, in_features) of every compressible matrix, read from a config.
+
+    The pipeline itself takes shapes from the loaded weights; this exists for
+    offline analysis, where the point is not to load a 7B model to find out how
+    many parameters a projection has. Kept next to `generate_paths` because the
+    two have to name the same seven matrices.
+    """
+    hidden = int(config.hidden_size)
+    intermediate = int(config.intermediate_size)
+    heads = int(config.num_attention_heads)
+    kv_heads = int(getattr(config, "num_key_value_heads", None) or heads)
+    head_dim = int(getattr(config, "head_dim", None) or hidden // heads)
+
+    q_features = heads * head_dim
+    kv_features = kv_heads * head_dim
+
+    return {
+        "self_attn.q_proj": ( q_features, hidden ),
+        "self_attn.k_proj": ( kv_features, hidden ),
+        "self_attn.v_proj": ( kv_features, hidden ),
+        "self_attn.o_proj": ( hidden, q_features ),
+        "mlp.gate_proj": ( intermediate, hidden ),
+        "mlp.up_proj": ( intermediate, hidden ),
+        "mlp.down_proj": ( hidden, intermediate ),
+    }
+
 def get_layer_parents(model: nn.Module, layers_str: List[str]) -> Tuple[List[nn.Module], List[str]]:
     """
     Resolve target keys into their parent module and attribute name.
@@ -555,9 +669,33 @@ def get_layer_idx_from_key(key: str) -> int:
     match = re.search(r"\.layers\.(\d+)\.", key)
     return int(match.group(1)) if match else -1
 
-def is_bypassed_key(key: str, bypass_early_layers: int) -> bool:
+def is_bypassed_key(
+        key: str,
+        bypass_early_layers: int,
+        bypass_late_layers: int = -1,
+        num_layers: Optional[int] = None
+) -> bool:
+    """
+    Whether a matrix lives in a decoder layer excluded from redistribution.
+
+    Both ends can be bypassed in the same run. Resolving the tail needs the
+    decoder depth, so the late test is inert when `num_layers` is unknown.
+    """
     idx = get_layer_idx_from_key(key)
-    return 0 <= idx < bypass_early_layers
+
+    if idx < 0:
+        return False
+
+    if idx < bypass_early_layers:
+        return True
+
+    is_late_bypassed = (
+        bypass_late_layers > 0
+        and num_layers is not None
+        and idx >= num_layers - bypass_late_layers
+    )
+
+    return is_late_bypassed
 
 def make_captured_meta(captured: List[Dict]) -> List[Dict]:
     """Store only reusable metadata, not the layer input tensor itself"""
@@ -763,6 +901,235 @@ def decoder_layer_output(out: Any) -> torch.Tensor:
         return out[0]
     return out
 
+def whitening_dir(base_path: str, model_name: str, version_str: str) -> str:
+    """The one place the whitening artifact layout is spelled out"""
+    return os.path.join(base_path, "whitening_matrices", sanitize_model_name(model_name), version_str)
+
+def layer_importance_path(wm_dir: str) -> str:
+    return os.path.join(wm_dir, LAYER_IMPORTANCE_FILENAME)
+
+def block_influence_from_sums(cos_sum: float, tokens: int) -> float:
+    """
+    Block Influence of one decoder block: 1 - E[cos(x_in, x_out)].
+
+    High values mean the block rotates the residual stream a lot, so it is doing
+    more work and is a worse compression target. Sums are kept rather than the
+    mean so chunked whitening runs can merge exactly.
+    """
+    if tokens <= 0:
+        return 0.0
+    return 1.0 - (cos_sum / tokens)
+
+def save_layer_importance(
+        wm_dir: str,
+        model_name: str,
+        version_str: str,
+        n_tokens: int,
+        per_layer: Dict[int, Dict[str, float]]
+) -> str:
+    """
+    Persist per-block Block Influence, merging with whatever an earlier chunk left.
+
+    Chunked whitening runs cover disjoint layer ranges, so entries accumulate
+    across runs instead of replacing one another.
+    """
+    os.makedirs(wm_dir, exist_ok=True)
+    path = layer_importance_path(wm_dir)
+
+    merged: Dict[int, Dict[str, float]] = {}
+    existing = None
+
+    if os.path.exists(path):
+        try:
+            existing = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as error:
+            print(f"[IMPORTANCE][WARNING] Overwriting unreadable {path}: {error}")
+            existing = None
+
+    is_reusable = (
+        isinstance(existing, dict)
+        and existing.get("model_name") == model_name
+        and existing.get("version") == version_str
+        and int(existing.get("n_tokens", -1)) == int(n_tokens)
+    )
+    if is_reusable:
+        merged.update(existing.get("per_layer", {})) # pyright: ignore[reportOptionalMemberAccess]
+    elif existing is not None:
+        print(f"[IMPORTANCE][WARNING] Discarding {path}, it was built for another configuration")
+
+    merged.update(per_layer)
+
+    torch.save(
+        {
+            "model_name": model_name,
+            "version": version_str,
+            "n_tokens": int(n_tokens),
+            "metric": "block_influence",
+            "per_layer": merged,
+        },
+        path,
+    )
+
+    print(f"[IMPORTANCE] Saved Block Influence for {len(merged)} decoder blocks -> {path}")
+
+    return path
+
+def load_layer_importance(
+        wm_dir: str,
+        model_name: str,
+        version_str: str,
+        n_tokens: int,
+        num_layers: Optional[int] = None
+) -> Optional[Dict[int, float]]:
+    """
+    Read cached Block Influence, validated against the run that produced it.
+
+    Returns None when absent, stale, or incomplete, so callers can fall back
+    rather than silently allocating on another configuration's signal.
+    """
+    path = layer_importance_path(wm_dir)
+
+    if not os.path.exists(path):
+        return None
+
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        print(f"[IMPORTANCE][WARNING] Could not read {path}: {error}")
+        return None
+
+    def reject(reason: str) -> None:
+        print(f"[IMPORTANCE][WARNING] Ignoring {path}: {reason}")
+
+    if not isinstance(blob, dict):
+        reject("unexpected file structure")
+        return None
+
+    if blob.get("model_name") != model_name:
+        reject(f"built for model {blob.get('model_name')}")
+        return None
+
+    if blob.get("version") != version_str:
+        reject(f"built for whitening version {blob.get('version')}")
+        return None
+
+    if int(blob.get("n_tokens", -1)) != int(n_tokens):
+        reject(f"built for n_tokens={blob.get('n_tokens')}, expected {n_tokens}")
+        return None
+
+    per_layer = blob.get("per_layer", {})
+    importance = {
+        int(idx): block_influence_from_sums(float(entry["cos_sum"]), int(entry["tokens"]))
+        for idx, entry in per_layer.items()
+    }
+
+    if num_layers is not None and len(importance) < num_layers:
+        reject(f"only {len(importance)}/{num_layers} decoder blocks recorded")
+        return None
+
+    return importance
+
+def spectra_dir(wm_dir: str) -> str:
+    return os.path.join(wm_dir, SPECTRA_DIRNAME)
+
+def spectrum_path(wm_dir: str, key: str) -> str:
+    return os.path.join(spectra_dir(wm_dir), key.replace(".", "_") + ".pt")
+
+def save_spectrum(wm_dir: str, key: str, singular_values: torch.Tensor, n_tokens: int) -> str:
+    """
+    Cache the raw singular values of one whitened matrix.
+
+    Raw rather than rescaled: every score metric is derivable from the spectrum,
+    so caching it once makes re-scoring under any metric free, and it keeps the
+    cache valid independently of how scores are normalized later on.
+    """
+    directory = spectra_dir(wm_dir)
+    os.makedirs(directory, exist_ok=True)
+    path = spectrum_path(wm_dir, key)
+
+    torch.save(
+        {
+            "key": key,
+            "n_tokens": int(n_tokens),
+            "singular_values": singular_values.detach().to(torch.float64).cpu(),
+        },
+        path,
+    )
+
+    return path
+
+def load_spectrum(wm_dir: str, key: str, n_tokens: int) -> Optional[torch.Tensor]:
+    """Read a cached raw spectrum, or None when it is absent or built elsewhere"""
+    path = spectrum_path(wm_dir, key)
+
+    if not os.path.exists(path):
+        return None
+
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        print(f"[SPECTRA][WARNING] Could not read {path}: {error}")
+        return None
+
+    if not isinstance(blob, dict) or blob.get("key") != key:
+        print(f"[SPECTRA][WARNING] Ignoring {path}: it describes another matrix")
+        return None
+
+    if int(blob.get("n_tokens", -1)) != int(n_tokens):
+        print(
+            f"[SPECTRA][WARNING] Ignoring {path}: built for "
+            f"n_tokens={blob.get('n_tokens')}, expected {n_tokens}",
+        )
+        return None
+
+    return blob["singular_values"]
+
+def load_spectra_cache(wm_dir: str) -> Tuple[Dict[str, torch.Tensor], Optional[int]]:
+    """
+    Read every cached spectrum in a whitening directory, keyed by matrix path.
+
+    Each record carries its own key and calibration size, so the layout on disk
+    is never re-derived from filenames. Returns the shared token count alongside
+    the spectra; it is None on an empty cache, and a cache mixing two
+    calibration sizes is a hard error rather than a silent comparison of scores
+    that were never on the same scale.
+    """
+    directory = spectra_dir(wm_dir)
+
+    if not os.path.isdir(directory):
+        return {}, None
+
+    spectra: Dict[str, torch.Tensor] = {}
+    token_counts = set()
+
+    for filename in sorted(os.listdir(directory)):
+        if not filename.endswith(".pt"):
+            continue
+
+        path = os.path.join(directory, filename)
+
+        try:
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as error:
+            print(f"[SPECTRA][WARNING] Could not read {path}: {error}")
+            continue
+
+        if not isinstance(blob, dict) or "key" not in blob:
+            print(f"[SPECTRA][WARNING] Ignoring {path}: unexpected file structure")
+            continue
+
+        spectra[str(blob["key"])] = blob["singular_values"]
+        token_counts.add(int(blob.get("n_tokens", -1)))
+
+    if len(token_counts) > 1:
+        raise ValueError(
+            f"Spectra in {directory} were built with different calibration sizes "
+            f"({sorted(token_counts)}). Truncation-style scores are not comparable "
+            f"across them, so rebuild the cache with one `--max_whitening_samples`",
+        )
+
+    return spectra, token_counts.pop() if token_counts else None
+
 def load_whitening_data(
         whitening_matrix_paths: Dict[str, str],
         key: str,
@@ -809,6 +1176,33 @@ def build_param_count_map(
 
     return param_count_map
 
+def build_shape_map(
+        layers_str: List[str],
+        layers_list: List[nn.Module],
+        attributes: List[str]
+) -> Dict[str, Tuple[int, int]]:
+    """
+    (out_features, in_features) of every target, read off the loaded weights.
+
+    Rank-space policies need more than the parameter count: one rank of the
+    factorization costs `out + in` parameters, and that cost is not recoverable
+    from `out * in` alone.
+    """
+    shape_map: Dict[str, Tuple[int, int]] = {}
+
+    for key, layer, attr in zip(layers_str, layers_list, attributes):
+        out_features, in_features = getattr(layer, attr).weight.shape
+        shape_map[key] = ( int(out_features), int(in_features) )
+
+    return shape_map
+
+def rank_cost(shape_map: Dict[str, Tuple[int, int]], keys: List[str]) -> torch.Tensor:
+    """Parameters one extra rank costs per matrix, `omega = out + in` in D-Rank"""
+    return torch.tensor(
+        [shape_map[key][0] + shape_map[key][1] for key in keys],
+        dtype=torch.float64,
+    )
+
 class ActiveBudget(NamedTuple):
     """Removal budget left to the matrices that are not bypassed"""
     selected_params: int
@@ -828,7 +1222,9 @@ def compute_active_budget(
         bypass_early_layers: int,
         bypass_ratio: float,
         max_ratio: float = 0.9,
-        target_total_params: Optional[int] = None
+        target_total_params: Optional[int] = None,
+        bypass_late_layers: int = -1,
+        num_layers: Optional[int] = None
 ) -> ActiveBudget:
     """
     Split the global removal target between bypassed and active matrices.
@@ -844,8 +1240,14 @@ def compute_active_budget(
 
     target_removed = target_ratio * target_total_params
 
-    bypassed_keys = [k for k in layers_str if is_bypassed_key(k, bypass_early_layers)]
-    active_keys = [k for k in layers_str if not is_bypassed_key(k, bypass_early_layers)]
+    bypassed_keys = [
+        k for k in layers_str
+        if is_bypassed_key(k, bypass_early_layers, bypass_late_layers, num_layers)
+    ]
+    active_keys = [
+        k for k in layers_str
+        if not is_bypassed_key(k, bypass_early_layers, bypass_late_layers, num_layers)
+    ]
 
     bypassed_removed = sum(param_count_map[k] * bypass_ratio for k in bypassed_keys)
     active_params = sum(param_count_map[k] for k in active_keys)
@@ -980,38 +1382,144 @@ def compute_spectrum_score(
 
     raise ValueError(f"Unsupported `score_metric`: {score_metric}")
 
-def allocate_param_weighted_group(
-        keys: List[str],
+class CompositeScore(NamedTuple):
+    """The two halves of a `composite|<local>|<end_to_end>` score metric"""
+    local: ScoreMetric
+    end_to_end: str
+
+def parse_composite_metric(score_metric: Union[ScoreMetric, str]) -> Optional[CompositeScore]:
+    """
+    Split a composite metric into the spectral half and the end-to-end half.
+
+    Returns None for an ordinary metric, so callers can branch on whether a
+    second signal has to be fused in after the score pass.
+    """
+    value = str(getattr(score_metric, "value", score_metric))
+
+    if not value.startswith(COMPOSITE_PREFIX):
+        return None
+
+    local, _, end_to_end = value[len(COMPOSITE_PREFIX):].rpartition("|")
+
+    if not local or end_to_end not in END_TO_END_SCORES:
+        raise ValueError(
+            f"Invalid composite score metric '{value}'. Expected "
+            f"composite|<local>|<end_to_end> with end_to_end one of {list(END_TO_END_SCORES)}",
+        )
+
+    return CompositeScore(local=ScoreMetric(local), end_to_end=end_to_end)
+
+def normalize_block_influence(importance_map: Dict[int, float]) -> Dict[int, float]:
+    """
+    Min-max normalize Block Influence across blocks and shift it into [1, 2].
+
+    Swift-SVD Eq. 12 raises this factor to a power, so it has to stay at or
+    above 1: a block can then only ever raise a matrix's score, never send it to
+    zero because its neighbours happened to move the residual stream more.
+    """
+    values = list(importance_map.values())
+    lowest = min(values)
+    span = max(values) - lowest
+
+    # A constant influence carries no preference, so every block weighs the same
+    return {
+        layer: (value - lowest) / span + 1.0 if span > 0 else 1.0
+        for layer, value in importance_map.items()
+    }
+
+def compose_scores(
         score_map: Dict[str, float],
-        param_count_map: Dict[str, int],
-        group_budget: float,
-        max_ratio: float = 0.9,
-        offset: float = 1.5
+        importance_map: Optional[Dict[int, float]],
+        fusion_alpha: float = 0.5
 ) -> Dict[str, float]:
     """
-    Allocates removal budget inside one group.
+    Fuse each matrix's spectral score with the influence of the block it sits in.
 
-    This preserves:
-        sum_i param_i * ratio_i = group_budget
+    Geometric fusion, following Swift-SVD Eq. 12 and ROCKET Eq. 5:
 
-    instead of:
-        mean_i ratio_i = target_ratio
+        s = beta^alpha * log(e + local)^(1 - alpha)
+
+    The local score goes through `log(e + .)` so that both factors are at least
+    1 whatever metric produced it, which is also what keeps the geometric mean
+    monotone in both. `alpha = 0` leaves the local score alone, in log form,
+    which is Swift-SVD's local-only candidate; `alpha = 1` leaves the block
+    importance alone.
+
+    Watch the dynamic range: `beta^0.5` spans [1, 1.41] while `log(e + local)`
+    is typically 5 to 8 for a truncation score, so the fused score is far
+    flatter than the raw one. Under the same `--offset` a composite allocation
+    therefore sits closer to homogeneous, which is a property of the fusion and
+    not evidence that the second signal adds nothing.
     """
-    if not keys:
-        return {}
+    if not 0.0 <= fusion_alpha <= 1.0:
+        raise ValueError("`fusion_alpha` must be in [0.0, 1.0]")
 
-    scores = torch.tensor([score_map[k] for k in keys], dtype=torch.float64)
-    weights = redundancy_from_scores(scores, offset)
+    if not importance_map:
+        raise ValueError(
+            "A composite score metric needs the cached Block Influence. Run the "
+            "whitening pass so that `layer_importance.pt` sits next to the "
+            "whitening matrices, then compress against the same calibration set",
+        )
 
-    params = torch.tensor([param_count_map[k] for k in keys], dtype=torch.float64)
+    normalized = normalize_block_influence(importance_map)
 
-    group_capacity = float((params * max_ratio).sum().item())
-    remaining_budget = max(0.0, min(float(group_budget), group_capacity))
+    fused: Dict[str, float] = {}
+    missing: List[str] = []
 
-    ratios = torch.zeros(len(keys), dtype=torch.float64)
-    active = torch.ones(len(keys), dtype=torch.bool)
+    for key, local in score_map.items():
+        layer_idx = get_layer_idx_from_key(key)
 
-    # Water-fill with per-matrix max_ratio cap
+        if layer_idx not in normalized:
+            missing.append(key)
+            continue
+
+        local_factor = math.log(math.e + max(0.0, float(local)))
+        fused[key] = (normalized[layer_idx] ** fusion_alpha) * (local_factor ** (1.0 - fusion_alpha))
+
+    if missing:
+        raise ValueError(
+            f"No Block Influence for {len(missing)} of {len(score_map)} scored matrices, "
+            f"e.g. '{missing[0]}'. The cache does not cover every compressed block",
+        )
+
+    return fused
+
+def group_params_tensor(param_count_map: Dict[str, int], keys: List[str]) -> torch.Tensor:
+    return torch.tensor([param_count_map[key] for key in keys], dtype=torch.float64)
+
+def group_scores_tensor(score_map: Dict[str, float], keys: List[str]) -> torch.Tensor:
+    return torch.tensor([score_map[key] for key in keys], dtype=torch.float64)
+
+def clamp_group_budget(params: torch.Tensor, group_budget: float, max_ratio: float) -> float:
+    """
+    What a group can actually be asked to give up.
+
+    The shell clamps the global budget to the global capacity, which does not
+    bound each group individually once an outer policy has divided it, so every
+    policy re-clamps to its own capacity before allocating.
+    """
+    capacity = float((params * max_ratio).sum().item())
+    return max(0.0, min(float(group_budget), capacity))
+
+def waterfill_ratios(
+        params: torch.Tensor,
+        weights: torch.Tensor,
+        group_budget: float,
+        max_ratio: float
+) -> torch.Tensor:
+    """
+    Spread a removal budget over matrices in proportion to `weights`.
+
+    Ratio-space allocation: what is divided is the removed parameters, so
+    `sum_i param_i * ratio_i = group_budget` holds by construction. Matrices
+    that reach `max_ratio` are frozen and their unspent share flows to the rest,
+    which is what makes this a water-fill rather than a single division.
+    """
+    remaining_budget = clamp_group_budget(params, group_budget, max_ratio)
+
+    ratios = torch.zeros_like(params)
+    active = torch.ones_like(params, dtype=torch.bool)
+
     while remaining_budget > 1e-6 and bool(active.any()):
         idx = torch.nonzero(active, as_tuple=False).flatten()
 
@@ -1042,7 +1550,877 @@ def allocate_param_weighted_group(
         remaining_budget -= spend
         active[clipped_idx] = False
 
+    return ratios
+
+def bounded_proportional_split(
+        share: torch.Tensor,
+        lower: torch.Tensor,
+        upper: torch.Tensor,
+        total: float
+) -> torch.Tensor:
+    """
+    Divide `total` in proportion to `share`, keeping every entry within bounds.
+
+    Solves for the scale `c` with `sum_i clamp(c * share_i, lower_i, upper_i) =
+    total`. That sum is non-decreasing in `c`, so a bisection brackets the
+    answer and the pinned set it settles on then gives `c` in closed form.
+
+    Pinning greedily instead — clamping the one-shot division and re-dividing
+    the remainder — is not equivalent: an entry pinned to its lower bound early
+    can turn out to be the only one able to absorb what the others cannot take,
+    and the budget it never receives is silently lost.
+    """
+    share = torch.clamp(share, min=0.0)
+
+    lower_sum = float(lower.sum().item())
+    upper_sum = float(upper.sum().item())
+
+    if total <= lower_sum:
+        return lower.clone()
+
+    if total >= upper_sum:
+        return upper.clone()
+
+    def filled(scale: float) -> torch.Tensor:
+        return torch.clamp(share * scale, min=lower, max=upper)
+
+    low = 0.0
+    high = 1.0
+
+    for _ in range(MAX_BISECTION_STEPS):
+        if float(filled(high).sum().item()) >= total:
+            break
+        high *= 2.0
+
+    for _ in range(MAX_BISECTION_STEPS):
+        middle = 0.5 * (low + high)
+
+        if float(filled(middle).sum().item()) < total:
+            low = middle
+        else:
+            high = middle
+
+    values = filled(high)
+    interior = (values > lower) & (values < upper)
+    denom = float(share[interior].sum().item())
+
+    # With the pinned entries known, the scale is exact instead of bisected
+    if denom > 0:
+        pinned_total = float(values[~interior].sum().item())
+        values = torch.where(interior, share * ((total - pinned_total) / denom), values)
+
+    return torch.clamp(values, min=lower, max=upper)
+
+def allocate_param_weighted_group(
+        keys: List[str],
+        score_map: Dict[str, float],
+        param_count_map: Dict[str, int],
+        group_budget: float,
+        max_ratio: float = 0.9,
+        offset: float = 1.5
+) -> Dict[str, float]:
+    """
+    Allocates removal budget inside one group, the `waterfill` inner policy.
+
+    This preserves:
+        sum_i param_i * ratio_i = group_budget
+
+    instead of:
+        mean_i ratio_i = target_ratio
+
+    The parameter weighting is where this departs from SVD-LLM V2's Algorithm 1,
+    which preserves the mean ratio instead and so does not hit a global
+    parameter target once a group mixes matrix shapes.
+    """
+    # TODO understand well how it works
+    if not keys:
+        return {}
+
+    params = group_params_tensor(param_count_map, keys)
+    weights = redundancy_from_scores(group_scores_tensor(score_map, keys), offset)
+    ratios = waterfill_ratios(params, weights, group_budget, max_ratio)
+
     return {k: float(r) for k, r in zip(keys, ratios.tolist())}
+
+def allocate_softmax_temp(
+        keys: List[str],
+        score_map: Dict[str, float],
+        param_count_map: Dict[str, int],
+        group_budget: float,
+        max_ratio: float = 0.9,
+        softmax_temp: float = 1.0
+) -> Dict[str, float]:
+    """
+    MoDeGPT's entropic allocation (Eq. 10-11), the `softmax_temp` inner policy.
+
+    Solves `max sum_i s_i (1 - r_i) + eps H(r)` under a fixed budget, whose
+    optimum for large `eps` is `r proportional to softmax(-s / eps)`. The
+    entropic term is what separates this from `waterfill`: `1 / log(s + offset)`
+    reads as the same trade-off without a regularizer to name.
+
+    Two deliberate departures from the paper. MoDeGPT preserves the mean ratio
+    (`phi = L phi_avg softmax(-s/eps)`) while the budget here is in parameters,
+    which is the same adaptation `waterfill` makes and reduces to the paper when
+    every matrix has the same size. And scores are min-max normalized within the
+    group before the softmax, because MoDeGPT's Block Influence already lives in
+    [0, 1] while ours span orders of magnitude by metric; that also fixes the
+    largest-to-smallest weight ratio at `exp(1 / softmax_temp)`, whatever the
+    metric.
+    """
+    if not keys:
+        return {}
+
+    if softmax_temp <= 0.0:
+        raise ValueError("`softmax_temp` must be > 0.0")
+
+    scores = group_scores_tensor(score_map, keys)
+    scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+    span = float((scores.max() - scores.min()).item())
+    # A constant score carries no preference, so every matrix weighs the same
+    normalized = (scores - scores.min()) / span if span > 0 else torch.zeros_like(scores)
+
+    weights = torch.softmax(-normalized / softmax_temp, dim=0)
+    params = group_params_tensor(param_count_map, keys)
+    ratios = waterfill_ratios(params, weights, group_budget, max_ratio)
+
+    return {k: float(r) for k, r in zip(keys, ratios.tolist())}
+
+def allocate_swift_pool(
+        keys: List[str],
+        score_map: Dict[str, float],
+        param_count_map: Dict[str, int],
+        group_budget: float,
+        max_ratio: float = 0.9
+) -> Dict[str, float]:
+    """
+    Swift-SVD's floor-plus-pool allocation (Alg. 2), the `swift_pool` policy.
+
+    Every matrix starts at the most aggressive ratio allowed and then buys ratio
+    back in proportion to its score, out of a flexible pool:
+
+        ratio_i = max_ratio - pool * score_i / sum_j (score_j * param_j)
+
+    which is linear in the score, where `waterfill` is logarithmic and
+    `drank_lagrangian` is a square root. That difference in shape is the whole
+    point of comparing them.
+
+    Two departures. Swift-SVD's guaranteed minimal rank `k_bar * delta` is
+    dropped in favour of the shared `--max_ratio` floor, which at a 0.2 target
+    is a far lower floor than the paper's `delta = 0.5` (an effective cap of 0.6
+    against 0.9), so this runs more aggressively than the original. And the
+    paper's pool is in raw rank units, which only preserves a parameter budget
+    when every matrix in the group has the same shape; the reduction is applied
+    to the ratio instead, so the two agree exactly under `--group_criterion
+    type` and stay budget-exact when a group mixes shapes.
+
+    The paper's `s_i = beta^alpha * log(e + eps)^(1-alpha)` is a *score*, not
+    part of this policy: reproducing Swift-SVD means pairing it with the
+    composite score metric, not with a raw truncation score.
+    """
+    if not keys:
+        return {}
+
+    params = group_params_tensor(param_count_map, keys)
+    scores = torch.nan_to_num(group_scores_tensor(score_map, keys), nan=0.0, posinf=0.0, neginf=0.0)
+    scores = torch.clamp(scores, min=0.0)
+
+    budget = clamp_group_budget(params, group_budget, max_ratio)
+
+    ratios = torch.full_like(params, max_ratio)
+    active = torch.ones_like(params, dtype=torch.bool)
+
+    # Matrices whose score would buy back more than the whole ratio are pinned
+    # dense and the rest re-solve for the pool they are left with
+    for _ in range(params.numel() + 1):
+        idx = torch.nonzero(active, as_tuple=False).flatten()
+
+        if idx.numel() == 0:
+            break
+
+        p = params[idx]
+        s = scores[idx]
+
+        # What the active matrices could give up beyond the target, i.e. the pool
+        pool = float((p * max_ratio).sum().item()) - budget
+        denom = float((p * s).sum().item())
+
+        if pool <= 0.0 or denom <= 0.0:
+            # No pool to hand out, or no signal to hand it out by: split flat.
+            # Capped because pinning matrices dense can leave the rest without
+            # the capacity to cover the budget, and the shell reports the drift
+            active_params = float(p.sum().item())
+            flat = budget / active_params if active_params > 0 else 0.0
+            ratios[idx] = min(flat, max_ratio)
+            break
+
+        proposed = max_ratio - pool * s / denom
+        dense = proposed < 0.0
+
+        if not bool(dense.any()):
+            ratios[idx] = proposed
+            break
+
+        pinned = idx[dense]
+        ratios[pinned] = 0.0
+        active[pinned] = False
+
+    return {k: float(r) for k, r in zip(keys, ratios.tolist())}
+
+def allocate_drank_lagrangian(
+        keys: List[str],
+        score_map: Dict[str, float],
+        param_count_map: Dict[str, int],
+        group_budget: float,
+        max_ratio: float = 0.9,
+        shape_map: Optional[Dict[str, Tuple[int, int]]] = None
+) -> Dict[str, float]:
+    """
+    D-Rank's Lagrangian allocation (Eq. 3-7), the `drank_lagrangian` policy.
+
+    Minimizes `sum_i score_i / k_i` under `sum_i k_i * omega_i = retained`, whose
+    stationary point is `k_i proportional to sqrt(score_i / omega_i)` with
+    `omega_i = out_i + in_i` the parameter cost of one rank. In retained
+    parameters that reads `omega_i k_i proportional to sqrt(score_i * omega_i)`,
+    which is Eq. 7 rewritten in the units the budget is measured in.
+
+    This allocates rank rather than ratio, so unlike the ratio-space policies a
+    uniform score does *not* leave every matrix at the flat ratio: cheap-per-rank
+    matrices still get more rank. That bias is a property of the family, not a
+    bug, and it is what makes the comparison worth running.
+
+    D-Rank's `R_eff` is exactly `--score_metric eff_rank_sq`. What is not
+    reproduced here is its grouped horizontal concatenation under a shared basis
+    and its Q/K-to-V rebalancing, both of which change the decomposition itself
+    rather than the allocation.
+    """
+    if not keys:
+        return {}
+
+    if shape_map is None:
+        raise ValueError(
+            "`drank_lagrangian` allocates in rank space and needs `shape_map`: "
+            "the parameter cost of one rank is out + in, which the parameter "
+            "count alone does not carry",
+        )
+
+    params = group_params_tensor(param_count_map, keys)
+    omega = rank_cost(shape_map, keys)
+    scores = torch.nan_to_num(group_scores_tensor(score_map, keys), nan=0.0, posinf=0.0, neginf=0.0)
+    scores = torch.clamp(scores, min=0.0)
+
+    budget = clamp_group_budget(params, group_budget, max_ratio)
+    retained_total = float(params.sum().item()) - budget
+
+    share = torch.sqrt(scores * omega)
+
+    if float(share.sum().item()) <= 0.0:
+        # No signal at all: fall back to the flat ratio rather than to a rank
+        # rule nobody asked for
+        print("[BUDGET][WARNING] drank_lagrangian got no usable score, falling back to a flat ratio")
+        share = params.clone()
+
+    retained = bounded_proportional_split(
+        share=share,
+        lower=params * (1.0 - max_ratio),
+        upper=params.clone(),
+        total=retained_total,
+    )
+    ratios = 1.0 - retained / params
+
+    return {k: float(r) for k, r in zip(keys, ratios.tolist())}
+
+def allocate_group_budgets_param_share(
+        groups: Dict[str, List[str]],
+        param_count_map: Dict[str, int],
+        remaining_budget: float
+) -> Dict[str, float]:
+    """
+    Split the removal budget across groups in proportion to their parameters.
+
+    Every group is then asked for the same average ratio, which is why this
+    outer policy leaves the allocation decision entirely to the inner one, and
+    why it is the controlled baseline the hierarchical outer level is measured
+    against.
+    """
+    grouped_params = sum(param_count_map[k] for keys in groups.values() for k in keys)
+
+    if grouped_params <= 0:
+        return {name: 0.0 for name in groups}
+
+    return {
+        name: remaining_budget * sum(param_count_map[k] for k in keys) / grouped_params
+        for name, keys in groups.items()
+    }
+
+def allocate_group_budgets_waterfill(
+        groups: Dict[str, List[str]],
+        param_count_map: Dict[str, int],
+        remaining_budget: float,
+        max_ratio: float = 0.9,
+        group_scores: Optional[Dict[str, float]] = None,
+        outer_offset: float = 1.5
+) -> Dict[str, float]:
+    """
+    Water-fill the budget across groups by their end-to-end importance.
+
+    This is `waterfill` one level up: a decoder block that transforms the
+    residual stream more is more important, so it is asked for less removal, and
+    the block-level budget it gives up flows to the rest. Its own knob
+    (`outer_offset`) is deliberately separate from the inner one, so that tuning
+    how matrices compete inside a block cannot silently change how blocks
+    compete against each other.
+    """
+    if group_scores is None:
+        raise ValueError(
+            "The `waterfill` outer allocation needs one score per group. Use "
+            "`--group_criterion hierarchical`, which scores each decoder block by "
+            "its Block Influence, and make sure the whitening cache holds it",
+        )
+
+    names = [name for name, keys in groups.items() if keys]
+    missing = [name for name in names if name not in group_scores]
+
+    if missing:
+        raise ValueError(
+            f"No score for {len(missing)} of {len(names)} groups, e.g. '{missing[0]}'. "
+            f"The cached Block Influence does not cover every decoder block being compressed",
+        )
+
+    params = torch.tensor(
+        [sum(param_count_map[key] for key in groups[name]) for name in names],
+        dtype=torch.float64,
+    )
+    weights = redundancy_from_scores(
+        torch.tensor([group_scores[name] for name in names], dtype=torch.float64),
+        outer_offset,
+    )
+    ratios = waterfill_ratios(params, weights, remaining_budget, max_ratio)
+
+    budgets = {name: 0.0 for name in groups}
+    budgets.update({
+        name: float(group_params * ratio)
+        for name, group_params, ratio in zip(names, params.tolist(), ratios.tolist())
+    })
+
+    return budgets
+
+# An allocation policy maps its targets to a removal figure per target: ratios per
+# matrix for an inner policy, budgets per group for an outer one
+AllocationPolicy = Callable[..., Dict[str, float]]
+
+# Data every policy of that level may ask for. Anything else it declares in its
+# signature is a knob, which is how a run records which flags actually applied.
+# A policy only ever receives what it names, so none has to carry a parameter it
+# does not use
+INNER_POLICY_ARGS = ( "keys", "score_map", "param_count_map", "group_budget", "max_ratio", "shape_map" )
+OUTER_POLICY_ARGS = ( "groups", "param_count_map", "remaining_budget", "max_ratio", "group_scores" )
+
+# Only wired policies live here, so the CLI can advertise exactly what runs
+INNER_POLICIES: Dict[InnerAllocation, AllocationPolicy] = {
+    InnerAllocation.WATERFILL: allocate_param_weighted_group,
+    InnerAllocation.DRANK_LAGRANGIAN: allocate_drank_lagrangian,
+    InnerAllocation.SWIFT_POOL: allocate_swift_pool,
+    InnerAllocation.SOFTMAX_TEMP: allocate_softmax_temp,
+}
+
+OUTER_POLICIES: Dict[OuterAllocation, AllocationPolicy] = {
+    OuterAllocation.PARAM_SHARE: allocate_group_budgets_param_share,
+    OuterAllocation.WATERFILL: allocate_group_budgets_waterfill,
+}
+
+# Ratio-space policies decide a removal fraction, so a score that carries no
+# preference leaves every matrix at the flat ratio. Rank-space policies decide a
+# retained rank instead, and a matrix that costs fewer parameters per rank still
+# gets more of them even under a constant score. That difference in implicit
+# bias is the reason both families are in the comparison
+RATIO_SPACE_POLICIES = frozenset({
+    InnerAllocation.WATERFILL,
+    InnerAllocation.SWIFT_POOL,
+    InnerAllocation.SOFTMAX_TEMP,
+})
+RANK_SPACE_POLICIES = frozenset({ InnerAllocation.DRANK_LAGRANGIAN })
+
+def resolve_policy(
+        value: Union[Enum, str],
+        enum_cls: Type[Enum],
+        registry: Dict[Any, AllocationPolicy],
+        label: str
+) -> Tuple[Any, AllocationPolicy]:
+    """
+    Coerce a policy name to its enum member and look up its implementation.
+
+    The enum is the agreed vocabulary while the registry is what is actually
+    wired, so a name that is spelled right but not implemented yet fails with a
+    different, clearer error than a typo does.
+    """
+    if isinstance(value, str):
+        try:
+            value = enum_cls(value)
+        except ValueError:
+            raise ValueError(
+                f"Invalid `{label}`: '{value}'. "
+                f"Expected one of: {[e.value for e in enum_cls]}",
+            )
+
+    policy = registry.get(value)
+
+    if policy is None:
+        raise NotImplementedError(
+            f"`{label}` '{value.value}' is not implemented yet. " # pyright: ignore[reportAttributeAccessIssue]
+            f"Available: {[e.value for e in registry]}",
+        )
+
+    return value, policy
+
+def resolve_inner_policy(inner_allocation: Union[InnerAllocation, str]) -> Tuple[InnerAllocation, AllocationPolicy]:
+    return resolve_policy(inner_allocation, InnerAllocation, INNER_POLICIES, "inner_allocation") # pyright: ignore[reportArgumentType]
+
+def resolve_outer_policy(outer_allocation: Union[OuterAllocation, str]) -> Tuple[OuterAllocation, AllocationPolicy]:
+    return resolve_policy(outer_allocation, OuterAllocation, OUTER_POLICIES, "outer_allocation") # pyright: ignore[reportArgumentType]
+
+def policy_knob_names(policy: AllocationPolicy, contract_args: Tuple[str, ...]) -> List[str]:
+    """
+    Names of the tunables a policy reads, beyond what every policy receives.
+
+    Knobs are declared as plain named parameters, so the signature is the single
+    source of truth for which flags apply to a run: no policy has to repeat its
+    own knob list, and none can silently ignore one it claims to read.
+    """
+    parameters = inspect.signature(policy).parameters
+
+    return [
+        name for name, parameter in parameters.items()
+        if name not in contract_args and parameter.kind is parameter.POSITIONAL_OR_KEYWORD
+    ]
+
+def select_policy_knobs(
+        policy: AllocationPolicy,
+        contract_args: Tuple[str, ...],
+        knobs: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Narrow the run's knobs down to the ones a policy declares, ignoring the rest"""
+    names = policy_knob_names(policy, contract_args)
+    return {name: knobs[name] for name in names if name in knobs}
+
+def select_policy_arguments(policy: AllocationPolicy, available: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Hand a policy exactly the arguments it names, and nothing else.
+
+    Levels of the contract differ in what they need — only the rank-space
+    policies care about shapes, only the outer one about per-group scores — so
+    filtering by signature keeps every policy free of parameters it ignores.
+    """
+    parameters = inspect.signature(policy).parameters
+    return {name: value for name, value in available.items() if name in parameters}
+
+class AllocationGroups(NamedTuple):
+    """Active matrices bucketed for allocation, plus the ones that fell through"""
+    groups: Dict[str, List[str]]
+    missing_score_keys: List[str]
+    unmatched_keys: List[str]
+
+def build_allocation_groups(
+        group_criterion: GroupBy,
+        active_keys: List[str],
+        score_map: Dict[str, float],
+        group_patterns: Optional[Dict[str, List[str]]] = None
+) -> AllocationGroups:
+    """
+    Bucket the matrices a budget will be spread over, one bucket per group.
+
+    A matrix without a score cannot be ranked against its peers, so it is
+    reported rather than grouped and the caller falls it back to the flat ratio.
+
+    `HIERARCHICAL` buckets exactly like `DECODER`; what separates them is that
+    only the hierarchical criterion lets an outer policy see a per-block score,
+    so `hierarchical` with the `param_share` outer policy reproduces `decoder`
+    to the digit and is the controlled baseline for the outer level.
+    """
+    groups: Dict[str, List[str]] = defaultdict(list)
+    missing_score_keys: List[str] = []
+    unmatched_keys: List[str] = []
+
+    match group_criterion:
+        case GroupBy.GLOBAL:
+            for key in active_keys:
+                if key in score_map:
+                    groups["global"].append(key)
+                else:
+                    missing_score_keys.append(key)
+
+        case GroupBy.DECODER | GroupBy.HIERARCHICAL:
+            for key in active_keys:
+                if key not in score_map:
+                    missing_score_keys.append(key)
+                    continue
+
+                layer_idx = get_layer_idx_from_key(key)
+                groups[f"layer_{layer_idx}"].append(key)
+
+        case GroupBy.TYPE:
+            if group_patterns is None:
+                raise ValueError("`group_patterns` required for GroupBy.TYPE")
+
+            for key in active_keys:
+                if key not in score_map:
+                    missing_score_keys.append(key)
+                    continue
+
+                group_name = None
+                for name, patterns in group_patterns.items():
+                    if any(p in key for p in patterns):
+                        group_name = name
+                        break
+
+                if group_name is None:
+                    unmatched_keys.append(key)
+                else:
+                    groups[group_name].append(key)
+
+    return AllocationGroups(
+        groups=groups,
+        missing_score_keys=missing_score_keys,
+        unmatched_keys=unmatched_keys,
+    )
+
+def warn_on_degenerate_scores(groups: Dict[str, List[str]], score_map: Dict[str, float]) -> bool:
+    """
+    Report a score that cannot rank anything within its group.
+
+    A policy only ever compares matrices inside a group, so a score that is
+    constant there produces the flat ratio no matter which policy runs. Fusing a
+    per-block signal into a per-matrix score does exactly this under per-block
+    grouping, and the run would otherwise look heterogeneous while being
+    homogeneous to the digit.
+    """
+    spreads = []
+
+    for keys in groups.values():
+        if len(keys) < 2:
+            continue
+
+        values = [score_map[key] for key in keys]
+        largest = max(abs(value) for value in values)
+        spreads.append((max(values) - min(values)) / largest if largest > 0 else 0.0)
+
+    if not spreads or max(spreads) >= DEGENERATE_SCORE_SPREAD:
+        return False
+
+    print(
+        f"[BUDGET][WARNING] Scores vary by at most {max(spreads):.2e} inside every group, "
+        f"so this allocation is homogeneous whatever the policy. A per-block score fused "
+        f"into a per-matrix one behaves this way under per-block grouping: it can only "
+        f"differentiate through the outer level",
+    )
+
+    return True
+
+def allocation_knobs(
+        offset: float = 1.5,
+        softmax_temp: float = 1.0,
+        outer_offset: float = 1.5
+) -> Dict[str, Any]:
+    """
+    Every tunable an allocation policy may read, gathered in one place.
+
+    Policies declare the subset they use, so this is the only list that has to
+    grow when a knob is added and no policy can be handed one it never reads.
+    """
+    return {
+        "offset": offset,
+        "softmax_temp": softmax_temp,
+        "outer_offset": outer_offset,
+    }
+
+class AllocationPolicies(NamedTuple):
+    """The resolved policy pair of a run, together with the knobs each one reads"""
+    inner_allocation: InnerAllocation
+    outer_allocation: OuterAllocation
+    inner_policy: AllocationPolicy
+    outer_policy: AllocationPolicy
+    inner_knobs: Dict[str, Any]
+    outer_knobs: Dict[str, Any]
+
+    def describe(self) -> Dict[str, Any]:
+        """The part worth recording next to a run's results"""
+        return {
+            "inner_allocation": self.inner_allocation.value,
+            "outer_allocation": self.outer_allocation.value,
+            "inner_knobs": self.inner_knobs,
+            "outer_knobs": self.outer_knobs,
+        }
+
+def resolve_allocation_policies(
+        inner_allocation: Union[InnerAllocation, str],
+        outer_allocation: Union[OuterAllocation, str],
+        knobs: Dict[str, Any]
+) -> AllocationPolicies:
+    """
+    Resolve both levels at once and hand each the subset of knobs it declares.
+
+    Callers that only need to report a configuration use the same entry point as
+    the allocator itself, so what a run records is what it actually ran.
+    """
+    inner_allocation, inner_policy = resolve_inner_policy(inner_allocation)
+    outer_allocation, outer_policy = resolve_outer_policy(outer_allocation)
+
+    return AllocationPolicies(
+        inner_allocation=inner_allocation,
+        outer_allocation=outer_allocation,
+        inner_policy=inner_policy,
+        outer_policy=outer_policy,
+        inner_knobs=select_policy_knobs(inner_policy, INNER_POLICY_ARGS, knobs),
+        outer_knobs=select_policy_knobs(outer_policy, OUTER_POLICY_ARGS, knobs),
+    )
+
+def build_group_scores(
+        group_criterion: GroupBy,
+        groups: Dict[str, List[str]],
+        importance_map: Optional[Dict[int, float]]
+) -> Optional[Dict[str, float]]:
+    """
+    Score each group as a whole, for the outer level to allocate across.
+
+    Only the hierarchical criterion produces these: its groups are decoder
+    blocks, which is the one granularity end-to-end Block Influence is measured
+    at. Every other criterion returns None, so an outer policy that needs group
+    scores fails loudly instead of silently receiving something meaningless.
+    """
+    if group_criterion is not GroupBy.HIERARCHICAL or importance_map is None:
+        return None
+
+    group_scores: Dict[str, float] = {}
+
+    for name, keys in groups.items():
+        if not keys:
+            continue
+
+        layer_idx = get_layer_idx_from_key(keys[0])
+
+        if layer_idx in importance_map:
+            group_scores[name] = float(importance_map[layer_idx])
+
+    return group_scores
+
+def allocate_ratios(
+        group_criterion: Union[GroupBy, Literal["global", "decoder", "type", "hierarchical"]],
+        score_map: Dict,
+        layers_str: List[str],
+        target_ratio: float,
+        param_count_map: Dict[str, int],
+        offset: float = 1.5,
+        group_patterns: Dict[str, List[str]] | None = None,
+        bypass_early_layers: int = 2,
+        bypass_ratio: float = 0.0,
+        max_ratio: float = 0.9,
+        target_total_params: Optional[int] = None,
+        bypass_late_layers: int = -1,
+        num_layers: Optional[int] = None,
+        inner_allocation: Union[InnerAllocation, str] = InnerAllocation.WATERFILL,
+        outer_allocation: Union[OuterAllocation, str] = OuterAllocation.PARAM_SHARE,
+        shape_map: Optional[Dict[str, Tuple[int, int]]] = None,
+        importance_map: Optional[Dict[int, float]] = None,
+        softmax_temp: float = 1.0,
+        outer_offset: float = 1.5
+) -> Dict[str, float]:
+    """
+    Redistributes compression budget within each weight group.
+    Groups: MLP (gate, up, down), Q proj, K proj, V proj, Attention out proj.
+
+    Within each group, matrices with higher score get a lower
+    compression ratio and vice versa.
+
+    Bypassed layers (the first `bypass_early_layers` and the last
+    `bypass_late_layers`, either or both) are mathematically isolated from
+    redistribution and strictly assigned the bypass_ratio. A bypass_ratio
+    of 0.0 means 0% parameter removal (no compression) for those layers.
+    In case some layers are bypassed, it still preserves
+    the global target_ratio across the entire model,
+    giving a higher compression ratio to allowed layers.
+
+    For same-shape TYPE groups, this reduces to the usual V2 behavior.
+    For GLOBAL and DECODER groups, this preserves actual removed parameters.
+
+    This function is the shell: it owns grouping, the budget split and all the
+    instrumentation, while the two pluggable policies own the arithmetic that
+    turns scores into removal figures. Under HIERARCHICAL the two levels use
+    different signals: the outer one splits the budget across decoder blocks by
+    their end-to-end Block Influence, the inner one splits each block's share by
+    the local spectral scores.
+    """
+    if isinstance(group_criterion, str):
+        try:
+            group_criterion = GroupBy(group_criterion)
+        except ValueError:
+            raise ValueError(
+                f"Invalid `group_criterion`: '{group_criterion}'. "
+                f"Expected one of: {[e.value for e in GroupBy]}",
+            )
+
+    knobs = allocation_knobs(offset=offset, softmax_temp=softmax_temp, outer_offset=outer_offset)
+    policies = resolve_allocation_policies(inner_allocation, outer_allocation, knobs)
+    inner_knobs = policies.inner_knobs
+    outer_knobs = policies.outer_knobs
+
+    print(f"\n[BUDGET] Parameter-aware redistribution: {group_criterion.value.upper()}")
+    print(f"[BUDGET] Global target ratio: {target_ratio:.6f}")
+    print(
+        f"[BUDGET] Bypassing first {bypass_early_layers} and last "
+        f"{bypass_late_layers} layers with ratio {bypass_ratio:.6f}",
+    )
+    print(f"[BUDGET] Per-matrix max ratio: {max_ratio:.6f}")
+    print(f"[BUDGET] Outer policy: {policies.outer_allocation.value} | knobs: {outer_knobs}")
+    print(f"[BUDGET] Inner policy: {policies.inner_allocation.value} | knobs: {inner_knobs}")
+
+    budget = compute_active_budget(
+        layers_str=layers_str,
+        param_count_map=param_count_map,
+        target_ratio=target_ratio,
+        bypass_early_layers=bypass_early_layers,
+        bypass_ratio=bypass_ratio,
+        max_ratio=max_ratio,
+        target_total_params=target_total_params,
+        bypass_late_layers=bypass_late_layers,
+        num_layers=num_layers,
+    )
+
+    selected_total_params = budget.selected_params
+    target_total_params = budget.target_total_params
+    active_keys = budget.active_keys
+    active_budget = budget.active_budget
+    active_target_ratio = budget.active_ratio
+
+    # Bypassed matrices are pinned before any redistribution happens
+    ratio_map: Dict[str, float] = {k: bypass_ratio for k in budget.bypassed_keys}
+
+    print(f"[BUDGET] Selected params:           {selected_total_params:,}")
+    print(f"[BUDGET] Target denominator params: {target_total_params:,}")
+    print(f"[BUDGET] Target removed params:     {budget.target_removed:,.0f}")
+    print(f"[BUDGET] Bypassed matrices:         {len(budget.bypassed_keys)}")
+    print(f"[BUDGET] Bypassed removed params:   {budget.bypassed_removed:,.0f}")
+    print(f"[BUDGET] Active matrices:           {len(active_keys)}")
+    print(f"[BUDGET] Active params:             {budget.active_params:,}")
+    print(f"[BUDGET] Active budget:             {active_budget:,.0f}")
+    print(f"[BUDGET] Active target ratio:       {active_target_ratio:.6f}")
+
+    grouping = build_allocation_groups(
+        group_criterion=group_criterion,
+        active_keys=active_keys,
+        score_map=score_map,
+        group_patterns=group_patterns,
+    )
+    groups = grouping.groups
+    missing_score_keys = grouping.missing_score_keys
+    unmatched_keys = grouping.unmatched_keys
+
+    grouped_keys = set()
+    for keys in groups.values():
+        grouped_keys.update(keys)
+
+    fallback_keys = [k for k in active_keys if k not in grouped_keys]
+
+    # Fallback keys get the active target ratio
+    fallback_removed = 0.0
+    for k in fallback_keys:
+        ratio_map[k] = active_target_ratio
+        fallback_removed += param_count_map[k] * active_target_ratio
+
+    remaining_budget = max(0.0, active_budget - fallback_removed)
+    grouped_params = sum(param_count_map[k] for k in grouped_keys)
+
+    print(f"[BUDGET] Grouped active params:    {grouped_params:,}")
+    print(f"[BUDGET] Fallback keys:            {len(fallback_keys)}")
+    print(f"[BUDGET] Remaining group budget:   {remaining_budget:,.0f}")
+
+    warn_on_degenerate_scores(groups, score_map)
+
+    group_scores = build_group_scores(group_criterion, groups, importance_map)
+
+    if group_scores is not None:
+        print(f"[BUDGET] Group scores available for {len(group_scores)}/{len(groups)} groups")
+
+    group_budgets = policies.outer_policy(
+        **select_policy_arguments(
+            policies.outer_policy,
+            {
+                "groups": groups,
+                "param_count_map": param_count_map,
+                "remaining_budget": remaining_budget,
+                "max_ratio": max_ratio,
+                "group_scores": group_scores,
+                **outer_knobs,
+            },
+        ),
+    )
+
+    for group_name, keys in groups.items():
+        if not keys:
+            print(f"  [GROUP: {group_name}] Empty")
+            continue
+
+        group_params = sum(param_count_map[k] for k in keys)
+        group_budget = group_budgets.get(group_name, 0.0)
+
+        group_ratio_map = policies.inner_policy(
+            **select_policy_arguments(
+                policies.inner_policy,
+                {
+                    "keys": keys,
+                    "score_map": score_map,
+                    "param_count_map": param_count_map,
+                    "group_budget": group_budget,
+                    "max_ratio": max_ratio,
+                    "shape_map": shape_map,
+                    **inner_knobs,
+                },
+            ),
+        )
+
+        ratio_map.update(group_ratio_map)
+
+        actual_group_removed = sum(
+            param_count_map[k] * ratio_map[k]
+            for k in keys
+        )
+
+        print(
+            f"  [GROUP: {group_name}] "
+            f"matrices={len(keys):>3} | "
+            f"params={group_params:>14,} | "
+            f"budget={group_budget:>14,.0f} | "
+            f"actual_removed~{actual_group_removed:>14,.0f}",
+        )
+
+        for k in keys:
+            # The offset only shapes the allocation of the policies that read it
+            offset_note = ""
+            if "offset" in inner_knobs:
+                offset_note = f" (+ offset = {(score_map[k] + offset):.6f})"
+
+            print(
+                f"    - {k:<55} "
+                f"| params={param_count_map[k]:>12,} "
+                f"| ratio={ratio_map[k]:.6f} "
+                f"| score={score_map[k]:.6f}{offset_note}",
+            )
+
+    actual_removed = sum(
+        param_count_map[k] * ratio_map.get(k, 0.0)
+        for k in layers_str
+    )
+
+    print("\n[BUDGET] Allocation Summary:")
+    print(f"  - Target overall ratio:                 {target_ratio:.6f}")
+    print(f"  - Actual selected ratio approx: {actual_removed / selected_total_params:.6f}")
+    print(f"  - Actual overall ratio approx:  {actual_removed / target_total_params:.6f}")
+    print(f"  - Target removed:               {budget.target_removed:,.0f}")
+    print(f"  - Actual removed:               {actual_removed:,.0f}")
+    print(f"  - Missing score keys:           {len(missing_score_keys)}")
+    print(f"  - Unmatched keys:               {len(unmatched_keys)}")
+    print("-" * 80 + "\n")
+
+    return ratio_map
 
 def resolve_grad_accum_steps(effective_batch_size: int, micro_batch_size: int, backend: str) -> int:
     """The HF Trainer needs an exact split, the custom loop rounds up"""
@@ -1445,7 +2823,17 @@ def build_run_name(
         bypass_early_layers: int,
         sequential_update: bool,
         sequential_update_method: str,
-        is_v2: bool
+        is_v2: bool,
+        bypass_late_layers: int = -1,
+        max_ratio: float = 0.9,
+        inner_allocation: str = InnerAllocation.WATERFILL.value,
+        outer_allocation: str = OuterAllocation.PARAM_SHARE.value,
+        bypass_ratio: float = DEFAULT_BYPASS_RATIO,
+        fusion_alpha: float = DEFAULT_FUSION_ALPHA,
+        seed: Optional[int] = DEFAULT_SEED,
+        offset: float = 1.5,
+        softmax_temp: float = 1.0,
+        outer_offset: float = 1.5
 ) -> str:
     """
     Encode a whole compression configuration into one filename token.
@@ -1453,10 +2841,15 @@ def build_run_name(
     This name identifies the checkpoint, the evaluation JSON and the log file of
     a run, and `generate_tables.py` parses it back to label the result tables,
     so it has to stay stable.
+
+    Dimensions added after the original layout only emit a token when they leave
+    their default, which keeps every pre-existing run name byte-identical.
     """
     # Enum members hold their value as a plain string, keep the token stable
     group_criterion = str(getattr(group_criterion, "value", group_criterion))
     score_metric = str(getattr(score_metric, "value", score_metric))
+    inner_allocation = str(getattr(inner_allocation, "value", inner_allocation))
+    outer_allocation = str(getattr(outer_allocation, "value", outer_allocation))
 
     compresses_everything = (
         compress_att_q
@@ -1470,9 +2863,67 @@ def build_run_name(
     score_metric_str = ""
     group_criterion_str = ""
     if heterogeneous:
-        # Score metrics such as "norm|2" carry a separator that filenames cannot hold
-        score_metric_str = "_" + score_metric.replace("|", "")
+        # Score metrics carry a separator that filenames cannot hold. "norm|2"
+        # drops it, since names in that form are already on disk; a composite
+        # metric turns it into "_", which stays readable across three parts
+        if score_metric.startswith(COMPOSITE_PREFIX):
+            score_metric_str = "_" + score_metric.replace("|", "_")
+        else:
+            score_metric_str = "_" + score_metric.replace("|", "")
+
         group_criterion_str = f"_{group_criterion}"
+
+    # The bare-integer bypass token is kept whenever only the early end is used,
+    # so names already on disk keep parsing; both ends need a prefixed form
+    bypass_str = ""
+    if bypass_late_layers > 0:
+        bypass_str = f"_byp{max(0, bypass_early_layers)}-{bypass_late_layers}"
+    elif bypass_early_layers >= 0:
+        bypass_str = f"_{bypass_early_layers}"
+
+    max_ratio_str = "" if max_ratio == 0.9 else f"_cap{round(max_ratio, 2)}"
+
+    # A knob earns a token only when it leaves its default *and* the run actually
+    # reads it, so passing --offset to a policy that ignores it cannot fork the
+    # name into two entries for what is the same run
+    knob_tokens: List[str] = []
+
+    if seed is not None and seed != DEFAULT_SEED:
+        knob_tokens.append(f"_seed{seed}")
+
+    bypasses_any_layer = bypass_early_layers > 0 or bypass_late_layers > 0
+    if bypasses_any_layer and bypass_ratio != DEFAULT_BYPASS_RATIO:
+        knob_tokens.append(f"_bypr{round(bypass_ratio, 3)}")
+
+    if heterogeneous:
+        if score_metric.startswith(COMPOSITE_PREFIX) and fusion_alpha != DEFAULT_FUSION_ALPHA:
+            knob_tokens.append(f"_fa{round(fusion_alpha, 3)}")
+
+        # The policies declare the knobs they read as named parameters, so this
+        # is the same relevance test the sidecar uses, from the same signatures
+        policies = resolve_allocation_policies(
+            inner_allocation,
+            outer_allocation,
+            allocation_knobs(offset=offset, softmax_temp=softmax_temp, outer_offset=outer_offset),
+        )
+        live_knobs = {**policies.inner_knobs, **policies.outer_knobs}
+
+        for knob, prefix, default in KNOB_FILENAME_TOKENS:
+            value = live_knobs.get(knob)
+            if value is not None and value != default:
+                knob_tokens.append(f"_{prefix}{round(value, 3)}")
+
+    knob_str = "".join(knob_tokens)
+
+    # Placed after the bypass token so `parse_filename` still finds that one at
+    # the position it expects, and simply ignores these trailing tokens
+    policy_str = ""
+    if heterogeneous and inner_allocation != InnerAllocation.WATERFILL.value:
+        policy_str = f"_{inner_allocation}"
+
+    outer_policy_str = ""
+    if heterogeneous and outer_allocation != OuterAllocation.PARAM_SHARE.value:
+        outer_policy_str = f"_out{outer_allocation}"
 
     parts = [
         sanitize_model_name(model_name),
@@ -1486,12 +2937,98 @@ def build_run_name(
         "_het" if heterogeneous else "_hom",
         group_criterion_str,
         score_metric_str,
-        f"_{bypass_early_layers}" if bypass_early_layers >= 0 else "",
+        bypass_str,
+        policy_str,
+        outer_policy_str,
+        max_ratio_str,
+        knob_str,
         f"_upd_{sequential_update_method}" if sequential_update else "",
         "_v2" if is_v2 else "",
     ]
 
     return "".join(parts)
+
+def sanitize_run_args(args_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop credentials before a run configuration is written next to results"""
+    return {k: v for k, v in args_dict.items() if k not in REDACTED_ARG_KEYS}
+
+def run_config_path(directory: str, run_name: str) -> str:
+    return os.path.join(directory, f"{run_name}{RUN_CONFIG_SUFFIX}")
+
+def save_run_config(directory: str, run_name: str, config: Dict[str, Any]) -> str:
+    """
+    Write, or merge into, the sidecar describing how a run was configured.
+
+    The filename can only carry a handful of tokens and is parsed positionally,
+    so it cannot express every dimension of a run. This sidecar is the
+    authoritative record instead, and `generate_tables.py` prefers it over
+    `parse_filename`. Writers are additive: the compression step records the
+    realized allocation, the entry point records the resolved arguments.
+    """
+    os.makedirs(directory, exist_ok=True)
+    path = run_config_path(directory, run_name)
+
+    merged: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as config_file:
+                merged = json.load(config_file)
+        except (OSError, ValueError) as error:
+            print(f"[CONFIG][WARNING] Overwriting unreadable sidecar {path}: {error}")
+            merged = {}
+
+    merged.update(config)
+    merged["run_name"] = run_name
+    merged["schema_version"] = RUN_CONFIG_SCHEMA_VERSION
+
+    with open(path, "w", encoding="utf-8") as config_file:
+        json.dump(merged, config_file, indent=2, default=str)
+
+    print(f"[CONFIG] Wrote run config: {path}")
+
+    return path
+
+def summarize_allocation(
+        ratio_map: Dict[str, float],
+        param_count_map: Dict[str, int],
+        layers_str: List[str],
+        target_ratio: float,
+        selected_total_params: int,
+        target_total_params: int,
+        bypassed_keys: List[str],
+        active_keys: List[str],
+        policies: Optional[AllocationPolicies] = None
+) -> Dict[str, Any]:
+    """
+    Realized allocation facts, recorded so results can be checked against target.
+
+    Allocation policies are compared at a fixed budget, so a run whose realized
+    ratio drifted from its target is not comparable to one that hit it. Keeping
+    both numbers next to the results makes that visible instead of implicit.
+
+    `policies` is absent on homogeneous runs, which allocate nothing.
+    """
+    actual_removed = sum(param_count_map[k] * ratio_map.get(k, 0.0) for k in layers_str)
+    assigned_ratios = [ratio_map.get(k, 0.0) for k in layers_str]
+
+    policy_record = policies.describe() if policies is not None else {}
+
+    return {
+        **policy_record,
+        "target_ratio": target_ratio,
+        "selected_params": selected_total_params,
+        "target_total_params": target_total_params,
+        "target_removed_params": target_ratio * target_total_params,
+        "actual_removed_params": actual_removed,
+        "realized_selected_ratio": actual_removed / selected_total_params if selected_total_params else 0.0,
+        "realized_overall_ratio": actual_removed / target_total_params if target_total_params else 0.0,
+        "num_matrices": len(layers_str),
+        "num_bypassed_matrices": len(bypassed_keys),
+        "num_active_matrices": len(active_keys),
+        "min_assigned_ratio": min(assigned_ratios) if assigned_ratios else 0.0,
+        "max_assigned_ratio": max(assigned_ratios) if assigned_ratios else 0.0,
+        "ratio_map": ratio_map,
+    }
 
 def save_compressed_checkpoint(
         model: nn.Module,
@@ -1639,11 +3176,12 @@ def ppl_eval(
         model: nn.Module,
         tokenizer,
         dataset_name: str = "wikitext",
-        subset: str = "wikitext-2-raw-v1",
+        subset: Optional[str] = "wikitext-2-raw-v1",
         split: str = "test",
         eval_max_length: int = 2048,
         batch_size: Union[int, str] = "auto",
-        device: str = "cuda"
+        device: str = "cuda",
+        data_files: Optional[Dict[str, str]] = None
 ) -> float:
     """
     Evaluates perplexity using the exact same methodology as the SVD-LLM paper.
@@ -1661,7 +3199,14 @@ def ppl_eval(
       4. Batches containing non-finite logits (NaN or inf) are skipped.
     """
     # Concatenate all samples with "\n\n"
-    data = load_dataset(path=dataset_name, name=subset, split=split, num_proc=8)
+    # `data_files` pins a specific shard for datasets whose split is too large to
+    # join whole, so `num_proc` is dropped there to keep the single-file read simple
+    if data_files is None:
+        data = load_dataset(path=dataset_name, name=subset, split=split, num_proc=8)
+    else:
+        data = load_dataset(path=dataset_name, name=subset, split=split, data_files=data_files)
+
+    print(f"[PPL] {dataset_name} | subset={subset} | split={split} | documents={len(data):,}") # pyright: ignore
     text = "\n\n".join(data["text"]) # pyright: ignore
     encodings = tokenizer(text, truncation=False, padding=False, return_tensors="pt")
 

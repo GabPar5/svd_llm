@@ -87,6 +87,7 @@ MATRIX_TOKEN_MAP = {
 GROUPING_TOKENS = {
     "global": "global",
     "decoder": "decoder",
+    "hierarchical": "hierarchical",
     "type": "matrix_type",
     "matrix": "matrix",
     "matrix_type": "matrix",
@@ -107,12 +108,50 @@ SCORING_TOKENS = {
     "full_norm_sq_tail_eff_rank": "full_norm_sq_tail_eff_rank",
 }
 
+# Local halves a composite metric can fuse, and what it can fuse them with
+COMPOSITE_LOCAL_TOKENS = (
+    "truncation",
+    "truncation_sq",
+    "entropy",
+    "entropy_sq",
+    "eff_rank",
+    "eff_rank_sq",
+    "full_norm_tail_entropy",
+    "full_norm_sq_tail_entropy",
+    "full_norm_tail_eff_rank",
+    "full_norm_sq_tail_eff_rank",
+)
+END_TO_END_TOKENS = ( "block_influence", )
+
+# Both spellings resolve to the same label: the sidecar records the flag
+# verbatim, while a filename cannot hold its separator and joins with "_".
+# `norm|p` composites are left out because p is unbounded; those rows fall back
+# to the sidecar, which is preferred anyway
+SCORING_TOKENS.update({
+    spelling: f"composite_{local}_{end_to_end}"
+    for local in COMPOSITE_LOCAL_TOKENS
+    for end_to_end in END_TO_END_TOKENS
+    for spelling in ( f"composite|{local}|{end_to_end}", f"composite_{local}_{end_to_end}" )
+})
+
 SCHEME_TOKENS = {
     "het": "het",
     "heterogeneous": "het",
     "hom": "hom",
     "homogeneous": "hom",
 }
+
+# Sidecar written next to every result by main.py, see `save_run_config`
+RUN_CONFIG_SUFFIX = ".config.json"
+
+# Compression targets, in the order the filename convention lists them
+MATRIX_ARG_ORDER = (
+    ("compress_att_q", "q"),
+    ("compress_att_k", "k"),
+    ("compress_att_v", "v"),
+    ("compress_att_out", "out"),
+    ("compress_mlp", "mlp"),
+)
 
 PREFERRED_METRICS = [
     "acc,none",
@@ -234,6 +273,13 @@ def find_scoring(tokens: List[str], start_idx: int) -> Tuple[str, Optional[int],
         cand = "_".join(tokens[start_idx:end])
         if cand in SCORING_TOKENS:
             return SCORING_TOKENS[cand], start_idx, end - start_idx
+
+    # A composite name embeds its local half ("composite_truncation_..."), which
+    # the token-by-token fallback would happily mistake for the whole metric and
+    # then read the bypass count off the wrong position. An unrecognized
+    # composite is reported as such and left to the sidecar
+    if start_idx < len(tokens) and tokens[start_idx] == "composite":
+        return "unknown", None, 0
 
     # Fallback: scan token by token
     for i in range(start_idx, len(tokens)):
@@ -386,6 +432,74 @@ def parse_filename(path: Path) -> Dict[str, Any]:
     }
 
 
+def is_run_config(path: Path) -> bool:
+    return path.name.endswith(RUN_CONFIG_SUFFIX)
+
+
+def load_run_config(result_path: Path) -> Optional[Dict[str, Any]]:
+    """Read the sidecar written beside a result file, if the run produced one"""
+    sidecar = result_path.with_name(f"{result_path.stem}{RUN_CONFIG_SUFFIX}")
+
+    if not sidecar.is_file():
+        return None
+
+    try:
+        with sidecar.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"[WARNING] Ignoring unreadable run config {sidecar}: {error}")
+        return None
+
+
+def row_from_run_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build the configuration columns of a row straight from the run sidecar.
+
+    `parse_filename` has to infer these positionally from a name that cannot
+    carry every dimension, so whenever the sidecar exists it wins.
+    """
+    run_args = config.get("args")
+
+    if not isinstance(run_args, dict):
+        return {}
+
+    matrices = [token for key, token in MATRIX_ARG_ORDER if run_args.get(key)]
+    heterogeneous = bool(run_args.get("het"))
+
+    # The bypass column has always meant "layers left out of redistribution",
+    # so both ends are summed rather than reported separately
+    bypassed = max(0, int(run_args.get("bypass_early_layers", -1) or -1))
+    bypassed += max(0, int(run_args.get("bypass_late_layers", -1) or -1))
+
+    row: Dict[str, Any] = {
+        "matrices": "+".join(matrices) if matrices else "unknown",
+        "compression_ratio": round(float(run_args.get("compression_ratio", 0.0)), 2),
+        "scheme": "het" if heterogeneous else "hom",
+        "grouping": GROUPING_TOKENS.get(
+            str(run_args.get("group_criterion", "")),
+            str(run_args.get("group_criterion", "--")),
+        ) if heterogeneous else "--",
+        "scoring": SCORING_TOKENS.get(
+            str(run_args.get("score_metric", "")),
+            str(run_args.get("score_metric", "--")),
+        ) if heterogeneous else "--",
+        "bypassed_layers": bypassed,
+        "filename_version": "v2" if run_args.get("run_v2") else "",
+        "is_original": False,
+    }
+
+    model = run_args.get("model")
+    if model:
+        row["model"] = str(model).replace("/", "_").replace("-", "_")
+
+    # Recorded by the compression step; lets tables show target vs actual
+    allocation = config.get("allocation")
+    if isinstance(allocation, dict):
+        row["realized_ratio"] = allocation.get("realized_overall_ratio")
+
+    return row
+
+
 def pick_accuracy_metric(task_result: Dict[str, Any]) -> Tuple[Optional[str], Optional[Any]]:
     for metric_name in PREFERRED_METRICS:
         if metric_name in task_result:
@@ -423,7 +537,12 @@ def load_result(path: Path, prefer_lm_eval_model_name: bool = False) -> Dict[str
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
+    # The filename stays the fallback for runs predating the sidecar
     row = parse_filename(path)
+
+    run_config = load_run_config(path)
+    if run_config is not None:
+        row.update(row_from_run_config(run_config))
 
     if prefer_lm_eval_model_name:
         lm_eval_model = data.get("config", {}).get("model")
@@ -857,7 +976,8 @@ def collect_rows(
     pattern: str,
     prefer_lm_eval_model_name: bool = False,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    paths = sorted(input_dir.glob(pattern))
+    # Sidecars share the .json extension but describe a result, they are not one
+    paths = sorted(p for p in input_dir.glob(pattern) if not is_run_config(p))
 
     if not paths:
         raise FileNotFoundError(f"No files matched {input_dir / pattern}")

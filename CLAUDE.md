@@ -34,8 +34,13 @@ python main.py --model "Qwen/Qwen2.5-7B" --use_compressed \
 # Run the sequential low-rank update on a TAW-only checkpoint (requires --use_compressed + path)
 python main.py ... --update_taw_only --sequential_update_method lora --sequential_lora_backend trainer
 
-# Experiment grid: reads args/base_args.json and args/experiments.json (both gitignored), runs main.py per config
-python run_experiments.py
+# Experiment grid: merges args/base_args.json into each entry of a stage file (both gitignored), runs main.py per config.
+# EXPERIMENTS.md documents the stages; --dry_run previews, and an unresolved "__PLACEHOLDER__" aborts before the first run
+python run_experiments.py args/experiments_stage2_score_grouping.json
+
+# Explore allocations offline from the cached spectra, no GPU, seconds per sweep
+python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
+    --compression_ratio 0.2 --sweep "score_metric=truncation,eff_rank_sq"
 
 # Reports from the eval JSONs
 python generate_tables.py ./output/eval/<model_dir> -f latex -o tables.tex
@@ -67,7 +72,9 @@ Reuse these instead of re-deriving the logic; each one is the single source of t
 | Run naming / paths | `build_run_name`, `sanitize_model_name`, `parse_dataset_spec` |
 | Checkpoint I/O | `save_compressed_checkpoint`, `load_compressed_model`, `apply_lowrank`, `collect_non_persistent_buffers`, `restore_non_persistent_buffers` |
 | Calibration replay | `capture_layer0_inputs`, `decoder_kwargs_to_device`, `decoder_layer_output`, `tree_map_tensors`, `group_keys_by_decoder_layer` |
-| Budget & scoring | `compute_active_budget` (returns an `ActiveBudget` breakdown), `allocate_param_weighted_group`, `redundancy_from_scores`, `compute_spectrum_score`, `normalized_spectrum`, `spectrum_entropy` |
+| Budget & scoring | `compute_active_budget` (returns an `ActiveBudget` breakdown), `redundancy_from_scores`, `compute_spectrum_score`, `normalized_spectrum`, `spectrum_entropy`, `parse_composite_metric`, `compose_scores`, `normalize_block_influence` |
+| Ratio allocation | `allocate_ratios` (the shell), `build_allocation_groups`, `build_group_scores`, `resolve_allocation_policies`, `allocation_knobs`, `select_policy_arguments`, `INNER_POLICIES` / `OUTER_POLICIES` and the policies they register |
+| Allocation primitives | `waterfill_ratios` (ratio space), `bounded_proportional_split` (rank space), `clamp_group_budget`, `build_shape_map`, `rank_cost`, `matrix_shapes_from_config` |
 | Sequential update | `validate_lora_batching`, `resolve_grad_accum_steps`, `build_lora_update_metadata`; `prepare_lora_update_data`, `run_local_u_update`, `lora_factor_targets`, `LORA_UPDATE_PHASES` (in `src/svd_llm.py`) |
 | Device plumbing | `pin_memory_enabled`, `synchronize_device`, `cuda_cleanup`, `set_attn_implementation`, `vram_usage`, `ram_usage` |
 
@@ -75,7 +82,7 @@ Reuse these instead of re-deriving the logic; each one is the single source of t
 
 1. **Target selection.** `generate_paths` builds fully-qualified module paths (`model.layers.N.mlp.gate_proj`, …) from the `--compress_*` flags. These path strings are the primary key for everything downstream: whitening files, `score_map`, `ratio_map`, `rank_map`, state-dict keys.
 2. **Whitening.** `get_whitening_matrices` captures decoder-layer-0 inputs once (via a `Catcher` module that raises `CatcherExit`), then replays activations layer by layer, accumulating `XXᵀ` in **fp64** through forward hooks. Per matrix it saves either the Cholesky factor (V1) or the `(U_s, L_s)` eigendecomposition (V2) as an individual `.pt` under `whitening_matrices/<model>/v1|v2/`. Runs can be chunked with `--whitening_start_layer/--whitening_end_layer`; between chunks, layer-input activations are persisted to `activation_checkpoints/` and validated on load against model name, version, `n_tokens`, and layer index.
-3. **Ratio allocation.** Homogeneous: one ratio for all active matrices. Heterogeneous (`--het`): an extra `svdvals` pass computes a per-matrix score (`--score_metric`), then `allocate_ratios` converts scores to redundancy weights via `1 / log(score + offset)` and water-fills the removal budget within groups (`--group_criterion` = `type` | `decoder` | `global`), capped at `max_ratio = 0.9` per matrix. The allocation preserves *removed parameters* (`Σ paramsᵢ · ratioᵢ = budget`), not the mean ratio, which is why `param_count_map` is threaded everywhere. `--bypass_early_layers` pins the first N decoder layers to `--bypass_ratio` and removes them from redistribution; the remaining budget is pushed onto the active matrices so the global target still holds. `--ratio_scope all` keeps the denominator at all q/k/v/o+MLP params even when only a subset is compressed.
+3. **Ratio allocation.** Homogeneous: one ratio for all active matrices. Heterogeneous (`--het`): an extra `svdvals` pass computes a per-matrix score (`--score_metric`), then `allocate_ratios` (in `src/utils.py`, so the offline tool can reach it without importing the GPU-only pipeline) forms the groups (`--group_criterion` = `type` | `decoder` | `global` | `hierarchical`), hands each group a share of the budget through an **outer** policy (`OUTER_POLICIES`, `--outer_allocation`, default `param_share`) and splits that share across the group's matrices through an **inner** policy (`INNER_POLICIES`, `--inner_allocation`, default `waterfill` = redundancy weights `1 / log(score + offset)`), capped at `--max_ratio` per matrix. A policy declares everything it needs — data and knobs — as named parameters and `select_policy_arguments` hands it only those; `select_policy_knobs` derives from the same signature what the sidecar records. `hierarchical` groups by decoder block like `decoder` and additionally exposes each block's cached Block Influence to the outer policy, which is what makes the two-level allocation possible; with `param_share` it reproduces `decoder` exactly. The allocation preserves *removed parameters* (`Σ paramsᵢ · ratioᵢ = budget`), not the mean ratio, which is why `param_count_map` is threaded everywhere. `--bypass_early_layers` pins the first N decoder layers to `--bypass_ratio` and removes them from redistribution; the remaining budget is pushed onto the active matrices so the global target still holds. `--ratio_scope all` keeps the denominator at all q/k/v/o+MLP params even when only a subset is compressed.
 4. **Truncation.** Per matrix: `rank = out*in*(1 - ratio) / (out + in)`, SVD of the whitened weight, split into `W_u`/`W_v`, then the `nn.Linear` is swapped for a `LowRank`. A ratio of exactly `0.0` skips SVD and leaves the layer dense (no `rank_map` entry). Math runs in fp64, factors are cast to `--compressed_dtype`. Each replacement is immediately checked by `check_weights_relative_difference`, `check_lowrank_equivalence`, and `check_layer_activation_error`.
 5. **Sequential update** (optional, `--sequential_update`, or `--update_taw_only` on an existing checkpoint). Two implementations: `lora` (paper/upstream-faithful, tunes `W_u` then `W_v` with PEFT and merges after each phase; `trainer` or `custom` backend; fine-tunes on Alpaca via `--finetune_dataset`) and `local_u` (low-VRAM closed-form ridge solve for `W_u` only, keeping `W_v` fixed, layer-by-layer against a dense reference model).
 
@@ -95,7 +102,9 @@ These models do not fit in VRAM alongside their decompositions, so the code is w
 
 ### Filename convention is an interface
 
-The run name encodes the full configuration: `<model>_q_k_v_out_mlp_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_upd_<method>][_v2]`. It determines the checkpoint filename, the eval JSON filename, and the log filename, and `generate_tables.py:parse_filename` parses it back out to build the table rows. `build_run_name` is the only place that constructs it — change it there, and update `parse_filename` to match, or tables silently mis-attribute rows.
+The run name encodes the full configuration: `<model>_q_k_v_out_mlp_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_<inner_allocation>][_out<outer_allocation>][_cap<max_ratio>][_<knobs>][_upd_<method>][_v2]`. It determines the checkpoint filename, the eval JSON filename, and the log filename, and `generate_tables.py:parse_filename` parses it back out to build the table rows. `build_run_name` is the only place that constructs it — change it there, and update `parse_filename` to match, or tables silently mis-attribute rows.
+
+Every token past `<bypassed>` is emitted only when its flag leaves its default, which is what keeps names that predate an option byte-identical; `parse_filename` reads positionally up to `<bypassed>` and ignores the rest. The `<knobs>` group (`_seed`, `_bypr`, `_fa`, `_off`, `_temp`, `_ooff`, listed in `KNOB_FILENAME_TOKENS`) additionally requires that the run *reads* the knob — relevance is decided from the policy signatures via `resolve_allocation_policies`, the same test the sidecar uses. A knob that a sweep varies but the name cannot express silently collapses that sweep onto one checkpoint, so any new swept flag needs a token here.
 
 ### Evaluation
 
@@ -103,11 +112,15 @@ The run name encodes the full configuration: `<model>_q_k_v_out_mlp_<ratio_scope
 
 ### Output layout
 
-Everything under `--save_path` (default `./output`, gitignored): `models/`, `eval/`, `logs/`, `whitening_matrices/<model>/<v1|v2>/`, `activation_checkpoints/`, `calibration_datasets/`, `sequential_lora_trainer/`.
+Everything under `--save_path` (default `./output`, gitignored): `models/`, `eval/`, `logs/`, `whitening_matrices/<model>/<v1|v2>/` (plus its `spectra/` cache and `layer_importance.pt`), `activation_checkpoints/`, `calibration_datasets/`, `sequential_lora_trainer/`, `allocation_reports/<model>/`.
 
 ## Gotchas
 
-- A new score metric has to be registered in three places: the `ScoreMetric` enum, the `match` in `compute_spectrum_score`, and `SCORING_TOKENS` in `generate_tables.py` (otherwise tables label it `unknown`). Accepted today: `truncation`, `truncation_sq`, `entropy`, `entropy_sq`, `eff_rank`, `eff_rank_sq`, the four `full_norm_*_tail_*` variants, and `norm|<p>` (handled by `ScoreMetric._missing_`, with `p` parsed by `parse_norm_order`).
+- A new score metric has to be registered in three places: the `ScoreMetric` enum, the `match` in `compute_spectrum_score`, and `SCORING_TOKENS` in `generate_tables.py` (otherwise tables label it `unknown`). Accepted today: `truncation`, `truncation_sq`, `entropy`, `entropy_sq`, `eff_rank`, `eff_rank_sq`, the four `full_norm_*_tail_*` variants, `norm|<p>` (handled by `ScoreMetric._missing_`, with `p` parsed by `parse_norm_order`), and `composite|<local>|block_influence` (also `_missing_`, validated against `END_TO_END_SCORES`, split from the right so a `norm|p` local half survives). A composite score is fused by `compose_scores` *after* the score pass — `compute_spectrum_score` stays purely spectral — and a new local metric is therefore composite-ready for free, but needs its `composite|...` spellings added to `SCORING_TOKENS` too.
+- A per-block score fused into a per-matrix one is constant inside a `decoder`/`hierarchical` group, so `--fusion_alpha 1` there is exactly homogeneous compression. `warn_on_degenerate_scores` prints a `[BUDGET][WARNING]` for that and any other case where scores vary by less than `DEGENERATE_SCORE_SPREAD` inside every group.
 - `--whitening_only` terminates with `SystemExit(0)` from inside `compress_svd_llm`.
-- Adding a compression-target flag means updating `generate_paths`, `build_run_name`, `--group_patterns`, and `MATRIX_TOKEN_MAP` in `generate_tables.py`.
+- Adding a compression-target flag means updating `generate_paths`, `matrix_shapes_from_config` (which has to name the same matrices, for offline analysis), `build_run_name`, `--group_patterns`, and `MATRIX_TOKEN_MAP` in `generate_tables.py`.
+- A new allocation policy has to be written *and* registered in `INNER_POLICIES` / `OUTER_POLICIES`: `--inner_allocation`'s choices come from the registry, so an enum member without an entry is rejected with `NotImplementedError` rather than silently offered. It also has to be classified in `RATIO_SPACE_POLICIES` or `RANK_SPACE_POLICIES`, which is what `allocation_report.py` uses to decide whether a constant score must flatten the allocation.
+- A new policy knob is a named parameter on the policy plus an entry in `allocation_knobs` plus a flag on `main.py` and `allocation_report.py`. Nothing else: the shell routes it by signature.
+- Rank-space policies must go through `bounded_proportional_split`, not a clamp-and-redistribute loop. Pinning an entry to its lower bound early can strand budget that only that entry could have absorbed, which silently over-compresses.
 - The code targets a transformers release that accepts `dtype=` on `from_pretrained`/`from_config` (older releases spell it `torch_dtype`), so it will not run on transformers 4.4x.

@@ -347,16 +347,49 @@ if __name__ == "__main__":
         help='Number of starting layers which bypass heterogeneous compression (or compression at all)',
     )
     parser.add_argument(
+        '--bypass_late_layers',
+        type=int,
+        default=-1,
+        help='Number of ending layers which bypass heterogeneous compression (or compression at all). Can be combined with --bypass_early_layers',
+    )
+    parser.add_argument(
         '--bypass_ratio',
         type=float,
         default=0.0,
-        help='Compression ratio for the bypassed layers',
+        help='Compression ratio for the bypassed layers, applied to both ends',
+    )
+    parser.add_argument(
+        '--max_ratio',
+        type=float,
+        default=0.9,
+        help='Upper bound on the compression ratio any single matrix may receive, shared by every allocation policy',
     )
     parser.add_argument(
         '--group_criterion',
         type=str,
         default="type",
-        help='Criterion used to group weight matrices in heterogeneous setting. Possible values are "type", "global" and "decoder"',
+        choices=[criterion.value for criterion in GroupBy],
+        help=(
+            'Criterion used to group weight matrices in heterogeneous setting. "hierarchical" groups by decoder '
+            'block like "decoder" and additionally lets --outer_allocation score whole blocks by Block Influence'
+        ),
+    )
+    parser.add_argument(
+        '--inner_allocation',
+        type=str,
+        default=InnerAllocation.WATERFILL.value,
+        choices=[policy.value for policy in INNER_POLICIES],
+        help='Policy that splits a group budget across the matrices inside it. Only used in heterogeneous setting',
+    )
+    parser.add_argument(
+        '--outer_allocation',
+        type=str,
+        default=OuterAllocation.PARAM_SHARE.value,
+        choices=[policy.value for policy in OUTER_POLICIES],
+        help=(
+            'Policy that splits the budget across groups. "waterfill" needs --group_criterion hierarchical, since '
+            'only that criterion scores whole decoder blocks'
+        ),
     )
     parser.add_argument(
         '--group_patterns',
@@ -375,14 +408,44 @@ if __name__ == "__main__":
             "variants \"full_norm_tail_entropy\", \"full_norm_sq_tail_entropy\", "
             "\"full_norm_tail_eff_rank\" and \"full_norm_sq_tail_eff_rank\", plus "
             "\"norm|p\" for the p-Schatten norm of the truncated tail, where p is a "
-            "number, \"inf\" or \"-inf\""
+            "number, \"inf\" or \"-inf\". Prefixing any of them as "
+            "\"composite|<local>|block_influence\" fuses that spectral score with the "
+            "end-to-end influence of the decoder block, weighted by --fusion_alpha"
+        ),
+    )
+    parser.add_argument(
+        '--fusion_alpha',
+        type=float,
+        default=0.5,
+        help=(
+            'Weight of the end-to-end half of a composite score metric, in [0, 1]. 0 keeps the local score alone '
+            '(in log form), 1 the block influence alone. Ignored by non-composite metrics'
         ),
     )
     parser.add_argument(
         '--offset',
         type=float,
         default=1.5,
-        help='Offset added to scores to avoid log(x) with x <= 1',
+        help='Offset added to scores to avoid log(x) with x <= 1. Read by the "waterfill" inner policy',
+    )
+    parser.add_argument(
+        '--outer_offset',
+        type=float,
+        default=1.5,
+        help=(
+            'Same offset, applied to the per-block Block Influence by the "waterfill" outer policy. Kept separate '
+            'from --offset so that tuning how matrices compete inside a block cannot change how blocks compete'
+        ),
+    )
+    parser.add_argument(
+        '--softmax_temp',
+        type=float,
+        default=1.0,
+        help=(
+            'Temperature of the "softmax_temp" inner policy. Scores are min-max normalized to [0, 1] within each '
+            'group first, so the largest allocation weight exceeds the smallest by exp(1 / softmax_temp): 1.0 is '
+            'nearly uniform, 0.2 spreads moderately, 0.05 strongly'
+        ),
     )
     parser.add_argument(
         '--hf_token',
@@ -525,6 +588,16 @@ if __name__ == "__main__":
             sequential_update=args.sequential_update,
             sequential_update_method=args.sequential_update_method,
             is_v2=args.run_v2,
+            bypass_late_layers=args.bypass_late_layers,
+            max_ratio=args.max_ratio,
+            inner_allocation=args.inner_allocation,
+            outer_allocation=args.outer_allocation,
+            bypass_ratio=args.bypass_ratio,
+            fusion_alpha=args.fusion_alpha,
+            seed=args.seed,
+            offset=args.offset,
+            softmax_temp=args.softmax_temp,
+            outer_offset=args.outer_offset,
         )
 
         dataset_name, dataset_subset, dataset_split = parse_dataset_spec(args.calibration_dataset)
@@ -567,15 +640,22 @@ if __name__ == "__main__":
             score_metric=args.score_metric,
             heterogeneous = args.het,
             group_criterion = args.group_criterion,
+            inner_allocation = args.inner_allocation,
+            outer_allocation = args.outer_allocation,
             group_patterns = group_patterns_dict,
             hf_token = args.hf_token,
             whitening_only = args.whitening_only,
             whitening_start_layer = args.whitening_start_layer,
             whitening_end_layer = args.whitening_end_layer,
             bypass_early_layers = args.bypass_early_layers,
+            bypass_late_layers = args.bypass_late_layers,
             bypass_ratio = args.bypass_ratio,
+            max_ratio = args.max_ratio,
             ratio_scope=args.ratio_scope,
             offset=args.offset,
+            softmax_temp=args.softmax_temp,
+            outer_offset=args.outer_offset,
+            fusion_alpha=args.fusion_alpha,
             sequential_update=args.sequential_update,
             sequential_update_ridge=args.sequential_update_ridge,
             sequential_update_method=args.sequential_update_method,
@@ -601,6 +681,15 @@ if __name__ == "__main__":
         )
         model = model.to(args.device)
         print(model)
+
+        # Record the arguments beside the checkpoint the compression just wrote,
+        # so a compress-only run is self-describing without an evaluation
+        if args.save_path:
+            save_run_config(
+                directory=os.path.join(args.save_path, "models", sanitize_model_name(args.model)),
+                run_name=model_name,
+                config={ "args": sanitize_run_args(vars(args)) },
+            )
 
         cuda_cleanup()
         vram_usage("After loading compressed model")
@@ -859,26 +948,34 @@ if __name__ == "__main__":
         results = {}
 
         # Perplexity tasks bypass lm-eval to stay comparable with the SVD-LLM paper
-        # TODO c4 task: the c4 entry still re-evaluates wikitext
         ppl_tasks = {
-            "wikitext": ("wikitext", "wikitext-2-raw-v1", "test"),
-            "c4": ("wikitext", "wikitext-2-raw-v1", "test"),
+            "wikitext": {
+                "dataset_name": "wikitext",
+                "subset": "wikitext-2-raw-v1",
+                "split": "test",
+            },
+            # A single validation shard, which is what upstream SVD-LLM loads. The
+            # full en/validation split is ~364k documents and cannot be joined
+            "c4": {
+                "dataset_name": "allenai/c4",
+                "subset": None,
+                "split": "validation",
+                "data_files": { "validation": "en/c4-validation.00000-of-00008.json.gz" },
+            },
         }
         ppl_results = {}
 
-        for task_name, (ppl_dataset, ppl_subset, ppl_split) in ppl_tasks.items():
+        for task_name, ppl_kwargs in ppl_tasks.items():
             if task_name not in tasks_list:
                 continue
 
             ppl_results[task_name] = ppl_eval(
                 model,
                 tokenizer,
-                dataset_name=ppl_dataset,
-                subset=ppl_subset,
-                split=ppl_split,
                 eval_max_length=max_length,
                 batch_size=args.eval_batch_size,
                 device=args.device,
+                **ppl_kwargs,
             )
             cuda_cleanup()
 
@@ -937,5 +1034,21 @@ if __name__ == "__main__":
 
         with open(os.path.join(model_eval_path, f"{model_name}.json"), "w") as f:
             json.dump(results, f, default=handle_non_serializable, indent=2)
+
+        # generate_tables.py reads this in preference to parsing the filename
+        eval_config = { "args": sanitize_run_args(vars(args)) }
+        compression_config_path = run_config_path(
+            os.path.join(args.save_path, "models", sanitize_model_name(args.model)),
+            model_name,
+        )
+        if os.path.exists(compression_config_path):
+            with open(compression_config_path, "r", encoding="utf-8") as config_file:
+                eval_config = {**json.load(config_file), **eval_config}
+
+        save_run_config(
+            directory=model_eval_path,
+            run_name=model_name,
+            config=eval_config,
+        )
 
         vram_usage("After evaluation")
