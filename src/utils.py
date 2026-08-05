@@ -41,6 +41,21 @@ DEGENERATE_SCORE_SPREAD = 1e-3
 RUN_CONFIG_SUFFIX = ".config.json"
 RUN_CONFIG_SCHEMA_VERSION = 1
 
+# Policy knobs a run name has to distinguish, as (knob, filename prefix, default).
+# Sweeping one of these leaves every other token untouched, so without a token of
+# its own the whole sweep would collapse onto a single checkpoint
+KNOB_FILENAME_TOKENS = (
+    ( "offset", "off", 1.5 ),
+    ( "softmax_temp", "temp", 1.0 ),
+    ( "outer_offset", "ooff", 1.5 ),
+)
+
+# Defaults of the remaining swept knobs, kept beside the ones above so that
+# "emit only when non-default" reads from one place
+DEFAULT_FUSION_ALPHA = 0.5
+DEFAULT_BYPASS_RATIO = 0.0
+DEFAULT_SEED = 6363
+
 # Never persisted to disk, the sidecar is committed alongside results
 REDACTED_ARG_KEYS = ( "hf_token", )
 
@@ -2812,7 +2827,13 @@ def build_run_name(
         bypass_late_layers: int = -1,
         max_ratio: float = 0.9,
         inner_allocation: str = InnerAllocation.WATERFILL.value,
-        outer_allocation: str = OuterAllocation.PARAM_SHARE.value
+        outer_allocation: str = OuterAllocation.PARAM_SHARE.value,
+        bypass_ratio: float = DEFAULT_BYPASS_RATIO,
+        fusion_alpha: float = DEFAULT_FUSION_ALPHA,
+        seed: Optional[int] = DEFAULT_SEED,
+        offset: float = 1.5,
+        softmax_temp: float = 1.0,
+        outer_offset: float = 1.5
 ) -> str:
     """
     Encode a whole compression configuration into one filename token.
@@ -2862,6 +2883,38 @@ def build_run_name(
 
     max_ratio_str = "" if max_ratio == 0.9 else f"_cap{round(max_ratio, 2)}"
 
+    # A knob earns a token only when it leaves its default *and* the run actually
+    # reads it, so passing --offset to a policy that ignores it cannot fork the
+    # name into two entries for what is the same run
+    knob_tokens: List[str] = []
+
+    if seed is not None and seed != DEFAULT_SEED:
+        knob_tokens.append(f"_seed{seed}")
+
+    bypasses_any_layer = bypass_early_layers > 0 or bypass_late_layers > 0
+    if bypasses_any_layer and bypass_ratio != DEFAULT_BYPASS_RATIO:
+        knob_tokens.append(f"_bypr{round(bypass_ratio, 3)}")
+
+    if heterogeneous:
+        if score_metric.startswith(COMPOSITE_PREFIX) and fusion_alpha != DEFAULT_FUSION_ALPHA:
+            knob_tokens.append(f"_fa{round(fusion_alpha, 3)}")
+
+        # The policies declare the knobs they read as named parameters, so this
+        # is the same relevance test the sidecar uses, from the same signatures
+        policies = resolve_allocation_policies(
+            inner_allocation,
+            outer_allocation,
+            allocation_knobs(offset=offset, softmax_temp=softmax_temp, outer_offset=outer_offset),
+        )
+        live_knobs = {**policies.inner_knobs, **policies.outer_knobs}
+
+        for knob, prefix, default in KNOB_FILENAME_TOKENS:
+            value = live_knobs.get(knob)
+            if value is not None and value != default:
+                knob_tokens.append(f"_{prefix}{round(value, 3)}")
+
+    knob_str = "".join(knob_tokens)
+
     # Placed after the bypass token so `parse_filename` still finds that one at
     # the position it expects, and simply ignores these trailing tokens
     policy_str = ""
@@ -2888,6 +2941,7 @@ def build_run_name(
         policy_str,
         outer_policy_str,
         max_ratio_str,
+        knob_str,
         f"_upd_{sequential_update_method}" if sequential_update else "",
         "_v2" if is_v2 else "",
     ]

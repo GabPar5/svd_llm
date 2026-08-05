@@ -101,7 +101,9 @@ These models do not fit in VRAM alongside their decompositions, so the code is w
 
 ### Filename convention is an interface
 
-The run name encodes the full configuration: `<model>_q_k_v_out_mlp_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_upd_<method>][_v2]`. It determines the checkpoint filename, the eval JSON filename, and the log filename, and `generate_tables.py:parse_filename` parses it back out to build the table rows. `build_run_name` is the only place that constructs it — change it there, and update `parse_filename` to match, or tables silently mis-attribute rows.
+The run name encodes the full configuration: `<model>_q_k_v_out_mlp_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_<inner_allocation>][_out<outer_allocation>][_cap<max_ratio>][_<knobs>][_upd_<method>][_v2]`. It determines the checkpoint filename, the eval JSON filename, and the log filename, and `generate_tables.py:parse_filename` parses it back out to build the table rows. `build_run_name` is the only place that constructs it — change it there, and update `parse_filename` to match, or tables silently mis-attribute rows.
+
+Every token past `<bypassed>` is emitted only when its flag leaves its default, which is what keeps names that predate an option byte-identical; `parse_filename` reads positionally up to `<bypassed>` and ignores the rest. The `<knobs>` group (`_seed`, `_bypr`, `_fa`, `_off`, `_temp`, `_ooff`, listed in `KNOB_FILENAME_TOKENS`) additionally requires that the run *reads* the knob — relevance is decided from the policy signatures via `resolve_allocation_policies`, the same test the sidecar uses. A knob that a sweep varies but the name cannot express silently collapses that sweep onto one checkpoint, so any new swept flag needs a token here.
 
 ### Evaluation
 

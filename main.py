@@ -592,6 +592,12 @@ if __name__ == "__main__":
             max_ratio=args.max_ratio,
             inner_allocation=args.inner_allocation,
             outer_allocation=args.outer_allocation,
+            bypass_ratio=args.bypass_ratio,
+            fusion_alpha=args.fusion_alpha,
+            seed=args.seed,
+            offset=args.offset,
+            softmax_temp=args.softmax_temp,
+            outer_offset=args.outer_offset,
         )
 
         dataset_name, dataset_subset, dataset_split = parse_dataset_spec(args.calibration_dataset)

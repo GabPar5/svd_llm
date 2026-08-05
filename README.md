@@ -349,12 +349,25 @@ output/
 Checkpoint, log and result filenames encode the whole configuration:
 
 ```
-<model>[_q][_k][_v][_out][_mlp]_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_<inner_allocation>][_out<outer_allocation>][_cap<max_ratio>][_upd_<method>][_v2]
+<model>[_q][_k][_v][_out][_mlp]_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_<inner_allocation>][_out<outer_allocation>][_cap<max_ratio>][_<knobs>][_upd_<method>][_v2]
 ```
 
 For example `Qwen_Qwen2.5_7B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_2_v2`. `generate_tables.py` parses this convention back into table columns, so keep the two in sync when changing it.
 
 The `<bypassed>` token is a bare integer when only `--bypass_early_layers` is used, and becomes `byp<early>-<late>` once `--bypass_late_layers` is set. `_<inner_allocation>` and `_out<outer_allocation>` appear only for a heterogeneous run that leaves the `waterfill` / `param_share` defaults, and both sit after `<bypassed>` so that token stays where `parse_filename` looks for it. `_cap<max_ratio>` appears only when `--max_ratio` leaves its `0.9` default. Every one of these rules exists so that run names predating the option stay byte-identical.
+
+`<knobs>` is the remaining set of swept tunables, each emitted only when it leaves its default **and** the run actually reads it:
+
+| Token | Flag | Emitted when |
+|---|---|---|
+| `_seed<n>` | `--seed` | always, since the calibration sample changes every downstream artifact |
+| `_bypr<r>` | `--bypass_ratio` | at least one layer is bypassed |
+| `_fa<a>` | `--fusion_alpha` | the score metric is a `composite\|...` |
+| `_off<v>` | `--offset` | the resolved inner policy declares it |
+| `_temp<v>` | `--softmax_temp` | the resolved inner policy declares it |
+| `_ooff<v>` | `--outer_offset` | the resolved outer policy declares it |
+
+The last three read the same policy signatures the sidecar reads, so `--offset` handed to a policy that ignores it does not fork the name into two entries for what is one run. Without these tokens a sweep over any single knob would leave every other token untouched and collapse the whole sweep onto one checkpoint.
 
 ### Run Configuration Sidecar
 

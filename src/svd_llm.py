@@ -2072,6 +2072,14 @@ def compress_svd_llm(
             is_v2=is_v2,
             bypass_late_layers=bypass_late_layers,
             max_ratio=max_ratio,
+            inner_allocation=inner_allocation,
+            outer_allocation=outer_allocation,
+            bypass_ratio=bypass_ratio,
+            fusion_alpha=fusion_alpha,
+            seed=seed,
+            offset=offset,
+            softmax_temp=softmax_temp,
+            outer_offset=outer_offset,
         )
 
         is_lora_update = sequential_update and sequential_update_method == "lora"
