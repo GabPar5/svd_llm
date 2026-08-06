@@ -277,6 +277,10 @@ def latex_escape(value: Any) -> str:
     return text
 
 
+def latex_column_label(column: str) -> str:
+    return r"Avg. $\uparrow$" if column == "avg_accuracy" else BENCHMARK_LABELS_LATEX[column]
+
+
 def latex_label_slug(value: str) -> str:
     value = value.lower()
     value = re.sub(r"[^a-z0-9]+", "-", value)
@@ -869,10 +873,25 @@ def latex_faded_cell(value: str, highlight: bool) -> str:
     return rf"\textcolor{{black!45}}{{{latex_escape(value)}}}"
 
 
+def present_columns(rows: List[Dict[str, Any]], columns: List[str]) -> List[str]:
+    """
+    The columns at least one row fills, in table order.
+
+    The screening stages evaluate wikitext alone and the full suite only runs at
+    the end, so a table built from the full column list carries a dead column
+    for every benchmark that stage has not reached yet.
+    """
+    return [
+        column for column in columns
+        if any(safe_float(row.get(column)) is not None for row in rows)
+    ]
+
+
 def value_cells(
     row: Dict[str, Any],
     render: Callable[[str, bool], str],
     best: Optional[Dict[str, Optional[float]]] = None,
+    columns: Optional[List[str]] = None,
 ) -> List[str]:
     """
     Formatted value cells of one row, in table order.
@@ -890,6 +909,12 @@ def value_cells(
 def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -> str:
     rows = sorted(rows, key=sort_rows_hierarchical)
     original_rows, grouped = group_rows_for_model_by_bypass(rows)
+
+    perplexity = present_columns(rows, PERPLEXITY_BENCHMARK_ORDER)
+    likelihood = present_columns(rows, LIKELIHOOD_BENCHMARK_ORDER)
+    generation = present_columns(rows, GENERATION_BENCHMARK_ORDER)
+    summary = present_columns(rows, [ "avg_accuracy" ])
+    columns = [ *perplexity, *likelihood, *summary, *generation ]
 
     headers = [
         "Ratio",
@@ -916,7 +941,7 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
             for row in original_rows:
                 row_cells = [ markdown_faded("0%") ]
                 row_cells += [ markdown_faded("--") ] * 4
-                row_cells += value_cells(row, markdown_faded_cell)
+                row_cells += value_cells(row, markdown_faded_cell, columns=columns)
                 row_cells.append(markdown_faded(row.get("file", "--")))
                 lines.append("| " + " | ".join(row_cells) + " |")
 
@@ -943,7 +968,7 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
                     row.get("matrices", "--"),
                 ]
 
-                row_cells += value_cells(row, markdown_cell, ratio_best)
+                row_cells += value_cells(row, markdown_cell, ratio_best, columns=columns)
                 row_cells.append(row.get("file", "--"))
 
                 lines.append("| " + " | ".join(markdown_escape(v) for v in row_cells) + " |")
@@ -964,6 +989,20 @@ def make_latex_table_for_model(
     rows = sorted(rows, key=sort_rows_hierarchical)
     original_rows, grouped = group_rows_for_model_by_bypass(rows)
 
+    # A group with no measured column is dropped entirely: an empty multicolumn
+    # and a reversed cmidrule span are both invalid LaTeX
+    column_groups = [
+        ( title, present_columns(rows, members) )
+        for title, members in (
+            ( "Perplexity Benchmarks", PERPLEXITY_BENCHMARK_ORDER ),
+            ( "Likelihood Benchmarks", LIKELIHOOD_BENCHMARK_ORDER ),
+            ( "Summary", [ "avg_accuracy" ] ),
+            ( "Generation Benchmarks", GENERATION_BENCHMARK_ORDER ),
+        )
+    ]
+    column_groups = [( title, members ) for title, members in column_groups if members]
+    columns = [column for _, members in column_groups for column in members]
+
     lines: List[str] = []
 
     for bypass in sorted(grouped.keys()):
@@ -975,39 +1014,31 @@ def make_latex_table_for_model(
         if use_adjustbox:
             lines.append(r"\begin{adjustbox}{width=" + str(table_width) + r"\textwidth,center}")
 
-        ppl_benchmark_colspec = "r" * len(PERPLEXITY_BENCHMARK_ORDER)
-        benchmark_colspec = "r" * len(LIKELIHOOD_BENCHMARK_ORDER)
-        generation_colspec = "r" * len(GENERATION_BENCHMARK_ORDER)
-        colspec = rf"l llll | {ppl_benchmark_colspec} {benchmark_colspec} r {generation_colspec}"
-        lines.append(rf"\begin{{tabular}}{{{colspec}}}")
+        value_colspec = " ".join("r" * len(members) for _, members in column_groups)
+        lines.append(rf"\begin{{tabular}}{{l llll | {value_colspec}}}")
         lines.append(r"\toprule")
 
-        ppl_start_col = 6
-        ppl_end_col = ppl_start_col + len(PERPLEXITY_BENCHMARK_ORDER) - 1
-        likelihood_start_col = ppl_end_col + 1
-        likelihood_end_col = likelihood_start_col + len(LIKELIHOOD_BENCHMARK_ORDER) - 1
-        summary_col = likelihood_end_col + 1
-        generation_start_col = summary_col + 1
-        generation_end_col = generation_start_col + len(GENERATION_BENCHMARK_ORDER) - 1
-        total_col_count = generation_end_col
+        # The configuration block occupies columns 1 to 5, so the value groups
+        # start at 6 and each one begins where the previous ended
+        rules = [ r"\cmidrule(lr){1-1}", r"\cmidrule(lr){2-5}" ]
+        group_start = 6
+
+        for _, members in column_groups:
+            group_end = group_start + len(members) - 1
+            rules.append(rf"\cmidrule(lr){{{group_start}-{group_end}}}")
+            group_start = group_end + 1
+
+        total_col_count = group_start - 1
 
         lines.append(
-            r"\multicolumn{1}{c}{Compression} & "
-            r"\multicolumn{4}{c}{Configuration} & "
-            rf"\multicolumn{{{len(PERPLEXITY_BENCHMARK_ORDER)}}}{{c}}{{Perplexity Benchmarks}} & "
-            rf"\multicolumn{{{len(LIKELIHOOD_BENCHMARK_ORDER)}}}{{c}}{{Likelihood Benchmarks}} & "
-            r"\multicolumn{1}{c}{Summary} & "
-            rf"\multicolumn{{{len(GENERATION_BENCHMARK_ORDER)}}}{{c}}{{Generation Benchmarks}} \\",
+            " & ".join([
+                r"\multicolumn{1}{c}{Compression}",
+                r"\multicolumn{4}{c}{Configuration}",
+                *[rf"\multicolumn{{{len(members)}}}{{c}}{{{title}}}" for title, members in column_groups],
+            ]) + r" \\",
         )
 
-        lines.append(
-            r"\cmidrule(lr){1-1}"
-            r"\cmidrule(lr){2-5}"
-            rf"\cmidrule(lr){{{ppl_start_col}-{ppl_end_col}}}"
-            rf"\cmidrule(lr){{{likelihood_start_col}-{likelihood_end_col}}}"
-            rf"\cmidrule(lr){{{summary_col}-{summary_col}}}"
-            rf"\cmidrule(lr){{{generation_start_col}-{generation_end_col}}}",
-        )
+        lines.append("".join(rules))
 
         header = [
             "Ratio",
@@ -1017,10 +1048,7 @@ def make_latex_table_for_model(
             "Matrices",
         ]
 
-        header += [BENCHMARK_LABELS_LATEX[b] for b in PERPLEXITY_BENCHMARK_ORDER]
-        header += [BENCHMARK_LABELS_LATEX[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
-        header += [ r"Avg. $\uparrow$" ]
-        header += [BENCHMARK_LABELS_LATEX[b] for b in GENERATION_BENCHMARK_ORDER]
+        header += [latex_column_label(column) for column in columns]
 
         lines.append(" & ".join(header) + r" \\")
         lines.append(r"\midrule")
@@ -1030,7 +1058,7 @@ def make_latex_table_for_model(
             for row in original_rows:
                 cells = [ r"\textcolor{black!45}{0\%}" ]
                 cells += [ r"\textcolor{black!45}{--}" ] * 4
-                cells += value_cells(row, latex_faded_cell)
+                cells += value_cells(row, latex_faded_cell, columns=columns)
 
                 lines.append(" & ".join(cells) + r" \\")
             lines.append(r"\midrule")
@@ -1055,7 +1083,7 @@ def make_latex_table_for_model(
                     latex_escape(row.get("matrices", "--")),
                 ]
 
-                cells += value_cells(row, latex_cell, ratio_best)
+                cells += value_cells(row, latex_cell, ratio_best, columns=columns)
 
                 lines.append(" & ".join(cells) + r" \\")
                 first_ratio_row = False
