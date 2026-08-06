@@ -80,9 +80,17 @@ class Inputs(NamedTuple):
 
 
 class Variant(NamedTuple):
-    """One point of the sweep: a full allocation configuration and its name"""
+    """
+    One point of the sweep: a full allocation configuration and its name.
+
+    `name` is the identifier, and becomes a budget-log filename and a CSV key.
+    `label` carries the swept values alone, for a console table that names the
+    axes once in its header instead of repeating every flag name on every row.
+    """
     name: str
     config: Dict[str, Any]
+    label: str
+    axes: Tuple[str, ...]
 
 
 class VariantResult(NamedTuple):
@@ -345,14 +353,16 @@ def build_variants(args: argparse.Namespace) -> List[Variant]:
         swept = dict(zip(keys, combination))
         config = { **base, **swept }
         name = "base"
+        label = "base"
 
         if swept:
             name = "__".join(f"{key}-{value}" for key, value in swept.items())
             # The name becomes a filename, and composite metrics carry a
             # separator no filename should hold
             name = re.sub(r"[^A-Za-z0-9.-]+", "_", name)
+            label = " / ".join(str(value) for value in swept.values())
 
-        variants.append(Variant(name=name, config=config))
+        variants.append(Variant(name=name, config=config, label=label, axes=tuple(keys)))
 
     return variants
 
@@ -1722,6 +1732,71 @@ def write_figures(
     print(f"[REPORT] Wrote figure data under {fig_dir}")
 
 
+def format_table_row(cells: List[str], widths: List[int]) -> str:
+    """Pad a row to the measured widths, the leading and trailing text columns left-aligned"""
+    padded = [
+        f"{cell:<{width}}" if index in ( 0, len(cells) - 1 ) else f"{cell:>{width}}"
+        for index, ( cell, width ) in enumerate(zip(cells, widths))
+    ]
+    return "  ".join(padded).rstrip()
+
+
+def render_summary_table(
+        variants: List[Variant],
+        results: Dict[str, VariantResult],
+        ranks: Dict[str, Dict[str, float]],
+        mean_rank: Dict[str, float]
+) -> None:
+    """
+    Print the variant comparison as one table, ordered by mean rank.
+
+    Widths are measured from the cells instead of fixed, because a variant name
+    is as long as the sweep makes it: a name overflowing a fixed field shifts
+    every column to its right by its own excess, and no two rows line up.
+    """
+    axes = variants[0].axes if variants else ()
+    rows: List[List[str]] = []
+    header = [
+        " / ".join(axes) if axes else "variant",
+        "realized", "mean rk",
+        *(objective.name for objective in OBJECTIVES),
+        "checks",
+    ]
+
+    ordered = sorted(
+        variants,
+        key=lambda item: mean_rank[item.name] if not math.isnan(mean_rank[item.name]) else math.inf,
+    )
+
+    for variant in ordered:
+        result = results[variant.name]
+        cells: List[str] = []
+
+        for objective in OBJECTIVES:
+            value = result.objectives[objective.name]
+            rank = ranks[objective.name][variant.name]
+            cell = "-"
+
+            if math.isfinite(value) and not math.isnan(rank):
+                cell = f"{value:.3e} ({rank:.0f})"
+
+            cells.append(cell)
+
+        rows.append([
+            variant.label,
+            f"{result.realized_ratio:.4f}" if math.isfinite(result.realized_ratio) else "-",
+            f"{mean_rank[variant.name]:.2f}" if not math.isnan(mean_rank[variant.name]) else "-",
+            *cells,
+            "ok" if not result.checks else "; ".join(result.checks),
+        ])
+
+    widths = [max(len(row[column]) for row in ( header, *rows )) for column in range(len(header))]
+
+    print()
+    for row in ( header, *rows ):
+        print(format_table_row(row, widths))
+
+
 def main() -> None:
     args = parse_args()
 
@@ -1764,23 +1839,13 @@ def main() -> None:
     mean_rank = {name: mean_objective_rank(ranks, name) for name in results}
     oracles = compute_oracles(inputs, variants, results)
 
-    header = " ".join(f"{objective.name[:6]:>6}" for objective in OBJECTIVES)
-    print(f"\n{'variant':<42} {'realized':>9} {'mean rk':>8}  {header}  checks")
-
-    for variant in sorted(variants, key=lambda item: mean_rank[item.name] if not math.isnan(mean_rank[item.name]) else 1e9):
-        result = results[variant.name]
-        cells = " ".join(
-            f"{ranks[objective.name][variant.name]:>6.0f}"
-            if not math.isnan(ranks[objective.name][variant.name]) else f"{'-':>6}"
-            for objective in OBJECTIVES
-        )
-        status = "ok" if not result.checks else "; ".join(result.checks)
-        print(f"{variant.name:<42} {result.realized_ratio:>9.4f} {mean_rank[variant.name]:>8.2f}  {cells}  {status}")
+    render_summary_table(variants, results, ranks, mean_rank)
 
     print(
-        "\n  Cells are ranks, 1 being best, so a variant that wins one column and trails the\n"
-        "  rest is winning on its own terms. Each objective and the score metric that\n"
-        "  optimizes it by construction:",
+        "\n  Cells are the objective, with its rank across variants in parentheses and 1\n"
+        "  being best, so a variant that wins one column and trails the rest is winning on\n"
+        "  its own terms. Each objective and the score metric that optimizes it by\n"
+        "  construction:",
     )
     for objective in OBJECTIVES:
         print(f"    {objective.name:<22} circular with {objective.circular_with}")
