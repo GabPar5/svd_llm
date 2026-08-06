@@ -2988,6 +2988,37 @@ def save_run_config(directory: str, run_name: str, config: Dict[str, Any]) -> st
 
     return path
 
+def merge_eval_results(path: str, results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge freshly evaluated tasks into the results file of the same run.
+
+    A run measures whichever tasks it was asked for, so writing that set over
+    the file would drop every task an earlier invocation measured: re-running
+    one task to add it would silently delete the rest. Only the `results`
+    entries are merged, because everything else in the payload describes the
+    invocation that produced it and the fresh copy is the accurate one.
+    """
+    stored: Dict[str, Any] = {}
+
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as results_file:
+                stored = json.load(results_file)
+        except (OSError, ValueError) as error:
+            print(f"[EVAL][WARNING] Overwriting unreadable results {path}: {error}")
+            stored = {}
+
+    evaluated = results.get("results") or {}
+    kept = {task: entry for task, entry in (stored.get("results") or {}).items() if task not in evaluated}
+
+    if kept:
+        print(f"[EVAL] Keeping {len(kept)} task(s) measured by an earlier run: {', '.join(sorted(kept))}")
+
+    merged = { **stored, **results }
+    merged["results"] = { **kept, **evaluated }
+
+    return merged
+
 def summarize_allocation(
         ratio_map: Dict[str, float],
         param_count_map: Dict[str, int],

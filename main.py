@@ -1032,11 +1032,21 @@ if __name__ == "__main__":
                 "token_perplexity_stderr,none": "N/A",
             }
 
-        with open(os.path.join(model_eval_path, f"{model_name}.json"), "w") as f:
+        # Tasks this run did not evaluate stay as an earlier run measured them,
+        # so adding a task later cannot delete the ones already collected
+        results_path = os.path.join(model_eval_path, f"{model_name}.json")
+        results = merge_eval_results(results_path, results) # pyright: ignore[reportArgumentType]
+
+        with open(results_path, "w") as f:
             json.dump(results, f, default=handle_non_serializable, indent=2)
 
-        # generate_tables.py reads this in preference to parsing the filename
-        eval_config = { "args": sanitize_run_args(vars(args)) }
+        # generate_tables.py reads this in preference to parsing the filename.
+        # `args.eval_tasks` only records the latest invocation, so the union of
+        # what the file now holds is recorded beside it
+        eval_config = {
+            "args": sanitize_run_args(vars(args)),
+            "evaluated_tasks": sorted(results.get("results", {})),
+        }
         compression_config_path = run_config_path(
             os.path.join(args.save_path, "models", sanitize_model_name(args.model)),
             model_name,
