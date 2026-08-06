@@ -13,25 +13,53 @@ Whitening is assumed to be already cached under `output/whitening_matrices/<mode
 with its `spectra/` cache and `layer_importance.pt`. Every stage below reads that cache and never
 recomputes it.
 
-## The two tools, and the order to use them in
+## The three tools, and the order to use them in
 
-| | `allocation_report.py` | `run_experiments.py` |
-|---|---|---|
-| Cost | seconds, CPU, no model weights | about an hour per run, GPU |
-| Answers | what ratios a configuration produces | what perplexity it produces |
-| Reads | the cached spectra and Block Influence | the model |
+Every stage is the same loop, and each tool owns one step of it:
 
-**Always preview a stage offline before running it.** The allocation half of every question in this
-grid is free: `allocation_report.py` replays the real `allocate_ratios` over the cached spectra, so
-a variant it explores allocates exactly as the same flags would on a GPU. It catches, at zero cost,
-the three failure modes that otherwise waste an hour each:
+```
+allocation_report.py  ->  run_experiments.py  ->  generate_tables.py --report gates
+   prune and configure       spend the GPU            read the gate, fill the placeholder
+   seconds, CPU               ~1h per run              seconds, no GPU
+```
 
-- **Infeasible budgets.** A cap too low to reach the target once bypassed layers are charged shows up
-  as a budget-drift violation and a non-zero exit.
-- **Degenerate allocations.** A score that is constant inside every group produces the flat ratio
-  whatever policy runs, so the run is homogeneous while looking heterogeneous.
-- **Indistinguishable variants.** Two configurations whose ratios differ in the fourth decimal will
-  not produce a measurable perplexity difference either.
+| | `allocation_report.py` | `run_experiments.py` | `generate_tables.py --report gates` |
+|---|---|---|---|
+| Cost | seconds, CPU, no model weights | about an hour per run, GPU | seconds, reads JSON |
+| Answers | what ratios a configuration produces | what perplexity it produces | which configuration won |
+| Reads | the cached spectra and Block Influence | the model | `output/eval/` and the offline CSVs |
+| Settles | the run list, the knobs, feasibility | nothing by itself, it only measures | every `__PLACEHOLDER__` |
+
+### What the offline report can and cannot settle
+
+**It resolves no placeholder on its own.** Every `__*__` value in this grid is defined as a ranking by
+perplexity, and perplexity needs the model. What the offline report does instead is decide **which
+runs are worth making** and **what to hold them at**, which is where the hours are actually saved.
+
+Read it as answering four questions, in this order:
+
+1. **Is the configuration even feasible?** A cap too low to reach the target once bypassed layers are
+   charged shows up as a budget-drift violation, a `checks` entry in `summary.csv`, and a non-zero
+   exit. Fix the configuration before running anything.
+2. **Does the variant allocate anything?** A score that is constant inside every group produces the
+   flat ratio whatever policy runs, so the run is homogeneous while looking heterogeneous.
+   `allocate_ratios` prints a `[BUDGET][WARNING]` for it, and `figures/dispersion.csv` shows a
+   `ratio_std` near zero. Drop the cell: it will reproduce the stage 1 homogeneous number and take an
+   hour to say so.
+3. **Are two variants distinguishable?** Two configurations whose ratios agree to three decimals are
+   one experiment, not two. Compare them in `matrices.csv`, which carries the assigned ratio per
+   matrix. This is what makes the stage 2b pairs (`truncation` against `truncation_sq`) worth checking
+   before spending six runs on them, and it is the one case where the offline pass can settle a gate
+   outright: a candidate that cannot allocate differently cannot win a promotion, so `__TOP1_SCORE__`
+   stays where stage 2 put it.
+4. **Are the variants comparable to each other?** Policies compared at their default knobs differ in
+   shape *and* in aggressiveness at once. Match `ratio_std` across them from
+   `figures/dispersion.csv`, then freeze `--offset`, `--softmax_temp` and `--outer_offset` in
+   `args/base_args.json`. That is the offline pass configuring the GPU stage, not just previewing it.
+
+One gate is answered offline and only offline: **the Spearman sign in stage 6**. It is a go/no-go on
+whether fusing Block Influence with a spectral score measures what it is meant to, and no perplexity
+number can substitute for it.
 
 ### Preview command
 
@@ -45,26 +73,44 @@ python allocation_report.py \
     --plots
 ```
 
-`--sweep` is repeatable and taken as a cartesian product. Give `--out_dir` per stage, or each
-preview overwrites the last. `--plots` adds PNGs when matplotlib is installed; the CSVs are written
-either way.
+`--sweep` is repeatable and taken as a cartesian product; anything not swept is passed as a plain
+flag and held fixed, exactly as `run_experiments.py` would pass it. `--plots` adds PNGs when
+matplotlib is installed; the CSVs are written either way.
+
+**Name `--out_dir` after the stage it previews**: `stage2`, `stage2b`, `stage3`, and so on under
+`output/allocation_reports/`. `generate_tables.py --allocation_dir` discovers stage directories by
+that name and attaches each preview to the gate it belongs to. A suffix is allowed and keeps the same
+stage, so `stage3_knobs` is read as stage 3; when both exist the unsuffixed one is used. A directory
+named anything else is simply not picked up. Giving one `--out_dir` per stage is also what stops each
+preview from overwriting the last.
 
 ### Reading its output
+
+The console table is the summary: one row per variant, ordered by mean rank, with the swept axes named
+once in the header. Each objective cell holds the objective value and, in parentheses, its rank across
+the variants. The `checks` column is `ok` or the invariant that failed.
 
 | File | Use |
 |---|---|
 | `summary.csv` | one row per variant: realized ratio, `mean_rank`, every objective with its rank and oracle ratio, ratio dispersion, invariant violations |
+| `matrices.csv` | one row per variant **per matrix**: score, assigned ratio, rank, truncation loss. This is the ratio map, and the only place two variants can be compared allocation by allocation |
+| `layers.csv` | one row per variant per decoder block: params, removed params, block ratio, Block Influence |
 | `figures/objectives.csv` | which variants win only the objective their own score optimizes |
-| `figures/dispersion.csv` | how widely each configuration spreads its ratios, for knob matching |
+| `figures/dispersion.csv` | how widely each configuration spreads its ratios, for knob matching and for spotting a degenerate cell |
 | `figures/cap_binding.csv` | how many matrices `--max_ratio` actually pins |
 | `figures/influence_vs_effrank_rho.csv` | Spearman rho per matrix family, the gate on stage 6 |
 | `figures/ratio_by_type.csv` | mean ratio per matrix family, where rank-space bias shows |
+| `figures/oracle_gap.csv` | each objective against its greedy lower bound, for comparing across budgets |
 | `budget/<variant>.log` | the captured `[BUDGET]` instrumentation of that variant |
 
 Variants are ranked by **mean rank across six objectives**, never by a single number. The obvious
 single number, `frobenius_tail`, *is* the `truncation_sq` score summed over matrices, so ranking on
 it hands the truncation scores a win by construction. A variant that wins one column and trails the
 others is winning on its own terms, which is a result to report rather than to resolve.
+
+**Do not read the offline ordering as a prediction of the perplexity ordering.** It prices the
+allocation, not the model. Where the two disagree is a thesis result in its own right, and the gate
+report prints the comparison for stage 2 once both halves exist.
 
 ## Running a stage
 
@@ -102,19 +148,22 @@ Changing any of these invalidates comparability with everything already collecte
 
 ## Placeholders
 
-Stage files carry literal placeholders until their gate resolves them:
+Stage files carry literal placeholders until their gate resolves them. Every one is filled from the
+gate report, and the offline preview only narrows the candidates that go into it:
 
-| Placeholder | Resolved by | Meaning |
-|---|---|---|
-| `__BEST_GROUPING__` | stage 2 | grouping criterion with the best mean rank |
-| `__BEST_FLAT_GROUPING__` | stage 2 | better of `type` / `global`, never `decoder` |
-| `__TOP1_SCORE__`, `__TOP2_SCORE__` | stage 2 (2b, 2c may promote) | the two best score metrics |
-| `__BEST_INNER__` | stage 3 | best inner allocation policy |
-| `__CKPT_<ROLE>__` | stages 1 to 8 | a path under `output/models/huggyllama_llama_7b/` |
-| `__FINALIST{1,2,3}_*` | stages 2 to 6 | the three configurations worth testing on another model |
+| Placeholder | Resolved by | Meaning | What the offline preview contributes |
+|---|---|---|---|
+| `__BEST_GROUPING__` | stage 2 | grouping criterion with the best mean rank | drops groupings whose scores are degenerate inside every group |
+| `__BEST_FLAT_GROUPING__` | stage 2 | better of `type` / `global`, never `decoder` | confirms both flat groupings actually spread their ratios |
+| `__TOP1_SCORE__`, `__TOP2_SCORE__` | stage 2 (2b, 2c may promote) | the two best score metrics | drops a candidate whose ratio map matches an incumbent's, since it cannot win a promotion |
+| `__BEST_INNER__` | stage 3 | best inner allocation policy | **required**: the knobs must be matched on `ratio_std` first, or the comparison is confounded |
+| `--max_ratio` | stage 4, into `args/base_args.json` | the cap every later stage runs at | drops caps that pin no matrix, from `cap_binding.csv` |
+| `__CKPT_<ROLE>__` | stages 1 to 8 | a path under `output/models/huggyllama_llama_7b/` | nothing, these are outputs of runs |
+| `__FINALIST{1,2,3}_*` | stages 2 to 6 | the three configurations worth testing on another model | rerun stage 0 per model: the Spearman sign and score-versus-depth shape are model properties, and the finalists may not transfer |
 
 `run_experiments.py` refuses to start while any remain, so an unfilled gate cannot silently run the
-wrong configuration.
+wrong configuration. The gate report prints the same list with the resolved value beside each one, and
+`waiting on runs` where a stage has not produced its answer yet.
 
 ## Reading evaluation results
 
@@ -159,6 +208,91 @@ What it does with the runs, so a table can be trusted before it is pasted into a
 
 The dimensions all come from the sidecar, the only place most of them exist. A run without one is
 counted and left out rather than guessed at.
+
+## Passing a gate, step by step
+
+The same six steps for every stage. Stage 3 is used here because it is the one stage whose offline
+pass is mandatory and changes the runs rather than only pruning them.
+
+**1. Preview the stage offline.** Sweep the axis, and sweep the knobs with it:
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion __BEST_GROUPING__ --compression_ratio 0.2 \
+    --sweep "inner_allocation=waterfill,drank_lagrangian,swift_pool,softmax_temp" \
+    --sweep "offset=1.2,1.5,2.0" --sweep "softmax_temp=0.05,0.2,1.0" \
+    --out_dir ./output/allocation_reports/stage3_knobs
+```
+
+Substitute the placeholder by hand here: this tool takes flags, not stage files, and does not read
+`args/`. A non-zero exit means an invariant failed and the configuration is not runnable yet.
+
+**2. Prune and configure from the CSVs.** Read `figures/dispersion.csv` and pick the knob values that
+bring the four policies to a comparable `ratio_std`; drop any cell that tripped the degenerate-score
+warning or whose `ratio_std` is near zero. Write the chosen knobs into `args/base_args.json`, and
+delete the dropped cells from the stage file.
+
+**3. Run the stage.**
+
+```bash
+python run_experiments.py args/experiments_stage3_policies.json --dry_run  # check the commands first
+python run_experiments.py args/experiments_stage3_policies.json
+```
+
+**4. Read the gate.**
+
+```bash
+python generate_tables.py ./output/eval/huggyllama_llama_7b \
+    --report gates --allocation_dir ./output/allocation_reports -o gates.md
+```
+
+**5. Check the gate's own warnings before trusting it.** A `confounded` note means a dimension moved
+that the stage was not comparing, and the fix is a run rather than a reading. A `priced at 1/2` row
+was ranked on one ratio and is not comparable to a row ranked on both. A drift note means a run missed
+its budget and is not comparable at all.
+
+**6. Copy the resolved value into the next stage file.** Take it from the **Placeholders** table, not
+from the body tables, and replace the literal string:
+
+```bash
+sed -i 's/__BEST_INNER__/drank_lagrangian/g' args/experiments_stage4_max_ratio.json
+```
+
+Then repeat from step 1 for the next stage. `run_experiments.py` refusing to start is the backstop: it
+means a placeholder was missed.
+
+### When the offline pass is enough on its own
+
+Three cases end at step 2, with no GPU time at all:
+
+- **The configuration is infeasible.** Non-zero exit, `checks` populated. Fix the cap, the bypass or
+  the target and preview again.
+- **The cell is degenerate.** A `[BUDGET][WARNING]` or a `ratio_std` near zero means the run would
+  reproduce the homogeneous number. Delete the cell and say so in the thesis: a heterogeneous
+  allocation that cannot allocate is a finding about the score, not a missing data point.
+- **Two candidates are the same experiment.** Ratio maps agreeing to three decimals cannot produce
+  different perplexities. Keep one, and for a stage 2b or 2c candidate that means the incumbent
+  `__TOP1_SCORE__` holds without a run.
+
+### Which preview to run for which stage
+
+| Stage | Preview `--out_dir` | Read | Decide |
+|---|---|---|---|
+| 0 | `stage0` | `figures/influence_vs_effrank_rho.csv` | whether stage 6 may run at all, and record the sign either way |
+| 1 | none | | a homogeneous run allocates nothing |
+| 2 | `stage2` | the console mean rank, `figures/dispersion.csv` | which of the nine cells to drop before spending 18 runs |
+| 2b | `stage2b` | `matrices.csv`, the ratio column per matrix | whether a `_sq` score allocates differently from the score it derives from |
+| 2c | `stage2c` | `matrices.csv`, `figures/dispersion.csv` | whether `norm\|-inf` is signal or rounding noise |
+| 3 | `stage3_knobs` | `figures/dispersion.csv`, `figures/ratio_by_type.csv` | the knobs to freeze in `args/base_args.json`, **mandatory** |
+| 4 | `stage4` | `figures/cap_binding.csv` | which caps pin any matrix, so which caps are worth a run |
+| 5 | `stage5` | the exit code and `checks` | whether the bypassed budgets are feasible under the cap |
+| 6 | `stage6` | `figures/dispersion.csv`, plus the stage 0 rho | the offset for the fused score, and that the three alphas allocate distinctly |
+| 7 | `stage0` again, per model | the rho sign, `figures/scores_by_depth.csv` | whether the finalists transfer to that model |
+| 8 | `stage8` | the `<objective>_oracle_ratio` columns of `summary.csv` | how to compare five budgets without the budget dominating |
+| 9, 10 | none | | both stages load existing checkpoints and allocate nothing |
+
+The preview never needs a GPU and never touches the model weights, so re-running one after changing a
+knob costs seconds. Re-run stage 0 whenever the whitening cache changes.
 
 ---
 
@@ -207,8 +341,10 @@ no allocation to inspect.
 values are the signature of the old `c4` bug, in which the c4 task re-evaluated wikitext, and would
 mean the fix did not take effect in this environment.
 
-**Gate.** None, this stage always runs first. Record the two homogeneous perplexities: they are the
-`hom` row of every table in chapter 4.
+**Gate.** Nothing to decide, this stage always runs first, but it does resolve `__CKPT_HOM_0.2__` and
+`__CKPT_HOM_0.5__` for stages 9 and 10. Record the two homogeneous perplexities: they are the `hom`
+row of every table in chapter 4, and the gate report subtracts them as the `gain` column of every
+heterogeneous table that follows.
 
 ---
 
@@ -250,10 +386,18 @@ first real read on RQ1.
 > uniform, rescued only by a rank floor, and the default `--max_ratio 0.9` sits in exactly that
 > regime.
 
-**Gate.**
-- `__BEST_GROUPING__` = grouping with the best mean rank across both ratios.
+**Gate.** All four values come from the gate report, which shows the aggregate each one is read off in
+its own table rather than only the answer:
+
+- `__BEST_GROUPING__` = grouping with the best mean rank across both ratios. A grouping holds three
+  scores here, so it is judged by the mean of their mean ranks.
 - `__TOP1_SCORE__`, `__TOP2_SCORE__` = the two best scores within that grouping, averaged over ratios.
 - `__BEST_FLAT_GROUPING__` = the better of `type` and `global`. Never `decoder`, see stage 6.
+- `__CKPT_BEST_SCORE_0.2__`, `__CKPT_BEST_SCORE_0.5__` = the rank-1 checkpoint at each ratio, for
+  stage 9. A promotion in 2b or 2c moves these too.
+
+Only the nine cells of this stage decide it: the families added by 2b and 2c are promotion tests
+against this gate's own winner, so counting them here would make the promotion circular.
 
 ---
 
@@ -396,7 +540,11 @@ python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
 **What to look at.** The homogeneous arm is not padding, it is the whole point. Compute the
 heterogeneous gain over homogeneous *at each bypass setting* and compare it to the gain at bypass 0
 from stage 2. If the gain shrinks as bypass grows, the two mechanisms are competing for the same
-redundancy, which is the second half of RQ4.
+redundancy, which is the second half of RQ4. The gate report pairs the two arms per setting and states
+this comparison outright, taking the configuration to hold from the bypassed runs themselves.
+
+**Gate.** `__CKPT_BEST_BYPASS_0.2__` = the heterogeneous checkpoint of the best-gain bypass setting at
+0.2, for stage 9.
 
 ---
 
@@ -445,6 +593,9 @@ this, but the stage file avoids the situation rather than relying on the warning
 metric, exactly as `frobenius_tail` is circular with `truncation`. Do not read a composite win on
 that column as evidence.
 
+**Gate.** `__CKPT_BEST_COMPOSITE_0.2__` = the best composite checkpoint at 0.2, for stage 9. The
+composite scores also enter the stage 7 finalist ranking on equal footing with the plain ones.
+
 ---
 
 ## Stage 7: cross-model confirmation
@@ -490,7 +641,10 @@ python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
 
 **What to look at.** Whether the gap widens, narrows or inverts with the ratio. At 0.8 a
 heterogeneous allocation is heavily constrained by `--max_ratio`, so read this stage together with
-stage 4 and with `figures/cap_binding.csv`.
+stage 4 and with `figures/cap_binding.csv`. The gate report prints the curve as one row per budget and
+names the winning configuration at each: if the name changes between rows, that change is the answer.
+
+**Gate.** None, this stage resolves no placeholder. It is read, not consumed.
 
 ---
 
