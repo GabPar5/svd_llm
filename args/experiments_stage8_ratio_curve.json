@@ -18,15 +18,5 @@
     "--group_criterion": "__BEST_GROUPING__",
     "--score_metric": "__TOP1_SCORE__",
     "--inner_allocation": "__BEST_INNER__"
-  },
-  {
-    "--compression_ratio": 0.8
-  },
-  {
-    "--compression_ratio": 0.8,
-    "--het": true,
-    "--group_criterion": "__BEST_GROUPING__",
-    "--score_metric": "__TOP1_SCORE__",
-    "--inner_allocation": "__BEST_INNER__"
   }
 ]

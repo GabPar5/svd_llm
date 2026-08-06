@@ -6,12 +6,49 @@ Every stage is one axis swept around a fixed configuration, with a **gate** at t
 the placeholders of the next stage. The grid is deliberately not a cross product: the full cross for
 a single model at a single ratio is already 4 groupings x 6 scores x 4 inner policies = 96 runs.
 
-Stages 1 to 8 evaluate **perplexity only** (`wikitext,c4|0`), which is what makes a ~100 run grid
-affordable. Only stage 9 pays for the full benchmark suite.
+Stages 1 to 8 evaluate **wikitext perplexity only**, which is what makes a ~100 run grid affordable.
+Only stage 9 pays for c4 and the full benchmark suite, which is also where the wikitext-against-c4
+check lives.
 
 Whitening is assumed to be already cached under `output/whitening_matrices/<model>/v2/`, together
 with its `spectra/` cache and `layer_importance.pt`. Every stage below reads that cache and never
 recomputes it.
+
+**Execution order**, which is not the section order: `0, 1, 2, 2b, 2c, 3, 4, onset, 5, 6, 7, 9, 10`.
+Stage 4 freezes `--max_ratio` into `args/base_args.json`, so everything that should inherit that cap
+runs after it. The onset probe lives in the stage 8 section and file for continuity.
+
+## What stages 1 and 2 established
+
+Both have run. Their results are the premise of everything below, so they are recorded here rather
+than left in a report.
+
+**At ratio 0.2, nothing distinguishes the allocations.** The nine cells span 0.03 perplexity, 0.4% of
+the best value, with three exact ties, against a homogeneous 7.79 and a dense 5.68 — the best
+allocation recovers 1% of the compression damage. Ranking there is below what this design resolves,
+and the gate report now says so on any ratio whose spread falls under 1%. It stays in the grid, but
+read every 0.2 column as a tie until stage 9 puts a second corpus behind it.
+
+**At ratio 0.5, the grouping effect is large and has a mechanism.** `decoder` wins, and not because
+it is the most conservative choice: ranking the groupings by how much freedom the score is given is
+not monotone with the result, since `global` has strictly more freedom than `type` and does better.
+
+|          | depth movement | cross-family movement | mean rank |
+|----------|----------------|-----------------------|-----------|
+| `decoder`| forbidden, `param_share` flattens every block | allowed, 7 families share a block | **2.67** |
+| `global` | allowed | allowed | 3.67 |
+| `type`   | allowed | forbidden, each family is flattened | 7.00 |
+
+**Cross-family budget movement helps; cross-depth movement hurts.** `decoder` takes the first without
+the second, `type` takes the second without the first, `global` takes both. The catastrophes settle
+it: `truncation` reaches 39.09 under `global` and 43.38 under `type`, both of which permit depth
+movement, against 25.05 under `decoder`, which forbids it. So the truncation score's ranking *across
+depth* is wrong while its ranking *within a block* is harmless.
+
+This is the working hypothesis the rest of the grid tests. It predicts that the outer level of stage
+3 and the composite score of stage 6 — the two mechanisms that re-introduce depth movement, this
+time driven by Block Influence — are as likely to lose as to win, and that a loss there is a
+result rather than a failure.
 
 ## The three tools, and the order to use them in
 
@@ -56,10 +93,48 @@ Read it as answering four questions, in this order:
    shape *and* in aggressiveness at once. Match `ratio_std` across them from
    `figures/dispersion.csv`, then freeze `--offset`, `--softmax_temp` and `--outer_offset` in
    `args/base_args.json`. That is the offline pass configuring the GPU stage, not just previewing it.
+5. **Is the allocation about to blow up?** See the dispersion screen below.
 
 One gate is answered offline and only offline: **the Spearman sign in stage 6**. It is a go/no-go on
 whether fusing Block Influence with a spectral score measures what it is meant to, and no perplexity
 number can substitute for it.
+
+### Do not rank with it
+
+Stage 2 measured the offline ordering against the measured one on all nine cells, and **every single
+row disagreed** — not randomly, but close to inverted. `type/truncation` is offline-best and
+measured-worst (43.38 at ratio 0.5); `decoder/eff_rank` is offline 8th of 9 and measured 1st.
+
+There is a mechanism, and it is worth a paragraph of the thesis. The six objectives are all
+tail-energy measures, minimised by concentrating removal where the spectrum decays fastest — exactly
+the aggressive cross-depth allocation that destroys the model. They systematically reward the failure
+mode. With `score_ratio_rho` at `-1.0000` on every variant, nothing else is absorbing the difference.
+
+So `mean_rank` is a reported negative result, not a screen. Keep the offline pass for the mechanical
+facts it is reliable on: feasibility, degeneracy, dispersion, cap binding. Expect the ranking to
+invert.
+
+### The dispersion screen
+
+One offline number did predict the measured outcome: **`ratio_std`**.
+
+| variant at ratio 0.5 | `ratio_std` | wikitext |
+|---|---|---|
+| `global` / `truncation` | 0.080 | 39.09 |
+| `type` / `truncation` | 0.072 | 43.38 |
+| `decoder` / `truncation` | 0.040 | 25.05 |
+| `global` / `eff_rank` | 0.039 | 24.28 |
+| `type` / `eff_rank` | 0.032 | 25.23 |
+| `decoder` / `eff_rank` | 0.029 | **23.91** |
+| `global` / `entropy` | 0.014 | 24.38 |
+| `type` / `entropy` | 0.011 | 24.80 |
+| `decoder` / `entropy` | 0.011 | 24.23 |
+
+Above roughly 0.05 both catastrophes; at or below 0.04 everything lands in 23.9 to 25.2 with no order
+inside the band. So it is a **danger screen, not a ranking**: a variant spreading its ratios that
+widely is about to lose a matrix, and the run can be dropped before it is made. Nine points from one
+model, so nothing in the tooling enforces it: check it by eye in `figures/dispersion.csv`, and
+re-derive the line on Qwen before trusting it there.
 
 ### Preview command
 
@@ -124,8 +199,8 @@ The runner merges `args/base_args.json` into each entry of the stage file, refus
 entry still holds an unresolved gate value, and continues to the next run when one fails rather than
 aborting the queue.
 
-The commands it prints are informational, not copy-paste ready: `--eval_tasks wikitext,c4|0` holds a
-pipe that a shell would interpret. `subprocess` passes it as one argument, so runs are unaffected.
+The commands it prints are informational, not copy-paste ready: a score like `norm|1` holds a pipe
+that a shell would interpret. `subprocess` passes it as one argument, so runs are unaffected.
 
 `args/` is tracked, so the grid is reproducible from the repository. **Never put `--hf_token` in one
 of these files**: pass it on the command line, or export it in the environment.
@@ -144,7 +219,21 @@ Changing any of these invalidates comparability with everything already collecte
 | `--seed` | `6363` | fixes the calibration sample |
 | Targets | all seven matrices, `--ratio_scope selected` | with all seven active, `selected` and `all` denominators coincide |
 | Screening ratios | `0.2`, `0.5` | |
-| Evaluation | `wikitext,c4\|0`, `--eval_max_length 4096` | |
+| Screening evaluation | `wikitext\|0`, `--eval_max_length 4096` | c4's validation shard costs as much again per run, and stage 9 is where a second corpus earns it |
+
+## Checkpoints, and what has to survive a cleanup
+
+A compressed fp32 7B checkpoint is about 20 GB, so checkpoints are deleted once their run has been
+evaluated. Two rules keep that from destroying a gate:
+
+- **Keep every checkpoint a `__CKPT_*__` role names**: the two homogeneous anchors, the best score,
+  policy, bypass and composite runs, and the overall heterogeneous winner at each ratio. Stages 9 and
+  10 load these directly and cannot recompress.
+- **Keep each stage's runner-up too.** Roles move: stage 2b or 2c promoting a score moves
+  `__CKPT_BEST_SCORE_*__` onto a different run, and if that run is gone it costs an hour to rebuild.
+
+The gate report's stage 9 roster has an `on disk` column for exactly this, so a cleanup can be checked
+against it before stage 9 is queued.
 
 ## Placeholders
 
@@ -158,12 +247,23 @@ gate report, and the offline preview only narrows the candidates that go into it
 | `__TOP1_SCORE__`, `__TOP2_SCORE__` | stage 2 (2b, 2c may promote) | the two best score metrics | drops a candidate whose ratio map matches an incumbent's, since it cannot win a promotion |
 | `__BEST_INNER__` | stage 3 | best inner allocation policy | **required**: the knobs must be matched on `ratio_std` first, or the comparison is confounded |
 | `--max_ratio` | stage 4, into `args/base_args.json` | the cap every later stage runs at | drops caps that pin no matrix, from `cap_binding.csv` |
+| `__BEST_BYPASS_EARLY__`, `__BEST_BYPASS_LATE__` | stage 5 | the bypass setting with the best gain over homogeneous | catches settings whose budget is infeasible once the exempt blocks are charged |
 | `__CKPT_<ROLE>__` | stages 1 to 8 | a path under `output/models/huggyllama_llama_7b/` | nothing, these are outputs of runs |
 | `__FINALIST{1,2,3}_*` | stages 2 to 6 | the three configurations worth testing on another model | rerun stage 0 per model: the Spearman sign and score-versus-depth shape are model properties, and the finalists may not transfer |
 
 `run_experiments.py` refuses to start while any remain, so an unfilled gate cannot silently run the
 wrong configuration. The gate report prints the same list with the resolved value beside each one, and
 `waiting on runs` where a stage has not produced its answer yet.
+
+**No stage file past 2c names a score.** Stages 2b and 2c are promotion tests, and either can move
+`__TOP1_SCORE__` or `__TOP2_SCORE__` onto a squared score or a Schatten norm. Writing today's winner
+into stage 3 would freeze the decision those two stages exist to revisit, so every entry from stage 3
+onward carries the placeholder and is substituted at the moment it runs. The same holds for the
+composite halves of stage 6, which are spelled `composite|__TOP1_SCORE__|block_influence`.
+
+**A `provisional` row is not an answer.** The gate report reports how many candidates a placeholder
+was chosen from, and a value decided by a table holding one entrant reads `provisional (1 candidate)`.
+That is the report saying it has recorded the only run that has happened, not picked a winner.
 
 ## Reading evaluation results
 
@@ -282,13 +382,13 @@ Three cases end at step 2, with no GPU time at all:
 | 1 | none | | a homogeneous run allocates nothing |
 | 2 | `stage2` | the console mean rank, `figures/dispersion.csv` | which of the nine cells to drop before spending 18 runs |
 | 2b | `stage2b` | `matrices.csv`, the ratio column per matrix | whether a `_sq` score allocates differently from the score it derives from |
-| 2c | `stage2c` | `matrices.csv`, `figures/dispersion.csv` | whether `norm\|-inf` is signal or rounding noise |
+| 2c | `stage2c` | `matrices.csv`, `figures/dispersion.csv` | whether `norm\|-inf` is signal or rounding noise, which decides the 2 conditional runs |
 | 3 | `stage3_knobs` | `figures/dispersion.csv`, `figures/ratio_by_type.csv` | the knobs to freeze in `args/base_args.json`, **mandatory** |
-| 4 | `stage4` | `figures/cap_binding.csv` | which caps pin any matrix, so which caps are worth a run |
-| 5 | `stage5` | the exit code and `checks` | whether the bypassed budgets are feasible under the cap |
+| 4 | `stage4` | `figures/cap_binding.csv`, **per grouping** | which caps pin any matrix, and whether the cap binds at all under `decoder` |
+| 5, 5b | `stage5` | the exit code and `checks` | whether the bypassed budgets are feasible under the cap |
 | 6 | `stage6` | `figures/dispersion.csv`, plus the stage 0 rho | the offset for the fused score, and that the three alphas allocate distinctly |
 | 7 | `stage0` again, per model | the rho sign, `figures/scores_by_depth.csv` | whether the finalists transfer to that model |
-| 8 | `stage8` | the `<objective>_oracle_ratio` columns of `summary.csv` | how to compare five budgets without the budget dominating |
+| 8 onset | `stage8` | the `<objective>_oracle_ratio` columns of `summary.csv` | the shape claim itself, which is made offline and never costs a run |
 | 9, 10 | none | | both stages load existing checkpoints and allocate nothing |
 
 The preview never needs a GPU and never touches the model weights, so re-running one after changing a
@@ -337,9 +437,13 @@ python run_experiments.py args/experiments_stage1_anchors.json
 **Offline preview.** None needed. A homogeneous run gives every matrix the same ratio, so there is
 no allocation to inspect.
 
-**What to check.** On the dense baseline, wikitext and c4 perplexity must **differ**. Identical
-values are the signature of the old `c4` bug, in which the c4 task re-evaluated wikitext, and would
-mean the fix did not take effect in this environment.
+**Runs so far.** Done: dense 5.68, homogeneous 7.79 at 0.2 and 24.56 at 0.5, on wikitext.
+
+**What to check, at stage 9.** On the dense baseline, wikitext and c4 perplexity must **differ**.
+Identical values are the signature of the old `c4` bug, in which the c4 task re-evaluated wikitext.
+Screening evaluates wikitext alone, so the check runs when c4 first does, at stage 9, against the
+dense row there. The gate report says which of the two situations it is looking at rather than
+reading an absent c4 as a failure.
 
 **Gate.** Nothing to decide, this stage always runs first, but it does resolve `__CKPT_HOM_0.2__` and
 `__CKPT_HOM_0.5__` for stages 9 and 10. Record the two homogeneous perplexities: they are the `hom`
@@ -420,8 +524,10 @@ python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
     --out_dir ./output/allocation_reports/stage2b
 ```
 
-**Gate.** If a squared variant beats both scores chosen in stage 2, it replaces `__TOP1_SCORE__`
-before stage 3 runs.
+**Gate.** Both incumbents are in the table, and the top two of the combined ranking become
+`__TOP1_SCORE__` and `__TOP2_SCORE__`. Either can move: a squared score that beats the second-placed
+amplitude score takes that slot even if it does not take the first. `__CKPT_BEST_SCORE_*__` follows
+whenever the top score changes.
 
 ---
 
@@ -429,23 +535,25 @@ before stage 3 runs.
 
 **Purpose.** Fills thesis section 3.1.1.2, which currently carries `% TODO - no results`.
 
-**Runs.** 8: `{norm|1, norm|3, norm|inf, norm|-inf} x {0.2, 0.5}` at `__BEST_GROUPING__`.
+**Runs.** 4: `{norm|1, norm|inf} x {0.2, 0.5}` at `__BEST_GROUPING__`, plus 2 conditional.
 
-The four values span genuinely different signals: `norm|1` is the nuclear norm of the truncated
-tail, `norm|inf` its largest singular value, `norm|-inf` its smallest.
+`norm|1` is the nuclear norm of the truncated tail and `norm|inf` its largest singular value: two
+genuinely different signals. `norm|3` is dropped because it interpolates between them, which is not a
+research question. `norm|-inf`, its smallest singular value, sits in
+`args/experiments_stage2c_schatten_neg_inf.json` and runs only if the preview clears it.
 
-**Offline preview.** Worth doing carefully here, because `norm|-inf` reads the smallest singular
-value of the tail, which is numerically the most fragile quantity in the whole score family. Check
-that its scores are not all within rounding distance of each other before spending 2 runs on it.
+**Offline preview.** `norm|-inf` is numerically the most fragile quantity in the whole score family.
+Check that its scores are not all within rounding distance of each other before spending 2 runs on it,
+and check the dispersion of all three against the screen above.
 
 ```bash
 python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
-    --group_criterion __BEST_GROUPING__ --compression_ratio 0.2 \
-    --sweep "score_metric=norm|1,norm|3,norm|inf,norm|-inf" \
+    --group_criterion __BEST_GROUPING__ --compression_ratio 0.5 \
+    --sweep "score_metric=norm|1,norm|inf,norm|-inf" \
     --out_dir ./output/allocation_reports/stage2c
 ```
 
-**Gate.** Reporting only, unless one of them beats `__TOP1_SCORE__`, in which case it is promoted.
+**Gate.** Same promotion test as 2b, over the same two slots.
 
 ---
 
@@ -471,21 +579,37 @@ policies produce comparable ratio standard deviations, then set them in `args/ba
 left at its default emits no filename token, so changing one here changes the run names of this stage
 only.
 
-**Runs.** 20:
-- 12: `{drank_lagrangian, swift_pool, softmax_temp} x {top1, top2} x {0.2, 0.5}` at `__BEST_GROUPING__`
-  (`waterfill` at those settings is already in stage 2)
+**Runs.** 32:
+- 24: `{drank_lagrangian, swift_pool, softmax_temp}` x `{__TOP1_SCORE__, __TOP2_SCORE__}` x
+  `{__BEST_GROUPING__, __BEST_FLAT_GROUPING__}` x `{0.2, 0.5}` (`waterfill` at those settings is
+  already in stage 2)
 - 8: `hierarchical` with `--outer_allocation waterfill` x all four inner policies x `{0.2, 0.5}`
+
+**Why two groupings.** The policy ranking is *guaranteed* to depend on the grouping, because
+`drank_lagrangian` allocates in rank space and prices a rank at `out + in`, so its shape bias only
+bites when a group mixes shapes. Under `type` every bucket holds one matrix family across 32 blocks
+and every shape is identical, so the bias is inert; under `decoder` a bucket mixes 4096x4096 attention
+with 11008x4096 MLP and it is live. Freezing the grouping before this stage would put that confound
+directly on RQ3. Running both costs 12 extra runs and settles it.
 
 **What to look at.** The second block against `decoder` + `param_share` from stage 2 is the
 controlled ablation of the **outer level**, since the two criteria bucket matrices identically and
 differ only in whether Block Influence gets to move budget between blocks. That comparison is the
 thesis contribution's own test, so report it separately from the inner-policy comparison.
 
+Stage 2 predicts it loses: depth movement hurt when spectra drove it, and the outer level exists to
+re-introduce depth movement driven by Block Influence instead. A loss is therefore a result about the
+signal, not a bug in the allocator. Should it come out flat rather than negative, the follow-up is
+`--outer_offset`, which dials how much depth movement the outer level is allowed to create and can be
+previewed offline for nothing.
+
 `figures/ratio_by_type.csv` is where `drank_lagrangian`'s rank-space bias becomes visible against
 ratio-space `waterfill`: it prices a rank at `out + in`, so on a group of mixed shapes it can
 compress a family harder than its score alone would justify. That figure is thesis 3.3.5.
 
-**Gate.** `__BEST_INNER__` = best inner policy at `__BEST_GROUPING__`, averaged over ratios.
+**Gate.** `__BEST_INNER__` = best inner policy, averaged over the scores, groupings and ratios it
+was run at. If the ranking flips between the two groupings, report that instead of a single winner:
+it means the policy and the grouping cannot be chosen independently, which is itself an RQ3 answer.
 
 ---
 
@@ -506,7 +630,20 @@ python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
     --out_dir ./output/allocation_reports/stage4
 ```
 
-**Runs.** 5: caps `{0.4, 0.6, 0.8}` at target 0.2 and `{0.6, 0.75}` at target 0.5.
+**Runs.** 9:
+- 6: caps `{0.4, 0.6, 0.8}` x `{0.2, 0.5}` at the configuration stages 2 and 3 chose
+- 3: the **rescue test**, the same caps on `global` + `truncation` at 0.5
+
+**The rescue test.** Stage 2 produced two catastrophes, `global`/`truncation` at 39.09 and
+`type`/`truncation` at 43.38 against a homogeneous 24.56, and both are the signature of a handful of
+matrices being pushed to the cap. Swift-SVD's claim is precisely that a floor is what makes
+heterogeneous allocation viable, so putting a tighter cap on the cell that actually blew up tests that
+claim directly. This is the one place a stage file names a score literally: the cell is identified by
+recorded results, not by a gate.
+
+Note also that `decoder`'s per-block flattening damps the extremes, so the cap may pin nothing at the
+winning configuration. `figures/cap_binding.csv` per grouping says so for free, and if it pins nothing
+the first six runs cannot move a number and should be dropped.
 
 **Gate.** If a lower cap wins, the RQ1 verdict is reported at that cap, and thesis 3.3 must state
 that the cap is a first-order hyperparameter rather than a guard rail. Carry the winning cap into
@@ -519,10 +656,17 @@ stages 5, 6 and 8 by setting it in `args/base_args.json`.
 **Purpose.** Whether exempting the first or last N decoder blocks beats compressing everything, and
 whether that gain **cannibalizes** the heterogeneous gain.
 
-**Runs.** 24: six bypass settings x `{heterogeneous, homogeneous}` x `{0.2, 0.5}`.
+**Runs.** 36: nine bypass settings x `{heterogeneous, homogeneous}` x `{0.2, 0.5}`.
 
-Settings: `early 2`, `early 4`, `early 8`, `late 1`, `late 2`, `early 2 + late 1`. `--bypass_ratio`
+Settings: `early {1, 4, 8}`, `late {1, 4, 8}`, then `2 + 2`, `4 + 4` and `2 + 1`. `--bypass_ratio`
 stays at `0.0`, so a bypassed block is skipped entirely and its budget is pushed onto the rest.
+
+The two ends carry the same depths on purpose, and that is what separates **placement** from
+**amount**. Three settings exempt four blocks (`early 4`, `late 4`, `2 + 2`) and three exempt eight
+(`early 8`, `late 8`, `4 + 4`), so inside each triple the budget pushed onto the remaining blocks is
+identical and the only difference is where the exempt blocks sit. Without matched totals, a
+first-against-last comparison prices placement and pushed-back budget at the same time. `2 + 1` is the
+asymmetric small case, and `early 1` / `late 1` bound how little it takes to matter.
 
 **Offline preview: this one catches infeasibility.** Bypassing blocks pushes their budget onto the
 rest, and at ratio 0.5 with 8 blocks skipped the remainder may not be able to absorb it under the
@@ -533,7 +677,7 @@ python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
     --group_criterion __BEST_GROUPING__ --score_metric __TOP1_SCORE__ \
     --inner_allocation __BEST_INNER__ \
     --sweep "compression_ratio=0.2,0.5" \
-    --sweep "bypass_early_layers=-1,2,4,8" --sweep "bypass_late_layers=-1,1,2" \
+    --sweep "bypass_early_layers=-1,1,4,8" --sweep "bypass_late_layers=-1,1,4,8" \
     --out_dir ./output/allocation_reports/stage5
 ```
 
@@ -543,8 +687,15 @@ from stage 2. If the gain shrinks as bypass grows, the two mechanisms are compet
 redundancy, which is the second half of RQ4. The gate report pairs the two arms per setting and states
 this comparison outright, taking the configuration to hold from the bypassed runs themselves.
 
-**Gate.** `__CKPT_BEST_BYPASS_0.2__` = the heterogeneous checkpoint of the best-gain bypass setting at
-0.2, for stage 9.
+**Gate.** `__BEST_BYPASS_EARLY__` and `__BEST_BYPASS_LATE__` = the setting with the best mean gain
+over homogeneous, and `__CKPT_BEST_BYPASS_0.2__` = its heterogeneous checkpoint at 0.2, for stage 9.
+
+**Stage 5b, the grouping probe.** 2 runs, `args/experiments_stage5b_bypass_grouping.json`: the winning
+setting again under `__BEST_FLAT_GROUPING__`, heterogeneous only. Bypassing means different things to
+the two groupings — under `decoder` it deletes whole groups and `param_share` redistributes their
+budget between the survivors, under a flat grouping it thins one pool — so a conclusion drawn at one
+may not transfer. The homogeneous arm allocates nothing and is grouping-independent, which is why
+the probe is 2 runs rather than 4.
 
 ---
 
@@ -581,17 +732,40 @@ alphas actually produce distinct allocations rather than assuming 0.25 / 0.5 / 0
 `fusion_alpha=1.0` point should collapse to homogeneous under a per-block grouping, which is a useful
 check that the sweep is wired correctly.
 
-**Runs.** 12: `composite|{truncation, eff_rank}|block_influence` x `--fusion_alpha {0.25, 0.5, 0.75}`
-x `{0.2, 0.5}` at `__BEST_FLAT_GROUPING__`.
+**Runs.** 12: `composite|{__TOP1_SCORE__, __TOP2_SCORE__}|block_influence` x
+`--fusion_alpha {0.25, 0.5, 0.75}` x `{0.2, 0.5}` at `__BEST_FLAT_GROUPING__`. The local halves are
+held as placeholders like every other score past 2c, so a promotion in 2b or 2c is fused here too.
 
-**Why never `decoder`.** Block Influence is constant inside a decoder block, so under `decoder` or
-`hierarchical` grouping a fused score cannot rank matrices within a group and the allocation
-collapses to exactly homogeneous. `allocate_ratios` prints a `[BUDGET][WARNING]` when it detects
-this, but the stage file avoids the situation rather than relying on the warning.
+**Why never `decoder`.** Not because the grouping is bad, it won stage 2, but because it closes both
+channels through which Block Influence could act. The fusion is
+
+```
+s_i = beta_b^alpha * log(e + local_i)^(1 - alpha),   beta in [1, 2] across blocks
+```
+
+Under `decoder`, one group *is* one block, so `beta_b` is a single constant `c` inside it and
+`s_i = c * L_i^(1-alpha)`. Raising to a positive power and multiplying by a positive constant are both
+monotone, so **the within-group ordering is exactly the local-only ordering at every alpha**: Block
+Influence cannot reorder anything. And between groups, `param_share` splits by parameter count and
+never reads a score at all, so the block-level signal has nowhere to go there either.
+
+What is left is a rescaling that passes through the redundancy weight `1 / log(s + offset)` and moves
+the ratios slightly. That makes `--fusion_alpha` a dispersion knob collinear with `--offset`, so a win
+under `decoder` would be an offset artifact wearing a hypothesis's clothes. At `alpha = 1` the score
+is constant outright and the allocation is exactly homogeneous, which `allocate_ratios` catches with a
+`[BUDGET][WARNING]`; the harmful case is the one it does not catch.
+
+Block Influence has exactly two channels: a **flat grouping**, where a group spans all 32 blocks so
+beta varies inside it, and the **outer level** of stage 3. This stage is the first; stage 3's second
+block is the second.
 
 **What to look at.** `influence_tail` in the offline objective panel is circular with this score
 metric, exactly as `frobenius_tail` is circular with `truncation`. Do not read a composite win on
 that column as evidence.
+
+Stage 2 predicts this stage loses: it re-opens cross-depth movement, and it does so under a grouping
+already measured as worse than `decoder`. That makes it a control rather than a candidate, and a
+negative result here is the scalar half of the same finding the outer level tests.
 
 **Gate.** `__CKPT_BEST_COMPOSITE_0.2__` = the best composite checkpoint at 0.2, for stage 9. The
 composite scores also enter the stage 7 finalist ranking on equal footing with the plain ones.
@@ -618,18 +792,28 @@ grouping, a score and an inner policy:
 
 ---
 
-## Stage 8: the ratio curve (RQ1)
+## Stage 8: the onset probe (RQ1)
 
-**Purpose.** RQ1 asks how the heterogeneous gain *depends* on the target ratio. Two points give a
-slope but no shape, so this adds three more rather than tripling every earlier stage.
+**Runs it after stage 4**, so it inherits the frozen cap. It keeps the stage 8 section and file.
 
-**Runs.** 6: `{homogeneous, best heterogeneous}` at `{0.35, 0.65, 0.8}`. Combined with 0.2 and 0.5
-already collected, that is a five point curve for both arms.
+**Purpose.** Not a curve. Stage 2 measured no distinguishable effect at 0.2 and a 2.7% gain at 0.5, so
+the question RQ1 can actually answer is **where between them the effect switches on**, and whether it
+survives past 0.5. Two points locate that; a five-point curve would not, for a reason worth stating in
+the thesis.
 
-**Offline preview: this is where the oracle earns its place.** Raw objective values move by orders of
+**Why not a curve.** There is no variance estimate anywhere in this design. `--seed 6363` is frozen
+upstream of the whitening cache, so a repeat measurement means recomputing whitening, hours per point.
+A five-point curve with no error bars supports a direction claim at best, and 0.2 against 0.5 already
+gives the direction. 0.35 is interpolation between two points already owned, and 0.8 puts the model
+past 100 perplexity where the comparison stops meaning anything.
+
+**Runs.** 4: `{homogeneous, best heterogeneous}` at `{0.35, 0.65}`.
+
+**Offline preview: the shape claim lives here, for free.** Raw objective values move by orders of
 magnitude with the budget, which drowns the difference between two policies at the same ratio. The
-`<objective>_oracle_ratio` columns divide out the budget's own contribution and leave the five points
-comparable.
+`<objective>_oracle_ratio` columns divide out the budget's own contribution and leave the points
+comparable, so sweep as many budgets as you like and report the shape as an allocation-level result,
+clearly labelled as not a perplexity claim.
 
 ```bash
 python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
@@ -639,10 +823,11 @@ python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
     --out_dir ./output/allocation_reports/stage8 --plots
 ```
 
-**What to look at.** Whether the gap widens, narrows or inverts with the ratio. At 0.8 a
-heterogeneous allocation is heavily constrained by `--max_ratio`, so read this stage together with
-stage 4 and with `figures/cap_binding.csv`. The gate report prints the curve as one row per budget and
-names the winning configuration at each: if the name changes between rows, that change is the answer.
+**What to look at.** Whether 0.35 sits with 0.2 (no measurable effect) or with 0.5 (a real gain). That
+boundary is the honest scope of the RQ1 claim, and if it falls above 0.35 the thesis has to say that
+the window where allocation matters and the window where the model is usable may not overlap. The gate
+report prints one row per budget and names the winning configuration at each: if the name changes
+between rows, that change is itself the answer.
 
 **Gate.** None, this stage resolves no placeholder. It is read, not consumed.
 
@@ -698,21 +883,26 @@ negatively.
 
 ## Totals
 
+In execution order, with the two completed stages marked.
+
 | Stage | Runs | Evaluation | Offline preview |
 |---|---|---|---|
 | 0 offline | 0 | none | the stage itself |
-| 1 anchors | 3 | perplexity | not needed |
-| 2 score x grouping | 18 | perplexity | prune degenerate cells |
-| 2b squared | 6 | perplexity | compare ratio maps |
-| 2c Schatten | 8 | perplexity | check `norm\|-inf` is not noise |
-| 3 policies | 20 | perplexity | **mandatory**, sets the knobs |
-| 4 cap | 5 | perplexity | which caps bind |
-| 5 bypass | 24 | perplexity | catches infeasible budgets |
-| 6 composite | 12 | perplexity | **gated** on the Spearman sign, sets the offset |
+| 1 anchors | 3 **done** | wikitext | not needed |
+| 2 score x grouping | 18 **done** | wikitext | prune degenerate cells |
+| 2b squared | 6 | wikitext | compare ratio maps |
+| 2c Schatten | 4 (+2) | wikitext | check `norm\|-inf` is not noise |
+| 3 policies | 32 | wikitext | **mandatory**, sets the knobs |
+| 4 cap | 9 | wikitext | which caps bind, per grouping |
+| 8 onset | 4 | wikitext | oracle-normalized, and where the shape claim lives |
+| 5 bypass | 36 | wikitext | catches infeasible budgets |
+| 5b bypass x grouping | 2 | wikitext | same preview as 5 |
+| 6 composite | 12 | wikitext | **gated** on the Spearman sign, sets the offset |
 | 7 cross-model | 12 | blocked | rerun stage 0 per model |
-| 8 ratio curve | 6 | perplexity | oracle-normalized comparison |
-| 9 benchmarks | 9 | full suite, no recompression | not applicable |
-| 10 LoRA | 4 | perplexity, no recompression | not applicable |
+| 9 benchmarks | 9 | full suite **and c4**, no recompression | not applicable |
+| 10 LoRA | 4 | wikitext, no recompression | not applicable |
 
-**102 compression runs** on LLaMA-7B, plus 13 evaluation-only or update-only runs, plus 12 blocked.
-Every stage is previewed offline first, at a cost of seconds.
+**105 compression runs remaining** on LLaMA-7B (+2 if `norm|-inf` clears its preview), on top of the
+21 already collected, plus 13 evaluation-only or update-only runs, plus 12 blocked. At roughly an hour
+each that is about four and a half days of continuous GPU. Every stage is previewed offline first, at
+a cost of seconds.

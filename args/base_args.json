@@ -21,5 +21,5 @@
   "--evaluate": true,
   "--eval_batch_size": "auto",
   "--eval_max_length": 4096,
-  "--eval_tasks": "wikitext,c4|0"
+  "--eval_tasks": "wikitext|0"
 }

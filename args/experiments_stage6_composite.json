@@ -3,84 +3,84 @@
     "--compression_ratio": 0.2,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|truncation|block_influence",
+    "--score_metric": "composite|__TOP1_SCORE__|block_influence",
     "--fusion_alpha": 0.25
   },
   {
     "--compression_ratio": 0.2,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|truncation|block_influence",
+    "--score_metric": "composite|__TOP1_SCORE__|block_influence",
     "--fusion_alpha": 0.5
   },
   {
     "--compression_ratio": 0.2,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|truncation|block_influence",
+    "--score_metric": "composite|__TOP1_SCORE__|block_influence",
     "--fusion_alpha": 0.75
   },
   {
     "--compression_ratio": 0.2,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|eff_rank|block_influence",
+    "--score_metric": "composite|__TOP2_SCORE__|block_influence",
     "--fusion_alpha": 0.25
   },
   {
     "--compression_ratio": 0.2,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|eff_rank|block_influence",
+    "--score_metric": "composite|__TOP2_SCORE__|block_influence",
     "--fusion_alpha": 0.5
   },
   {
     "--compression_ratio": 0.2,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|eff_rank|block_influence",
+    "--score_metric": "composite|__TOP2_SCORE__|block_influence",
     "--fusion_alpha": 0.75
   },
   {
     "--compression_ratio": 0.5,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|truncation|block_influence",
+    "--score_metric": "composite|__TOP1_SCORE__|block_influence",
     "--fusion_alpha": 0.25
   },
   {
     "--compression_ratio": 0.5,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|truncation|block_influence",
+    "--score_metric": "composite|__TOP1_SCORE__|block_influence",
     "--fusion_alpha": 0.5
   },
   {
     "--compression_ratio": 0.5,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|truncation|block_influence",
+    "--score_metric": "composite|__TOP1_SCORE__|block_influence",
     "--fusion_alpha": 0.75
   },
   {
     "--compression_ratio": 0.5,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|eff_rank|block_influence",
+    "--score_metric": "composite|__TOP2_SCORE__|block_influence",
     "--fusion_alpha": 0.25
   },
   {
     "--compression_ratio": 0.5,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|eff_rank|block_influence",
+    "--score_metric": "composite|__TOP2_SCORE__|block_influence",
     "--fusion_alpha": 0.5
   },
   {
     "--compression_ratio": 0.5,
     "--het": true,
     "--group_criterion": "__BEST_FLAT_GROUPING__",
-    "--score_metric": "composite|eff_rank|block_influence",
+    "--score_metric": "composite|__TOP2_SCORE__|block_influence",
     "--fusion_alpha": 0.75
   }
 ]

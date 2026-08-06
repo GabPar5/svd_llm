@@ -5,11 +5,11 @@
     "--group_criterion": "__BEST_GROUPING__",
     "--score_metric": "__TOP1_SCORE__",
     "--inner_allocation": "__BEST_INNER__",
-    "--bypass_early_layers": 2
+    "--bypass_early_layers": 1
   },
   {
     "--compression_ratio": 0.2,
-    "--bypass_early_layers": 2
+    "--bypass_early_layers": 1
   },
   {
     "--compression_ratio": 0.2,
@@ -53,11 +53,51 @@
     "--group_criterion": "__BEST_GROUPING__",
     "--score_metric": "__TOP1_SCORE__",
     "--inner_allocation": "__BEST_INNER__",
+    "--bypass_late_layers": 4
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--bypass_late_layers": 4
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--bypass_late_layers": 8
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--bypass_late_layers": 8
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--bypass_early_layers": 2,
     "--bypass_late_layers": 2
   },
   {
     "--compression_ratio": 0.2,
+    "--bypass_early_layers": 2,
     "--bypass_late_layers": 2
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--bypass_early_layers": 4,
+    "--bypass_late_layers": 4
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--bypass_early_layers": 4,
+    "--bypass_late_layers": 4
   },
   {
     "--compression_ratio": 0.2,
@@ -79,11 +119,11 @@
     "--group_criterion": "__BEST_GROUPING__",
     "--score_metric": "__TOP1_SCORE__",
     "--inner_allocation": "__BEST_INNER__",
-    "--bypass_early_layers": 2
+    "--bypass_early_layers": 1
   },
   {
     "--compression_ratio": 0.5,
-    "--bypass_early_layers": 2
+    "--bypass_early_layers": 1
   },
   {
     "--compression_ratio": 0.5,
@@ -127,11 +167,51 @@
     "--group_criterion": "__BEST_GROUPING__",
     "--score_metric": "__TOP1_SCORE__",
     "--inner_allocation": "__BEST_INNER__",
+    "--bypass_late_layers": 4
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--bypass_late_layers": 4
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--bypass_late_layers": 8
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--bypass_late_layers": 8
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--bypass_early_layers": 2,
     "--bypass_late_layers": 2
   },
   {
     "--compression_ratio": 0.5,
+    "--bypass_early_layers": 2,
     "--bypass_late_layers": 2
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--bypass_early_layers": 4,
+    "--bypass_late_layers": 4
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--bypass_early_layers": 4,
+    "--bypass_late_layers": 4
   },
   {
     "--compression_ratio": 0.5,

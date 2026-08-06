@@ -1,0 +1,14 @@
+[
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "norm|-inf"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "norm|-inf"
+  }
+]
