@@ -1865,9 +1865,13 @@ def load_offline_reports(allocation_dir: Path) -> Dict[str, OfflineStage]:
     stages: Dict[str, OfflineStage] = {}
 
     for path in sorted(allocation_dir.iterdir()):
-        match = re.fullmatch(r"stage(\d+[a-z]?)", path.name)
+        # A stage may be previewed more than once, under a suffixed directory
+        # such as `stage3_knobs`, and both still belong to stage 3
+        match = re.fullmatch(r"stage(\d+[a-z]?)(?:[_-].*)?", path.name)
 
-        if not path.is_dir() or match is None:
+        # Sorted order puts the unsuffixed directory first, and that one is the
+        # canonical preview of its stage
+        if not path.is_dir() or match is None or match.group(1) in stages:
             continue
 
         stages[match.group(1)] = OfflineStage(
