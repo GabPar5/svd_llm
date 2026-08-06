@@ -478,6 +478,11 @@ python generate_tables.py ./output/eval/huggyllama_llama_7b \
 
 The gate report ranks configurations **within each ratio** and averages those ranks, never comparing raw perplexity between budgets, and reports the number of ratios each row was priced at so a partially-run configuration cannot quietly win. Every gate holds the dimensions it is not sweeping fixed and says which runs that excluded, since a later stage's sweep otherwise shares an earlier gate's axes and decides it through a dimension the stage was never comparing. The dimensions come from the sidecar, which is the only place most of them exist; a run without one is counted and left out.
 
+Two things it says out loud rather than leaving to the reader:
+
+- A placeholder decided by a table holding a single entrant is marked **`provisional (1 candidate)`** instead of `ready`. It is a real value, but it reports the only run that has happened rather than a winner.
+- A ratio whose rows span less than 1% of its best value is flagged as **not resolvable**: the ranking there carries no information and the mean rank is decided by the other ratios.
+
 ### `generate_text.py`
 
 Generates text with one checkpoint, a whole folder of checkpoints (sequentially), and optionally the original model, writing one markdown file per model with both greedy and sampled output.

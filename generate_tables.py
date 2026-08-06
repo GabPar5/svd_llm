@@ -900,7 +900,7 @@ def value_cells(
     """
     cells = []
 
-    for column in VALUE_COLUMNS:
+    for column in columns if columns is not None else VALUE_COLUMNS:
         highlight = best is not None and is_best(row, column, best)
         cells.append(render(metric_value_for_display(row, column), highlight))
 
@@ -924,10 +924,10 @@ def make_markdown_table_for_model(model_name: str, rows: List[Dict[str, Any]]) -
         "Matrices",
     ]
 
-    headers += [BENCHMARK_LABELS_MD[b] for b in PERPLEXITY_BENCHMARK_ORDER]
-    headers += [BENCHMARK_LABELS_MD[b] for b in LIKELIHOOD_BENCHMARK_ORDER]
-    headers += [ "Average ↑" ]
-    headers += [BENCHMARK_LABELS_MD[b] for b in GENERATION_BENCHMARK_ORDER]
+    headers += [BENCHMARK_LABELS_MD[b] for b in perplexity]
+    headers += [BENCHMARK_LABELS_MD[b] for b in likelihood]
+    headers += [ "Average ↑" ] * len(summary)
+    headers += [BENCHMARK_LABELS_MD[b] for b in generation]
     headers += [ "File" ]
 
     lines: List[str] = [ f"## {model_name}", "" ]
@@ -1236,6 +1236,10 @@ SQUARED_SCORE_FAMILY = (
 # one that hit its budget, which a gate has to say out loud rather than average in
 RATIO_DRIFT_TOLERANCE = 0.005
 
+# Rows spanning less than this fraction of the best value at a ratio are not
+# separated by it, so the ranking there carries no information
+RESOLUTION_SPREAD = 0.01
+
 # Every placeholder a stage file can carry, and the gate that answers it
 PLACEHOLDER_SOURCES: Dict[str, str] = {
     "__CKPT_HOM_0.2__": "stage 1",
@@ -1250,6 +1254,8 @@ PLACEHOLDER_SOURCES: Dict[str, str] = {
     "__CKPT_BEST_POLICY_0.2__": "stage 3",
     "__CKPT_BEST_POLICY_0.5__": "stage 3",
     "--max_ratio": "stage 4, into args/base_args.json",
+    "__BEST_BYPASS_EARLY__": "stage 5",
+    "__BEST_BYPASS_LATE__": "stage 5",
     "__CKPT_BEST_BYPASS_0.2__": "stage 5",
     "__CKPT_BEST_COMPOSITE_0.2__": "stage 6",
     "__CKPT_HET_0.2__": "stages 2 to 6",
@@ -1261,6 +1267,11 @@ PLACEHOLDER_SOURCES.update({
     for index in ( 1, 2, 3 )
     for role in ( "GROUPING", "SCORE", "INNER" )
 })
+
+# In rank order, because stages 2b and 2c re-resolve both of them together: a
+# squared score or a Schatten norm may take either place, which is why no stage
+# file past 2c names a score literally
+SCORE_PLACEHOLDERS = ( "__TOP1_SCORE__", "__TOP2_SCORE__" )
 
 # Figures `allocation_report.py` writes that a gate reads back
 OFFLINE_FIGURES = (
@@ -1287,6 +1298,22 @@ class Table(NamedTuple):
     notes: List[str]
 
 
+class Resolution(NamedTuple):
+    """
+    A placeholder's value, and how many candidates the gate chose it from.
+
+    A gate whose deciding axis held one entrant still resolves to a real value
+    and reads as decided, which is how `__BEST_INNER__` came out of a table
+    holding only `waterfill`. The count is what separates a decision from a
+    default, and it is the only thing distinguishing the two in the report.
+
+    `candidates` is None where no choice was involved at all: the homogeneous
+    anchor of a ratio is the only run that could have filled its role
+    """
+    value: str
+    candidates: Optional[int]
+
+
 class OfflineStage(NamedTuple):
     """One `allocation_report.py --out_dir` directory, keyed by the stage it previews"""
     stage: str
@@ -1304,13 +1331,13 @@ class GateContext(NamedTuple):
     """
     rows: List[Dict[str, Any]]
     offline: Dict[str, OfflineStage]
-    resolved: Dict[str, str]
+    resolved: Dict[str, Resolution]
     metric: str
 
 
 class GateResult(NamedTuple):
     tables: List[Table]
-    resolved: Dict[str, str]
+    resolved: Dict[str, Resolution]
 
 
 class PivotRow(NamedTuple):
@@ -1595,12 +1622,21 @@ def best_by(pivot: List[PivotRow], index: int) -> List[Tuple[str, float]]:
     )
 
 
-def best_checkpoints(pivot: List[PivotRow], prefix: str) -> Dict[str, str]:
+def resolved_value(resolved: Dict[str, Resolution], placeholder: str) -> Optional[str]:
+    """The value a gate resolved, or None while no gate has answered yet"""
+    resolution = resolved.get(placeholder)
+    return resolution.value if resolution is not None else None
+
+
+def best_checkpoints(pivot: List[PivotRow], prefix: str) -> Dict[str, Resolution]:
     """The rank-1 checkpoint at each ratio, which is what a `__CKPT_*__` role names"""
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
     ratios = sorted({ratio for row in pivot for ratio in row.runs})
 
     for ratio in ratios:
+        # Only the rows this ratio actually priced were in the running for it
+        competing = sum(1 for row in pivot if row.values.get(ratio) is not None)
+
         for row in pivot:
             if row.ranks.get(ratio) != 1:
                 continue
@@ -1608,7 +1644,7 @@ def best_checkpoints(pivot: List[PivotRow], prefix: str) -> Dict[str, str]:
             path = str(row.runs[ratio].get("checkpoint_path") or "")
 
             if path:
-                resolved[f"{prefix}_{axis_text(ratio)}__"] = path
+                resolved[f"{prefix}_{axis_text(ratio)}__"] = Resolution(value=path, candidates=competing)
 
             break
 
@@ -1717,6 +1753,38 @@ def skipped_note(skipped: int) -> List[str]:
     ]
 
 
+def resolution_notes(pivot: List[PivotRow], ratios: List[float]) -> List[str]:
+    """
+    Ratios whose rows are too close together for the ranking to mean anything.
+
+    A rank is only worth reading where the configurations it separates actually
+    differ. On LLaMA-7B at ratio 0.2 the nine stage 2 cells spanned 0.03
+    perplexity with three exact ties, and averaging that rank with the one from
+    0.5 handed half the decision to a quantity this design cannot resolve
+    """
+    notes: List[str] = []
+
+    for ratio in ratios:
+        priced = [row.values[ratio] for row in pivot if row.values.get(ratio) is not None]
+
+        if len(priced) < 2 or min(priced) <= 0.0:
+            continue
+
+        spread = max(priced) - min(priced)
+        relative = spread / min(priced)
+
+        if relative >= RESOLUTION_SPREAD:
+            continue
+
+        notes.append(
+            f"the {len(priced)} rows at {axis_text(ratio)} span {spread:.2f} ({relative:.1%} of the best "
+            "value), so the ranking at this ratio is not resolvable by this design and the mean rank is "
+            "decided by the other ratios",
+        )
+
+    return notes
+
+
 def pivot_table(
         title: str,
         purpose: str,
@@ -1764,7 +1832,7 @@ def pivot_table(
         cells.append(Cell(text=f"{priced}/{len(ratios)}"))
         body.append(cells)
 
-    extra_notes: List[str] = []
+    extra_notes = resolution_notes(pivot, ratios)
 
     if len(set(coverage.values())) > 1:
         extra_notes.append(
@@ -2052,18 +2120,30 @@ def offline_tables(context: GateContext, stage: str, figures: Tuple[Tuple[str, s
 # The gates themselves, in the order EXPERIMENTS.md runs them
 # ---------------------------------------------------------------------------
 
-def dense_perplexity_notes(row: Dict[str, Any]) -> List[str]:
+def dense_perplexity_notes(row: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[str]:
     """
     Stage 1's own check: wikitext and c4 must differ on the dense baseline.
 
     Identical values are the signature of the c4 task re-evaluating wikitext, in
-    which case nothing downstream measures what it claims to.
+    which case nothing downstream measures what it claims to. The screening
+    stages deliberately evaluate wikitext alone, so a corpus with no c4 anywhere
+    is waiting for the full suite rather than broken, and only a corpus that has
+    c4 elsewhere but not here is missing something.
     """
     wikitext = as_float(row.get("wikitext"))
     c4 = as_float(row.get("c4"))
 
-    if wikitext is None or c4 is None:
-        return ["the dense baseline is missing one of the two perplexities, so the c4 check cannot run"]
+    if wikitext is None:
+        return ["the dense baseline has no wikitext perplexity, so nothing below is measured against a floor"]
+
+    if c4 is None:
+        if not any(as_float(other.get("c4")) is not None for other in rows):
+            return [
+                "c4 was not evaluated in these runs, which is expected while screening: the check that "
+                "wikitext and c4 differ runs when the full suite does",
+            ]
+
+        return ["other runs carry a c4 perplexity but the dense baseline does not, so the check cannot run"]
 
     if abs(wikitext - c4) < 1e-6:
         return [
@@ -2083,7 +2163,7 @@ def gate_stage1_anchors(context: GateContext) -> GateResult:
         return is_compression_run(row) and row.get("scheme") == "hom" and bypasses_nothing(row)
 
     rows = sorted((row for row in context.rows if select(row)), key=sort_rows_hierarchical)
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
     notes: List[str] = []
     body: List[List[Cell]] = []
 
@@ -2100,13 +2180,14 @@ def gate_stage1_anchors(context: GateContext) -> GateResult:
         ])
 
         if dense:
-            notes += dense_perplexity_notes(row)
+            notes += dense_perplexity_notes(row, context.rows)
             continue
 
         path = str(row.get("checkpoint_path") or "")
 
         if path and target is not None:
-            resolved[f"__CKPT_HOM_{axis_text(target)}__"] = path
+            # One homogeneous run per ratio, so nothing competed for the role
+            resolved[f"__CKPT_HOM_{axis_text(target)}__"] = Resolution(value=path, candidates=None)
 
     table = Table(
         title="Stage 1 gate: anchors",
@@ -2151,18 +2232,18 @@ def gate_stage2_score_grouping(context: GateContext) -> GateResult:
         notes=[ *skipped_note(skipped), *held, *confound_notes(rows, axes) ],
     )]
 
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
     groupings = best_by(pivot, 0)
 
     if not groupings:
         return GateResult(tables=tables, resolved=resolved)
 
     best_grouping = groupings[0][0]
-    resolved["__BEST_GROUPING__"] = best_grouping
+    resolved["__BEST_GROUPING__"] = Resolution(value=best_grouping, candidates=len(groupings))
     flat = [value for value, _ in groupings if value in FLAT_GROUPINGS]
 
     if flat:
-        resolved["__BEST_FLAT_GROUPING__"] = flat[0]
+        resolved["__BEST_FLAT_GROUPING__"] = Resolution(value=flat[0], candidates=len(flat))
 
     tables.append(aggregate_table(
         title="Stage 2 gate: grouping aggregate",
@@ -2180,7 +2261,7 @@ def gate_stage2_score_grouping(context: GateContext) -> GateResult:
 
     for placeholder, index in ( ( "__TOP1_SCORE__", 0 ), ( "__TOP2_SCORE__", 1 ) ):
         if len(scores) > index:
-            resolved[placeholder] = scores[index][0]
+            resolved[placeholder] = Resolution(value=scores[index][0], candidates=len(scores))
 
     if scores:
         tables.append(aggregate_table(
@@ -2210,14 +2291,17 @@ def score_family_gate(
         offline_stage: str
 ) -> GateResult:
     """
-    Stages 2b and 2c: a score family measured against the incumbent `__TOP1_SCORE__`.
+    Stages 2b and 2c: a score family measured against the incumbent scores.
 
-    The incumbent is pulled into the same table on purpose, since both gates are
-    promotion tests rather than rankings of a family on its own.
+    Both incumbents are pulled into the same table on purpose. These gates are
+    promotion tests rather than rankings of a family on its own, and every stage
+    from 3 on holds its scores as placeholders precisely so that either of them
+    can still move here.
     """
     axes = ( "score_metric", )
-    grouping = context.resolved.get("__BEST_GROUPING__")
-    incumbent = context.resolved.get("__TOP1_SCORE__", "")
+    grouping = resolved_value(context.resolved, "__BEST_GROUPING__")
+    incumbents = [resolved_value(context.resolved, name) for name in SCORE_PLACEHOLDERS]
+    incumbents = [score for score in incumbents if score]
 
     def select(row: Dict[str, Any]) -> bool:
         score = str(row.get("score_metric") or "")
@@ -2226,28 +2310,39 @@ def score_family_gate(
             is_baseline_heterogeneous(row)
             and row.get("inner_allocation") == DEFAULT_INNER_ALLOCATION
             and ( grouping is None or row.get("group_criterion") == grouping )
-            and ( belongs(score) or score == incumbent )
+            and ( belongs(score) or score in incumbents )
         )
 
     rows, skipped = gate_rows(context.rows, axes, select)
     rows, held = hold_dominant(rows, "max_ratio")
     pivot = build_pivot(rows, axes, context.metric)
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
     notes = [ *skipped_note(skipped), *held, *confound_notes(rows, axes) ]
 
     if grouping is not None:
         notes.append(f"held at `--group_criterion {grouping}`, as stage 2 resolved it")
 
-    winner = pivot[0].key[0] if pivot else ""
+    ranked = [row.key[0] for row in pivot if row.mean_rank is not None]
 
-    if winner and not incumbent:
-        notes.append("stage 2 has not resolved `__TOP1_SCORE__` yet, so nothing is promoted from here")
-    elif winner and winner != incumbent:
-        resolved["__TOP1_SCORE__"] = winner
-        resolved.update(best_checkpoints(pivot, "__CKPT_BEST_SCORE"))
-        notes.append(f"`{winner}` beats the incumbent `{incumbent}` on mean rank and is promoted to `__TOP1_SCORE__`")
-    elif winner:
-        notes.append(f"the incumbent `{incumbent}` holds, so `__TOP1_SCORE__` is unchanged")
+    if ranked and not incumbents:
+        notes.append("stage 2 has not resolved the scores yet, so nothing is promoted from here")
+    elif ranked:
+        for index, placeholder in enumerate(SCORE_PLACEHOLDERS):
+            if index >= len(ranked) or ranked[index] == resolved_value(context.resolved, placeholder):
+                continue
+
+            resolved[placeholder] = Resolution(value=ranked[index], candidates=len(ranked))
+            notes.append(
+                f"`{ranked[index]}` takes `{placeholder}` from "
+                f"`{resolved_value(context.resolved, placeholder)}` on mean rank",
+            )
+
+        if not resolved:
+            notes.append(f"the incumbents hold, so {' and '.join(SCORE_PLACEHOLDERS)} are unchanged")
+
+        # The checkpoint role follows whichever run now holds the top score
+        if SCORE_PLACEHOLDERS[0] in resolved:
+            resolved.update(best_checkpoints(pivot, "__CKPT_BEST_SCORE"))
 
     tables = [pivot_table(
         title=title,
@@ -2294,8 +2389,8 @@ def gate_stage2c_schatten(context: GateContext) -> GateResult:
 
 def gate_stage3_policies(context: GateContext) -> GateResult:
     """Stage 3 (RQ3): whether the policy spending a group budget matters apart from the score"""
-    grouping = context.resolved.get("__BEST_GROUPING__")
-    top_scores = [context.resolved.get(name) for name in ( "__TOP1_SCORE__", "__TOP2_SCORE__" )]
+    grouping = resolved_value(context.resolved, "__BEST_GROUPING__")
+    top_scores = [resolved_value(context.resolved, name) for name in ( "__TOP1_SCORE__", "__TOP2_SCORE__" )]
     top_scores = [score for score in top_scores if score]
 
     inner_axes = ( "inner_allocation", "score_metric" )
@@ -2354,11 +2449,11 @@ def gate_stage3_policies(context: GateContext) -> GateResult:
         ],
     ))
 
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
     policies = best_by(inner_pivot, 0)
 
     if policies:
-        resolved["__BEST_INNER__"] = policies[0][0]
+        resolved["__BEST_INNER__"] = Resolution(value=policies[0][0], candidates=len(policies))
         resolved.update(best_checkpoints(inner_pivot, "__CKPT_BEST_POLICY"))
         tables.append(aggregate_table(
             title="Stage 3 gate: inner policy aggregate",
@@ -2391,9 +2486,9 @@ def gate_stage3_policies(context: GateContext) -> GateResult:
 def gate_stage4_cap(context: GateContext) -> GateResult:
     """Stage 4: `--max_ratio`, which Swift-SVD reports as first-order rather than a guard rail"""
     axes = ( "max_ratio", )
-    grouping = context.resolved.get("__BEST_GROUPING__")
-    score = context.resolved.get("__TOP1_SCORE__")
-    inner = context.resolved.get("__BEST_INNER__")
+    grouping = resolved_value(context.resolved, "__BEST_GROUPING__")
+    score = resolved_value(context.resolved, "__TOP1_SCORE__")
+    inner = resolved_value(context.resolved, "__BEST_INNER__")
 
     def select(row: Dict[str, Any]) -> bool:
         return (
@@ -2418,11 +2513,11 @@ def gate_stage4_cap(context: GateContext) -> GateResult:
             notes += held
 
     pivot = build_pivot(rows, axes, context.metric)
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
     notes += confound_notes(rows, axes)
 
     if pivot:
-        resolved["--max_ratio"] = pivot[0].key[0]
+        resolved["--max_ratio"] = Resolution(value=pivot[0].key[0], candidates=len(pivot))
         notes.append(
             f"cap `{pivot[0].key[0]}` wins on mean rank. If it is below the 0.9 default, thesis 3.3 has "
             "to call the cap a first-order hyperparameter, and stages 5, 6 and 8 need it in `args/base_args.json`",
@@ -2473,7 +2568,7 @@ def gate_stage5_bypass(context: GateContext) -> GateResult:
         notes += held
 
     gain_rows = build_gain_rows(rows, axes, context.metric)
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
 
     baseline_gain = next((row.mean_gain for row in gain_rows if row.key == ( "0", "0" )), None)
     bypassing = [row for row in gain_rows if row.key != ( "0", "0" ) and row.mean_gain is not None]
@@ -2493,11 +2588,17 @@ def gate_stage5_bypass(context: GateContext) -> GateResult:
             "both mechanisms are competing for the same redundancy, which is the second half of RQ4",
         )
 
+    if bypassing:
+        # Sorted by mean gain, so the setting itself comes from the head even
+        # when its checkpoint has already been cleaned up
+        for placeholder, position in ( ( "__BEST_BYPASS_EARLY__", 0 ), ( "__BEST_BYPASS_LATE__", 1 ) ):
+            resolved[placeholder] = Resolution(value=bypassing[0].key[position], candidates=len(bypassing))
+
     for row in bypassing:
         path = str(row.het.runs[0.2].get("checkpoint_path") or "") if row.het is not None and 0.2 in row.het.runs else ""
 
         if path:
-            resolved["__CKPT_BEST_BYPASS_0.2__"] = path
+            resolved["__CKPT_BEST_BYPASS_0.2__"] = Resolution(value=path, candidates=len(bypassing))
             break
 
     tables = [gain_table(
@@ -2540,7 +2641,7 @@ def gate_stage6_composite(context: GateContext) -> GateResult:
         "`frobenius_tail` is with `truncation`, so a win on that column is not evidence",
     ]
 
-    grouping = context.resolved.get("__BEST_FLAT_GROUPING__")
+    grouping = resolved_value(context.resolved, "__BEST_FLAT_GROUPING__")
     groupings_used = {str(row.get("group_criterion")) for row in rows}
 
     if groupings_used & set(BLOCK_GROUPINGS):
@@ -2561,7 +2662,7 @@ def gate_stage6_composite(context: GateContext) -> GateResult:
         notes=notes,
     )]
 
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
     resolved.update(best_checkpoints(pivot, "__CKPT_BEST_COMPOSITE"))
     # Only 0.2 has a role in stage 9, and an extra ratio would invent a placeholder
     resolved = {key: value for key, value in resolved.items() if key in PLACEHOLDER_SOURCES}
@@ -2598,11 +2699,12 @@ def gate_stage7_finalists(context: GateContext) -> GateResult:
     pivot = build_pivot(rows, axes, context.metric)
     finalists = pivot[:3]
 
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
 
     for index, row in enumerate(finalists, start=1):
         for role, position in ( ( "GROUPING", 0 ), ( "SCORE", 1 ), ( "INNER", 2 ) ):
-            resolved[f"__FINALIST{index}_{role}__"] = row.key[position]
+            candidates = len({other.key[position] for other in pivot})
+            resolved[f"__FINALIST{index}_{role}__"] = Resolution(value=row.key[position], candidates=candidates)
 
     if finalists:
         for ratio, run in sorted(finalists[0].runs.items()):
@@ -2610,7 +2712,7 @@ def gate_stage7_finalists(context: GateContext) -> GateResult:
             placeholder = f"__CKPT_HET_{axis_text(ratio)}__"
 
             if path and placeholder in PLACEHOLDER_SOURCES:
-                resolved[placeholder] = path
+                resolved[placeholder] = Resolution(value=path, candidates=len(pivot))
 
     tables = [pivot_table(
         title="Stage 7 gate: finalists",
@@ -2707,7 +2809,7 @@ def gate_stage9_roster(context: GateContext) -> GateResult:
     body: List[List[Cell]] = []
 
     for placeholder, source in roles:
-        path = context.resolved.get(placeholder, "")
+        path = resolved_value(context.resolved, placeholder) or ""
         stem = Path(path).stem if path else ""
 
         body.append([
@@ -2817,7 +2919,27 @@ GATES: Tuple[Callable[[GateContext], GateResult], ...] = (
 )
 
 
-def placeholder_table(resolved: Dict[str, str]) -> Table:
+def resolution_status(resolution: Optional[Resolution]) -> str:
+    """
+    Whether a value was decided or merely defaulted.
+
+    A gate whose deciding axis held one entrant produces a real value that reads
+    as settled. Saying how many candidates it beat is what stops a stage from
+    being carried forward on the strength of the only run that had happened yet
+    """
+    if resolution is None:
+        return "waiting on runs"
+
+    if resolution.candidates is None:
+        return "ready"
+
+    if resolution.candidates <= 1:
+        return "provisional (1 candidate)"
+
+    return f"ready ({resolution.candidates} candidates)"
+
+
+def placeholder_table(resolved: Dict[str, Resolution]) -> Table:
     """
     The one table this report exists for: what to paste into the next stage file.
 
@@ -2827,21 +2949,21 @@ def placeholder_table(resolved: Dict[str, str]) -> Table:
     body: List[List[Cell]] = []
 
     for placeholder, source in PLACEHOLDER_SOURCES.items():
-        value = resolved.get(placeholder, "")
+        resolution = resolved.get(placeholder)
 
         body.append([
             Cell(text=placeholder),
-            Cell(text=value or "not resolved yet", bold=bool(value)),
+            Cell(text=resolution.value if resolution is not None else "not resolved yet", bold=resolution is not None),
             Cell(text=source),
-            Cell(text="ready" if value else "waiting on runs"),
+            Cell(text=resolution_status(resolution)),
         ])
 
     for placeholder in sorted(set(resolved) - set(PLACEHOLDER_SOURCES)):
         body.append([
             Cell(text=placeholder),
-            Cell(text=resolved[placeholder], bold=True),
+            Cell(text=resolved[placeholder].value, bold=True),
             Cell(text="resolved by a gate, no stage file asks for it"),
-            Cell(text="ready"),
+            Cell(text=resolution_status(resolved[placeholder])),
         ])
 
     return Table(
@@ -2852,6 +2974,8 @@ def placeholder_table(resolved: Dict[str, str]) -> Table:
         notes=[
             "`run_experiments.py` refuses to start while a placeholder is unresolved, so a `waiting on runs` "
             "row is a stage that cannot run yet rather than a defaulted one",
+            "a `provisional` row was decided by a gate whose deciding axis held a single candidate, so it "
+            "reports the only run that has happened rather than a winner: rerun the stage before trusting it",
         ],
     )
 
@@ -2862,7 +2986,7 @@ def gate_tables_for_model(
         metric: str
 ) -> List[Table]:
     """Run every gate in stage order, so a later one can read what an earlier one resolved"""
-    resolved: Dict[str, str] = {}
+    resolved: Dict[str, Resolution] = {}
     tables: List[Table] = []
 
     for gate in GATES:
