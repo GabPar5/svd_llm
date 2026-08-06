@@ -127,6 +127,39 @@ Each run also writes `<run_name>.config.json` beside its checkpoint and its eval
 is authoritative for the dimensions the filename cannot carry, and records the **realized** removal
 ratio alongside the target.
 
+## Resolving a gate
+
+```bash
+python generate_tables.py ./output/eval/huggyllama_llama_7b \
+    --report gates --allocation_dir ./output/allocation_reports -o gates.md
+```
+
+One table per gate below, in stage order, and a leading **Placeholders** table holding every value a
+stage file waits on next to what the collected runs resolve it to. A gate still waiting on runs says
+so rather than defaulting, so an unresolved row means that stage cannot run yet. Add `--report both`
+to get the result tables in the same file, or `-f latex` to get the gate tables as LaTeX.
+
+What it does with the runs, so a table can be trusted before it is pasted into a stage file:
+
+- Ranks **within each ratio** and averages the ranks, never comparing raw perplexity across budgets,
+  and reports how many ratios priced each row: stage 4 runs different caps at different ratios, and
+  a mean rank from one ratio is not comparable to one from both.
+- Carries the **gain over the homogeneous arm** at the same setting, which is the RQ1 read every
+  stage repeats, and for stage 5 pairs the two arms bypass setting by bypass setting.
+- **Holds fixed** whatever a stage is not sweeping, and reports which runs that excluded. Stage 4's
+  cap sweep matches stage 3's table in every dimension except the cap, so left in it would decide
+  stage 3's gate through the cap. Stage 5 reads the setting to hold from its own bypassed runs, since
+  its bypass-0 reference otherwise sits among every other stage's runs.
+- Warns when a dimension moves inside a table without being one of its axes, and when a run's
+  realized removal drifted off the budget it is being compared at.
+- Attaches the offline preview of each stage from `--allocation_dir`, including the Spearman sign that
+  gates stage 6, the dispersion used to match the stage 3 knobs, and the cap binding behind stage 4.
+  For stage 2 it also prints the offline ordering against the measured one, which is the disagreement
+  worth reporting: it bounds how far the free preview can substitute for an hour of GPU per cell.
+
+The dimensions all come from the sidecar, the only place most of them exist. A run without one is
+counted and left out rather than guessed at.
+
 ---
 
 ## Stage 0: the offline pass

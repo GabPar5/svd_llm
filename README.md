@@ -452,20 +452,31 @@ The script also reports the Spearman correlation between Block Influence and nor
 
 ### `generate_tables.py`
 
-Turns a directory of evaluation JSONs into markdown or LaTeX tables, grouped by bypassed layers and compression ratio, with the best value per ratio highlighted and the uncompressed baseline shown as a faded row.
+Turns a directory of evaluation JSONs into markdown or LaTeX tables. Two reports, selected with `--report`:
+
+- **`benchmarks`** (default) — the result tables, grouped by bypassed layers and compression ratio, with the best value per ratio highlighted and the uncompressed baseline shown as a faded row.
+- **`gates`** — one table per stage gate of `EXPERIMENTS.md`, plus a leading table resolving every `__PLACEHOLDER__` the next stage file waits on. This is the report to read when moving from one stage to the next.
 
 ```bash
 python generate_tables.py ./output/eval/Qwen_Qwen2.5_7B -f latex -o tables.tex
+
+python generate_tables.py ./output/eval/huggyllama_llama_7b \
+    --report gates --allocation_dir ./output/allocation_reports -o gates.md
 ```
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `input_dir` | `Path` | — | Directory containing lm-eval JSON files. |
 | `-p`, `--pattern` | `str` | `*.json` | Glob pattern for result files. |
-| `-f`, `--format` | `str` | `markdown` | `markdown` or `latex`. |
+| `-f`, `--format` | `str` | `markdown` | `markdown` or `latex`. Applies to both reports. |
 | `-o`, `--output` | `Path` | `lm_eval_report.md` | Output file. |
-| `-w`, `--table_width` | `float` | `1.6` | Table width passed to `adjustbox` (LaTeX only). |
+| `-w`, `--table_width` | `float` | `1.6` | Table width passed to `adjustbox` (LaTeX only, benchmark tables). |
 | `--prefer-lm-eval-model-name` | `flag` | `False` | Take the model name from the JSON config instead of the filename. |
+| `-r`, `--report` | `str` | `benchmarks` | `benchmarks`, `gates`, or `both`. |
+| `--allocation_dir` | `Path` | `None` | Root holding the `allocation_report.py` output directories, usually `./output/allocation_reports`. Every `stage<N>/` inside it is attached to the gate it previews. |
+| `--gate_metric` | `str` | `wikitext` | Perplexity a gate ranks by: `wikitext`, `c4`, or `mean` of both. |
+
+The gate report ranks configurations **within each ratio** and averages those ranks, never comparing raw perplexity between budgets, and reports the number of ratios each row was priced at so a partially-run configuration cannot quietly win. Every gate holds the dimensions it is not sweeping fixed and says which runs that excluded, since a later stage's sweep otherwise shares an earlier gate's axes and decides it through a dimension the stage was never comparing. The dimensions come from the sidecar, which is the only place most of them exist; a run without one is counted and left out.
 
 ### `generate_text.py`
 

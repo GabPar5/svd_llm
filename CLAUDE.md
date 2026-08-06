@@ -46,6 +46,10 @@ python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
 python generate_tables.py ./output/eval/<model_dir> -f latex -o tables.tex
 python generate_tables.py ./output/eval/<model_dir> -f markdown -o report.md
 
+# One table per EXPERIMENTS.md stage gate, resolving the placeholders the next stage waits on
+python generate_tables.py ./output/eval/<model_dir> --report gates \
+    --allocation_dir ./output/allocation_reports -o gates.md
+
 # Text generation for qualitative comparison (one checkpoint, or a folder, sequentially)
 python generate_text.py --base_model "Qwen/Qwen2.5-7B" --compressed_folder ./output/models/... --prompt "..."
 ```
