@@ -165,7 +165,7 @@ Boolean `true` emits the bare flag, `null` drops the argument, anything else is 
 ```bash
 python run_experiments.py                                          # args/experiments.json
 python run_experiments.py args/experiments_stage2_score_grouping.json
-python run_experiments.py args/experiments_stage3_policies.json --dry_run
+python run_experiments.py args/experiments_stage4_policies.json --dry_run
 ```
 
 A stage file may carry placeholders such as `__BEST_GROUPING__` for values that only the preceding stage's results can supply. Any string argument containing `__` aborts the whole stage before the first run, so an unfilled placeholder cannot quietly compress the wrong configuration. `EXPERIMENTS.md` describes the staged grid itself: what each stage answers, what to inspect, and which placeholder its results resolve.

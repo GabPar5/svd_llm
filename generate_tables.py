@@ -1250,10 +1250,10 @@ PLACEHOLDER_SOURCES: Dict[str, str] = {
     "__TOP2_SCORE__": "stage 2",
     "__CKPT_BEST_SCORE_0.2__": "stage 2",
     "__CKPT_BEST_SCORE_0.5__": "stage 2",
-    "__BEST_INNER__": "stage 3",
-    "__CKPT_BEST_POLICY_0.2__": "stage 3",
-    "__CKPT_BEST_POLICY_0.5__": "stage 3",
-    "--max_ratio": "stage 4, into args/base_args.json",
+    "__BEST_INNER__": "stage 4",
+    "__CKPT_BEST_POLICY_0.2__": "stage 4",
+    "__CKPT_BEST_POLICY_0.5__": "stage 4",
+    "--max_ratio": "stage 3, into args/base_args.json",
     "__BEST_BYPASS_EARLY__": "stage 5",
     "__BEST_BYPASS_LATE__": "stage 5",
     "__CKPT_BEST_BYPASS_0.2__": "stage 5",
@@ -1671,7 +1671,7 @@ def hold_at(
 
     A stage is run at one setting of everything it does not sweep, so another
     value inside a gate's selection belongs to a different stage that happens to
-    share its axes: stage 4's cap sweep, for one, matches stage 3's table exactly
+    share its axes: stage 3's cap sweep, for one, matches stage 4's table exactly
     apart from the cap. Left in, it decides the gate through a dimension the
     stage was never comparing.
 
@@ -1962,7 +1962,7 @@ def load_offline_reports(allocation_dir: Path) -> Dict[str, OfflineStage]:
 
     for path in sorted(allocation_dir.iterdir()):
         # A stage may be previewed more than once, under a suffixed directory
-        # such as `stage3_knobs`, and both still belong to stage 3
+        # such as `stage4_knobs`, and both still belong to stage 4
         match = re.fullmatch(r"stage(\d+[a-z]?)(?:[_-].*)?", path.name)
 
         # Sorted order puts the unsuffixed directory first, and that one is the
@@ -2387,8 +2387,8 @@ def gate_stage2c_schatten(context: GateContext) -> GateResult:
     )
 
 
-def gate_stage3_policies(context: GateContext) -> GateResult:
-    """Stage 3 (RQ3): whether the policy spending a group budget matters apart from the score"""
+def gate_stage4_policies(context: GateContext) -> GateResult:
+    """Stage 4 (RQ3): whether the policy spending a group budget matters apart from the score"""
     grouping = resolved_value(context.resolved, "__BEST_GROUPING__")
     top_scores = [resolved_value(context.resolved, name) for name in ( "__TOP1_SCORE__", "__TOP2_SCORE__" )]
     top_scores = [score for score in top_scores if score]
@@ -2408,7 +2408,7 @@ def gate_stage3_policies(context: GateContext) -> GateResult:
     inner_pivot = build_pivot(inner_rows, inner_axes, context.metric)
 
     tables = [pivot_table(
-        title="Stage 3 gate: inner allocation policies",
+        title="Stage 4 gate: inner allocation policies",
         purpose=(
             "The four inner policies at the grouping and scores stage 2 chose. Their knobs must first "
             "be matched on ratio dispersion, or this table prices shape and aggressiveness at once"
@@ -2432,7 +2432,7 @@ def gate_stage3_policies(context: GateContext) -> GateResult:
     outer_pivot = build_pivot(outer_rows, outer_axes, context.metric)
 
     tables.append(pivot_table(
-        title="Stage 3 gate: the outer level",
+        title="Stage 4 gate: the outer level",
         purpose=(
             "`decoder` + `param_share` against `hierarchical` + `waterfill`. The two criteria bucket "
             "matrices identically and differ only in whether Block Influence may move budget between "
@@ -2456,7 +2456,7 @@ def gate_stage3_policies(context: GateContext) -> GateResult:
         resolved["__BEST_INNER__"] = Resolution(value=policies[0][0], candidates=len(policies))
         resolved.update(best_checkpoints(inner_pivot, "__CKPT_BEST_POLICY"))
         tables.append(aggregate_table(
-            title="Stage 3 gate: inner policy aggregate",
+            title="Stage 4 gate: inner policy aggregate",
             purpose="Averaged over the scores and ratios it was run at, which is what decides `__BEST_INNER__`",
             header="inner_allocation",
             ranked=policies,
@@ -2464,17 +2464,18 @@ def gate_stage3_policies(context: GateContext) -> GateResult:
 
     tables += offline_tables(
         context,
-        "3",
+        "4",
         figures=(
             (
                 "dispersion",
-                "Stage 3 preview: ratio dispersion",
-                "Match `--offset`, `--softmax_temp` and `--outer_offset` so the policies spread "
-                "their ratios comparably, then set them in `args/base_args.json`",
+                "Stage 4 preview: ratio dispersion",
+                "Compare how aggressively each policy spreads its ratios. `--offset` moves none of "
+                "them and only `--softmax_temp` is live, so where two cannot be matched, report the "
+                "dispersion beside the result rather than implying it was controlled",
             ),
             (
                 "ratio_by_type",
-                "Stage 3 preview: mean ratio per matrix family",
+                "Stage 4 preview: mean ratio per matrix family",
                 "Where a rank-space policy's bias against mixed shapes becomes visible, thesis 3.3.5",
             ),
         ),
@@ -2483,8 +2484,8 @@ def gate_stage3_policies(context: GateContext) -> GateResult:
     return GateResult(tables=tables, resolved=resolved)
 
 
-def gate_stage4_cap(context: GateContext) -> GateResult:
-    """Stage 4: `--max_ratio`, which Swift-SVD reports as first-order rather than a guard rail"""
+def gate_stage3_cap(context: GateContext) -> GateResult:
+    """Stage 3: `--max_ratio`, which Swift-SVD reports as first-order rather than a guard rail"""
     axes = ( "max_ratio", )
     grouping = resolved_value(context.resolved, "__BEST_GROUPING__")
     score = resolved_value(context.resolved, "__TOP1_SCORE__")
@@ -2524,7 +2525,7 @@ def gate_stage4_cap(context: GateContext) -> GateResult:
         )
 
     tables = [pivot_table(
-        title="Stage 4 gate: the per-matrix cap",
+        title="Stage 3 gate: the per-matrix cap",
         purpose="How far a single matrix may be compressed, at the configuration stages 2 and 3 chose",
         pivot=pivot,
         axis_headers=[ "max_ratio" ],
@@ -2535,11 +2536,11 @@ def gate_stage4_cap(context: GateContext) -> GateResult:
 
     tables += offline_tables(
         context,
-        "4",
+        "3",
         figures=(
             (
                 "cap_binding",
-                "Stage 4 preview: how many matrices each cap pins",
+                "Stage 3 preview: how many matrices each cap pins",
                 "A cap pinning nothing cannot change an allocation, so it never needed a run",
             ),
         ),
@@ -2776,7 +2777,7 @@ def gate_stage8_curve(context: GateContext) -> GateResult:
         trend = "widens" if gains[-1] > gains[0] else "narrows"
         notes.append(
             f"the gain goes from {gains[0]:+.2f} at the lowest ratio to {gains[-1]:+.2f} at the highest, so it "
-            f"{trend} with the budget. At the high end read this together with stage 4 and `cap_binding.csv`",
+            f"{trend} with the budget. At the high end read this together with stage 3 and `cap_binding.csv`",
         )
 
     tables = [Table(
@@ -2908,8 +2909,8 @@ GATES: Tuple[Callable[[GateContext], GateResult], ...] = (
     gate_stage2_score_grouping,
     gate_stage2b_squared,
     gate_stage2c_schatten,
-    gate_stage3_policies,
-    gate_stage4_cap,
+    gate_stage3_cap,
+    gate_stage4_policies,
     gate_stage5_bypass,
     gate_stage6_composite,
     gate_stage7_finalists,
