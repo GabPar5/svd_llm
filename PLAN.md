@@ -186,8 +186,14 @@ sits closer to homogeneous. §4.2 must not mistake reduced dispersion for reduce
 - **D-Rank** contributes its Lagrangian only. Its grouped horizontal concatenation under a shared
   basis (Basis Sharing) and its Q/K-to-V rebalancing are not implemented, since both change the
   decomposition rather than the allocation. Its `R_eff` is exactly our `eff_rank_sq`.
-- **ERC-SVD** is cited as motivation for testing last-N bypass. Neither its Alg. 3 search nor its
-  residual compensation is implemented.
+- **ERC-SVD** is cited as motivation, but for the **early** end, not the late one. Under a fixed
+  overall ratio it compresses only the *last* `k` blocks and leaves the first `N - k` untouched,
+  which is `--bypass_early_layers N-k`, not `--bypass_late_layers`. Its Alg. 3 charges the
+  compressed blocks `R_l = N·R_o/k`, the same push-the-budget-onto-the-rest arithmetic as
+  `compute_active_budget`, and searches over `k`; we fix the count by hand instead. Neither that
+  search nor its residual compensation is implemented. The late-N arm is motivated by the
+  importance profile rather than by ERC-SVD: ShortGPT and MoDeGPT both report the first *and* last
+  blocks as the most critical.
 - **§3.3.2** is written as an *equivalence*: pinning `rᵢ` for the bypassed set and redistributing —
   what `compute_active_budget` already does — gives the same answer as constraining the §3.3.1
   objective, for all the separable objectives above. One implementation, one source of bugs.
