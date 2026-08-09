@@ -100,6 +100,25 @@ if __name__ == "__main__":
         help='Base path to save the whitening matrices and the compressed model checkpoints',
     )
     parser.add_argument(
+        '--scratch_path',
+        type=str,
+        default=None,
+        help=(
+            'Base path for the regenerable intermediates (whitening matrices, '
+            'activation checkpoints, sequential LoRA trainer state). Defaults to '
+            '--save_path, so setting it keeps the bulky artifacts off a small or '
+            'synced save directory'
+        ),
+    )
+    parser.add_argument(
+        '--no_save_checkpoint',
+        action='store_true',
+        help=(
+            'Do not write the compressed .pt checkpoint (nor the tokenizer beside it). '
+            'Logs, evaluation results and the run sidecar are still written under --save_path'
+        ),
+    )
+    parser.add_argument(
         '--whitening_mat_path',
         type=str,
         default=None,
@@ -631,6 +650,8 @@ if __name__ == "__main__":
             seed = args.seed,
             device = args.device,
             save_path = args.save_path,
+            scratch_path = args.scratch_path,
+            save_checkpoint = not args.no_save_checkpoint,
             whitening_mat_path = args.whitening_mat_path,
             compress_mlp = args.compress_mlp,
             compress_att_q = args.compress_att_q,
@@ -795,7 +816,11 @@ if __name__ == "__main__":
                 eval_dataset=eval_dataset,
                 data_collator=finetune_collator,
                 tokenizer=tokenizer,
-                output_dir=os.path.join(args.save_path or "./tmp", "sequential_lora_trainer", model_name),
+                output_dir=os.path.join(
+                    scratch_root(args.save_path, args.scratch_path),
+                    "sequential_lora_trainer",
+                    model_name,
+                ),
                 model_dtype=args.model_dtype,
                 lora_r=args.sequential_lora_r,
                 lora_alpha=args.sequential_lora_alpha,
@@ -868,12 +893,15 @@ if __name__ == "__main__":
             ),
         })
 
-        save_compressed_checkpoint(
-            model=model,
-            checkpoint_path=updated_model_path,
-            rank_map=rank_map,
-            metadata=metadata,
-        )
+        if args.no_save_checkpoint:
+            print("[DEBUG] Checkpoint saving disabled, the updated model stays in memory only")
+        else:
+            save_compressed_checkpoint(
+                model=model,
+                checkpoint_path=updated_model_path,
+                rank_map=rank_map,
+                metadata=metadata,
+            )
 
         # Evaluation/result filenames must follow the newly saved checkpoint,
         # otherwise --update_taw_only overwrites the TAW-only JSON/log labels

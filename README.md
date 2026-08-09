@@ -186,6 +186,8 @@ A stage file may carry placeholders such as `__BEST_GROUPING__` for values that 
 | `--attn_implementation` | `str` | `flash_attention_2` | One of `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`. |
 | `--seed` | `int` | `6363` | Seed for calibration sampling and evaluation. |
 | `--save_path` | `str` | `None` | Base output path for checkpoints, whitening matrices, logs and results. |
+| `--scratch_path` | `str` | `None` | Base path for the regenerable intermediates (`whitening_matrices/`, `activation_checkpoints/`, `sequential_lora_trainer/`). Defaults to `--save_path`; set it to keep the bulky artifacts off a small or synced save directory. |
+| `--no_save_checkpoint` | `flag` | `False` | Do not write the compressed `.pt` checkpoint, nor the tokenizer beside it. Logs, evaluation results and the run sidecar are still written under `--save_path`. |
 | `--hf_token` | `str` | `None` | Hugging Face token for restricted models. |
 
 ### Compression Targets
@@ -341,14 +343,26 @@ output/
 ├── eval/<model>/<run_name>.json    # merged evaluation results
 │   └── <run_name>.config.json      # same sidecar, read by generate_tables.py
 ├── logs/<model>/<run_name>.log     # full stdout of the compression run
-├── whitening_matrices/<model>/<v1|v2>/
+├── whitening_matrices/<model>/<v1|v2>/   # follows --scratch_path
 │   ├── layer_importance.pt          # Block Influence per decoder block
 │   └── spectra/                     # cached raw singular values, one per matrix
-├── activation_checkpoints/<model>/<v1|v2>/
+├── activation_checkpoints/<model>/<v1|v2>/   # follows --scratch_path
 ├── allocation_reports/<model>/      # CSV written by allocation_report.py
 ├── calibration_datasets/           # tokenized calibration data cache
-└── sequential_lora_trainer/        # HF Trainer checkpoints of the LoRA update
+└── sequential_lora_trainer/        # HF Trainer checkpoints of the LoRA update, follows --scratch_path
 ```
+
+The three directories marked above are regenerable intermediates and dwarf everything else — a single V2 whitening artifact is `in_dim x in_dim` in fp64. `--scratch_path` moves them to another disk, leaving `--save_path` with the checkpoints, logs, evaluations and reports; `--no_save_checkpoint` drops the checkpoints too, which is what makes a run fit on a small synced directory (e.g. a Colab run logging to Google Drive):
+
+```bash
+python main.py --model "Qwen/Qwen2.5-7B" \
+    --save_path "/content/drive/MyDrive/svd_llm" --scratch_path "/content/scratch" \
+    --no_save_checkpoint \
+    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
+    --compression_ratio 0.2 --evaluate --eval_tasks "wikitext|0"
+```
+
+`--no_save_checkpoint` also suppresses the second checkpoint an `--update_taw_only` run would write; evaluation results keep the `_sequpd_<method>` name either way. Since the run sidecar is still written, `generate_tables.py` keeps working — only the `__CKPT_*__` paths it resolves point at files that were never created.
 
 ### Run Names
 
@@ -406,6 +420,7 @@ python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
 | --- | --- | --- | --- |
 | `--model` | `str` | — | Model the spectra were cached for. Only its config is read. |
 | `--save_path` | `str` | `./output` | Root holding `whitening_matrices/`. |
+| `--scratch_path` | `str` | `./output` | Root holding `whitening_matrices/` when the compression run was given a `--scratch_path`. |
 | `--whitening_mat_path` | `str` | `None` | Whitening directory to read, overriding the one derived from `--save_path` and `--model`. |
 | `--run_v2` | `flag` | `False` | Read the V2 artifacts instead of V1. |
 | `--compress_*` | `flag` | all | Restrict the report to some matrix families. Unlike `main.py`, giving none covers them all. |

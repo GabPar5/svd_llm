@@ -11,6 +11,7 @@
   "--seed": 6363,
   "--device": "cuda",
   "--save_path": "./output",
+  "--scratch_path": "./output",
   "--compress_mlp": true,
   "--compress_att_q": true,
   "--compress_att_k": true,

@@ -118,6 +118,8 @@ Every token past `<bypassed>` is emitted only when its flag leaves its default, 
 
 Everything under `--save_path` (default `./output`, gitignored): `models/`, `eval/`, `logs/`, `whitening_matrices/<model>/<v1|v2>/` (plus its `spectra/` cache and `layer_importance.pt`), `activation_checkpoints/`, `calibration_datasets/`, `sequential_lora_trainer/`, `allocation_reports/<model>/`.
 
+The three regenerable, bulky ones — `whitening_matrices/`, `activation_checkpoints/`, `sequential_lora_trainer/` — follow `--scratch_path` instead when it is set, resolved through the single helper `scratch_root(save_path, scratch_path)`; `allocation_report.py` takes the same flag so it still finds the spectra. `--no_save_checkpoint` skips the `.pt` and the tokenizer beside it while still writing the `<run_name>.config.json` sidecar, so `generate_tables.py` keeps working on a run that stored no checkpoint.
+
 ## Gotchas
 
 - A new score metric has to be registered in three places: the `ScoreMetric` enum, the `match` in `compute_spectrum_score`, and `SCORING_TOKENS` in `generate_tables.py` (otherwise tables label it `unknown`). Accepted today: `truncation`, `truncation_sq`, `entropy`, `entropy_sq`, `eff_rank`, `eff_rank_sq`, the four `full_norm_*_tail_*` variants, `norm|<p>` (handled by `ScoreMetric._missing_`, with `p` parsed by `parse_norm_order`), and `composite|<local>|block_influence` (also `_missing_`, validated against `END_TO_END_SCORES`, split from the right so a `norm|p` local half survives). A composite score is fused by `compose_scores` *after* the score pass — `compute_spectrum_score` stays purely spectral — and a new local metric is therefore composite-ready for free, but needs its `composite|...` spellings added to `SCORING_TOKENS` too.

@@ -94,7 +94,7 @@ def get_whitening_matrices(
         n_tokens: int,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         is_v2: bool = False,
-        save_path: str = "./tmp",
+        scratch_path: str = "./tmp",
         start_layer: int = 0,
         end_layer: Optional[int] = None
 ):
@@ -116,10 +116,10 @@ def get_whitening_matrices(
 
     version_str = "v2" if is_v2 else "v1"
 
-    wm_dir = whitening_dir(save_path, model_name, version_str)
+    wm_dir = whitening_dir(scratch_path, model_name, version_str)
     os.makedirs(wm_dir, exist_ok=True)
 
-    act_ckpt_dir = os.path.join(save_path, "activation_checkpoints", sanitize_model_name(model_name), version_str)
+    act_ckpt_dir = os.path.join(scratch_path, "activation_checkpoints", sanitize_model_name(model_name), version_str)
     os.makedirs(act_ckpt_dir, exist_ok=True)
 
     print(f"[WHITENING] Streaming whitening matrices to: {wm_dir}")
@@ -1275,6 +1275,8 @@ def compress_svd_llm(
         seed: Optional[int] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         save_path: Optional[str] = None,
+        scratch_path: Optional[str] = None,
+        save_checkpoint: bool = True,
         whitening_mat_path: Optional[str] = None,
         compress_mlp: bool = False,
         compress_att_q: bool = False,
@@ -1324,6 +1326,11 @@ def compress_svd_llm(
         finetune_add_eos_token: bool = False,
         pin_cpu_offload: bool = False
 ):
+    # Whitening artifacts, activation checkpoints and LoRA trainer state are
+    # regenerable and far larger than the checkpoint, so they can be parked
+    # somewhere other than the save root
+    scratch_dir = scratch_root(save_path, scratch_path)
+
     # Load model and tokenizer
     vram_usage("Before loading original model")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -1458,7 +1465,7 @@ def compress_svd_llm(
 
     # Directory the whitening artifacts actually came from. Derived caches
     # (spectra, layer importance) live beside the artifacts they were built from
-    wm_source_dir = whitening_dir(save_path or "./tmp", model_name, version_str)
+    wm_source_dir = whitening_dir(scratch_dir, model_name, version_str)
 
     whitening_matrices: Optional[Dict[str, str]] = None
     if whitening_mat_path:
@@ -1498,7 +1505,7 @@ def compress_svd_llm(
             n_calibration_tokens,
             device,
             is_v2,
-            save_path or "./tmp",
+            scratch_dir,
             whitening_start_layer,
             whitening_end_layer,
         )
@@ -1988,7 +1995,7 @@ def compress_svd_llm(
                 eval_dataset=eval_dataset,
                 data_collator=finetune_collator,
                 tokenizer=tokenizer,
-                output_dir=os.path.join(save_path or "./tmp", "sequential_lora_trainer", sanitize_model_name(model_name)),
+                output_dir=os.path.join(scratch_dir, "sequential_lora_trainer", sanitize_model_name(model_name)),
                 model_dtype=dtype,
                 lora_r=sequential_lora_r,
                 lora_alpha=sequential_lora_alpha,
@@ -2045,14 +2052,9 @@ def compress_svd_llm(
     model.eval()
 
     if save_path:
-        print("[DEBUG] Saving compressed model to disk...")
-
         # Create model directory
         save_path_model = os.path.join(save_path, "models", sanitize_model_name(model_name))
         os.makedirs(save_path_model, exist_ok=True)
-
-        # Save tokenizer
-        tokenizer.save_pretrained(save_path_model)
 
         run_name = build_run_name(
             model_name=model_name,
@@ -2112,12 +2114,17 @@ def compress_svd_llm(
             ),
         }
 
-        save_compressed_checkpoint(
-            model=model,
-            checkpoint_path=os.path.join(save_path_model, f"{run_name}.pt"),
-            rank_map=rank_map,
-            metadata=metadata,
-        )
+        if save_checkpoint:
+            print("[DEBUG] Saving compressed model to disk...")
+            tokenizer.save_pretrained(save_path_model)
+            save_compressed_checkpoint(
+                model=model,
+                checkpoint_path=os.path.join(save_path_model, f"{run_name}.pt"),
+                rank_map=rank_map,
+                metadata=metadata,
+            )
+        else:
+            print("[DEBUG] Checkpoint saving disabled, writing only the run sidecar")
 
         # Keep the checkpoint self-describing even when the run never evaluates
         save_run_config(

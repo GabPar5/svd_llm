@@ -113,6 +113,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model', type=str, required=True, help='LLM the spectra were cached for')
     parser.add_argument('--save_path', type=str, default='./output', help='Root holding whitening_matrices/')
     parser.add_argument(
+        '--scratch_path',
+        type=str,
+        default='./output',
+        help='Root holding whitening_matrices/ when the compression run was given a --scratch_path',
+    )
+    parser.add_argument(
         '--whitening_mat_path',
         type=str,
         default=None,
@@ -237,7 +243,11 @@ def matrix_type_of(key: str) -> str:
 def load_inputs(args: argparse.Namespace) -> Inputs:
     """Read the model config and the cached spectra, and reconcile the two"""
     version_str = "v2" if args.run_v2 else "v1"
-    wm_dir = args.whitening_mat_path or whitening_dir(args.save_path, args.model, version_str)
+    wm_dir = args.whitening_mat_path or whitening_dir(
+        scratch_root(args.save_path, args.scratch_path),
+        args.model,
+        version_str,
+    )
 
     print(f"[REPORT] Whitening directory: {wm_dir}")
 

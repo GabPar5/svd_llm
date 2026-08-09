@@ -901,6 +901,15 @@ def decoder_layer_output(out: Any) -> torch.Tensor:
         return out[0]
     return out
 
+def scratch_root(save_path: Optional[str], scratch_path: Optional[str] = None) -> str:
+    """
+    Root of the regenerable intermediates: whitening artifacts, activation
+    checkpoints and the LoRA trainer state. They dwarf the results they produce,
+    so a run can park them on a scratch disk and keep `--save_path` for the
+    checkpoints, logs and evaluations. Unset, everything stays where it was
+    """
+    return scratch_path or save_path or "./tmp"
+
 def whitening_dir(base_path: str, model_name: str, version_str: str) -> str:
     """The one place the whitening artifact layout is spelled out"""
     return os.path.join(base_path, "whitening_matrices", sanitize_model_name(model_name), version_str)
