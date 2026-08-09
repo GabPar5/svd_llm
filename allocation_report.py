@@ -55,6 +55,19 @@ SWEEPABLE: Dict[str, Any] = {
 # Part of every variant's configuration, but held fixed across a sweep
 FIXED_CONFIG = ( "ratio_scope", )
 
+# Two variants are one experiment when *no* matrix moves more than this between
+# them. The test is on the largest per-matrix difference and not the mean,
+# because the mean hides exactly the case that matters: raising the cap from 0.75
+# to 0.9 on LLaMA-7B moves the allocation by 0.004 on average and by 0.15 on the
+# three matrices that decide the outcome, which is the difference between a
+# working model and one at 43 perplexity. A screen that says "do not run this"
+# has to be wrong in the safe direction
+DUPLICATE_MAP_MAX_DELTA = 0.02
+
+# A wide sweep can hold hundreds of near-identical pairs. The CSV keeps them all,
+# the console prints enough to act on
+MAX_REPORTED_DUPLICATES = 10
+
 MATRIX_TYPES = (
     "self_attn.q_proj",
     "self_attn.k_proj",
@@ -1543,6 +1556,101 @@ def figure_cap_binding(fig_dir: str, inputs: Inputs, variants: List[Variant], re
     save_figure(fig_dir, "cap_binding", figure, plt)
 
 
+def figure_ratio_tail(fig_dir: str, variants: List[Variant], results: Dict[str, VariantResult]) -> None:
+    """
+    How much of the allocation sits in the aggressive region, and where it sits.
+
+    The peak alone is not enough. At ratio 0.5 with a cap of 0.7, `decoder` puts
+    one matrix at the ceiling and `global` puts eight, and the two measure 25.05
+    and 33.06: the peak is identical and the mass behind it is not. The layers
+    matter too, because the matrices that reach the ceiling under a flat grouping
+    are the earliest blocks, which are the ones Block Influence rates highest.
+    """
+    thresholds = ( 0.6, 0.7, 0.8, 0.85 )
+    rows: List[List[Any]] = []
+
+    for variant in variants:
+        ratio_map = results[variant.name].ratio_map
+
+        if not ratio_map:
+            continue
+
+        ranked = sorted(ratio_map.items(), key=lambda item: -item[1])
+        top_layers = sorted({get_layer_idx_from_key(key) for key, _ in ranked[:8]})
+
+        rows.append([
+            variant.name,
+            f"{max(ratio_map.values()):.6f}",
+            *[sum(1 for value in ratio_map.values() if value > threshold) for threshold in thresholds],
+            ";".join(str(layer) for layer in top_layers),
+        ])
+
+    write_figure_csv(
+        fig_dir,
+        "ratio_tail",
+        [ "variant", "peak", *[f"above_{threshold}" for threshold in thresholds], "layers_of_top_8" ],
+        rows,
+    )
+
+
+def figure_map_distance(fig_dir: str, variants: List[Variant], results: Dict[str, VariantResult]) -> None:
+    """
+    How far apart two variants allocate, matrix by matrix.
+
+    A sweep can hold two variants that produce the same allocation by different
+    routes, and no amount of GPU time separates them. The peak of each is carried
+    alongside, because two variants can be close on average and still sit on
+    opposite sides of the ratio at which a matrix stops surviving truncation.
+
+    There is no plot: the numbers are the point, and the pair list below them is
+    what a stage file should be pruned against.
+    """
+    rows: List[List[Any]] = []
+    duplicates: List[Tuple[str, str, float]] = []
+
+    for index, first in enumerate(variants):
+        for second in variants[index + 1:]:
+            left = results[first.name].ratio_map
+            right = results[second.name].ratio_map
+            shared = sorted(set(left) & set(right))
+
+            if not shared:
+                continue
+
+            deltas = [abs(left[key] - right[key]) for key in shared]
+            mean_delta = sum(deltas) / len(deltas)
+            max_delta = max(deltas)
+
+            rows.append([
+                first.name, second.name, len(shared),
+                f"{mean_delta:.6f}", f"{max_delta:.6f}",
+                f"{max(left.values()):.6f}", f"{max(right.values()):.6f}",
+            ])
+
+            if max_delta < DUPLICATE_MAP_MAX_DELTA:
+                duplicates.append(( first.label, second.label, max_delta ))
+
+    write_figure_csv(
+        fig_dir,
+        "map_distance",
+        [ "variant_a", "variant_b", "matrices", "mean_abs_diff", "max_abs_diff", "peak_a", "peak_b" ],
+        rows,
+    )
+
+    if not duplicates:
+        return
+
+    print(f"\n[REPORT][WARNING] {len(duplicates)} variant pair(s) allocate the same way:")
+
+    for left, right, max_delta in sorted(duplicates, key=lambda item: item[2])[:MAX_REPORTED_DUPLICATES]:
+        print(f"  {left}  ==  {right}   largest |delta ratio| on any matrix {max_delta:.4f}")
+
+    if len(duplicates) > MAX_REPORTED_DUPLICATES:
+        print(f"  ... and {len(duplicates) - MAX_REPORTED_DUPLICATES} more, see figures/map_distance.csv")
+
+    print("  Running both of a pair pays twice for one experiment")
+
+
 def figure_objectives(fig_dir: str, variants: List[Variant], results: Dict[str, VariantResult], ranks: Dict[str, Dict[str, float]], plt: Any) -> None:
     """
     Every variant priced under every objective.
@@ -1735,6 +1843,8 @@ def write_figures(
     figure_ratio_by_type(fig_dir, inputs, variants, results, plt)
     figure_cap_binding(fig_dir, inputs, variants, results, plt)
 
+    figure_ratio_tail(fig_dir, variants, results)
+    figure_map_distance(fig_dir, variants, results)
     figure_objectives(fig_dir, variants, results, ranks, plt)
     figure_oracle_gap(fig_dir, variants, results, oracles, plt)
     figure_dispersion(fig_dir, inputs, variants, results, plt)

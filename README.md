@@ -455,7 +455,11 @@ Each objective that is a plain sum over singular directions also carries `<objec
 
 Each writes `figures/<name>.csv` always, and `figures/<name>.png` when `--plots` is given and matplotlib is installed:
 
-`scores_by_depth`, `influence_by_depth`, `influence_vs_effrank` (+ its `_rho` companion), `spectra`, `layer_ratios`, `ratio_heatmap`, `ratio_by_type`, `cap_binding`, `objectives`, `oracle_gap`, `dispersion`.
+`scores_by_depth`, `influence_by_depth`, `influence_vs_effrank` (+ its `_rho` companion), `spectra`, `layer_ratios`, `ratio_heatmap`, `ratio_by_type`, `cap_binding`, `objectives`, `oracle_gap`, `dispersion`, `map_distance`, `ratio_tail`.
+
+`ratio_tail` is CSV-only: per variant it reports the peak assigned ratio, how many matrices sit above 0.6, 0.7, 0.8 and 0.85, and which decoder layers hold the eight largest ratios. The peak alone does not separate two allocations that reach it with one matrix and with eight, and the layers say whether the aggressive end of the allocation landed on the blocks that matter most.
+
+`map_distance` is CSV-only and pairwise: for every pair of variants it reports the mean and the largest per-matrix ratio difference, plus each one's peak assigned ratio. A pair whose largest difference falls under `DUPLICATE_MAP_MAX_DELTA` is reported on the console as one experiment measured twice. The test uses the largest difference rather than the mean because a handful of matrices moving to the cap can decide a run's outcome while barely shifting the average.
 
 Each variant is also checked against the invariants any policy must satisfy: realized removal matches the budget, ratios stay within `[0, --max_ratio]`, and the *value* of a constant score never changes the allocation. Two further checks apply only to ratio-space policies, which read nothing but the score: no group may give more removal to a higher-scoring matrix, and a constant score must collapse the allocation onto the flat ratio (the latter also requires a neutral outer level, since Block Influence is not flattened by it). A rank-space policy is exempt from both — it also prices a rank at `out + in`, and on a group of mixed shapes that can outweigh the score ordering, which is the family's bias rather than a defect.
 
