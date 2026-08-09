@@ -1,0 +1,52 @@
+[
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "waterfill",
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "waterfill",
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "global",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.7,
+    "--bypass_early_layers": 2
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.7,
+    "--bypass_early_layers": 2
+  }
+]

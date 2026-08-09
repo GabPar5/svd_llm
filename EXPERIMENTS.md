@@ -15,7 +15,7 @@ with its `spectra/` cache and `layer_importance.pt`. Every stage below reads tha
 recomputes it.
 
 **Execution order**, matching the section order again now that the cap comes first:
-`0, 1, 2, 2b, 2c, 3, 3b, 4, onset, 5, 5b, 6, 7, 9, 10`.
+`0, 1, 2, 2b, 2c, 3, 3b, 3c, 4, onset, 5, 5b, 6, 7, 9, 10`.
 Stage 3 runs **before** stage 4 and freezes `--max_ratio` into `args/base_args.json`; the reason is
 in the findings below. The onset probe lives in the stage 8 section and file for continuity.
 
@@ -25,29 +25,81 @@ All four have run: 28 heterogeneous cells plus two homogeneous anchors and the d
 Their results are the premise of everything below, so they are recorded here rather than left in a
 report.
 
-### The peak assigned ratio decides everything else
+### The peak assigned ratio is a threshold, not the whole story
 
-Sort all 28 heterogeneous runs by the **largest removal ratio assigned to any single matrix** and
-the outcome separates without a single exception:
+Sorting the 28 heterogeneous runs collected before the cap sweep by the **largest removal ratio
+assigned to any single matrix** separates them without exception:
 
 | peak assigned ratio | runs | wikitext against the homogeneous anchor |
 |---|---|---|
-| 0.23 to 0.83 | 23 | −0.65 to +0.67 |
+| 0.23 to 0.83 | 23 | -0.65 to +0.67 |
 | 0.87 to 0.90 | 5 | **+1.85 to +18.82** |
 
-The boundary sits between 0.8325 (`global`/`eff_rank` at 0.5, which *beat* homogeneous by 0.28) and
-0.8743 (`decoder`/`norm|inf` at 0.5, which lost 8.88). Nothing else in the collected data splits the
-runs so cleanly: not the grouping, not the score family, not the dispersion.
+The boundary sits between 0.8325 (`global`/`eff_rank`, which *beat* homogeneous by 0.28) and 0.8743
+(`decoder`/`norm|inf`, which lost 8.88). `global`/`truncation` and `type`/`truncation` at ratio 0.5
+each pinned **3 matrices out of 224** at the 0.9 cap and lost 14.53 and 18.82.
 
-The two worst runs make the scale concrete. `global`/`truncation` and `type`/`truncation` at ratio
-0.5 each pinned **3 matrices out of 224** at the 0.9 cap, and each lost 14.53 and 18.82 perplexity
-against a homogeneous 24.56. Three matrices out of 224 cost more than twenty times the best
-heterogeneous gain anywhere in the grid.
+**The cap sweep then tested whether the peak was the cause, and it is only part of it.** Capping the
+two catastrophes recovers between a third and a half of the damage and leaves the rest:
 
-**This is Swift-SVD's claim, confirmed: the per-matrix cap is not a guard rail, it is the dominant
-hyperparameter.** Hence stage 3 moving ahead of stage 4 — comparing allocation policies at
-`--max_ratio 0.9` would mostly measure which policy reaches the cap, and the offline preview already
-answers that for free.
+| at ratio 0.5, homogeneous 24.56 | peak 0.90 | peak 0.85 | peak 0.70 |
+|---|---|---|---|
+| `global` / `truncation` | 39.09 | 35.75 | **33.06** |
+| `type` / `truncation` | 43.38 | 35.31 | **33.56** |
+| `decoder` / `truncation` | — | — | **25.05** |
+
+At a peak of 0.70 all three allocate to the same ceiling, and `decoder` is still **eight perplexity
+better**. So the peak is a threshold that amplifies a bad allocation, not the thing that makes it bad.
+An earlier draft of this document read the catastrophes as pure peak damage and demoted the grouping
+to a second-order effect; the cap sweep refutes that. For `truncation` the grouping is worth about 8
+perplexity at matched peak, which is more than ten times the best heterogeneous gain anywhere in the
+grid.
+
+**And within the safe band a higher peak is better, not worse.** Capping the winning configuration
+degrades it monotonically:
+
+| `decoder`/`eff_rank` at 0.5 | cap 0.6 | 0.7 | 0.8 | 0.85 |
+|---|---|---|---|---|
+| peak | 0.600 | 0.700 | 0.724 | 0.724 |
+| wikitext | 24.19 | 24.09 | 24.05 | 24.05 |
+
+Caps at 0.8 and above stop binding, which is why the last two rows are identical. So `--max_ratio` is
+a **guard rail and not a tuning knob**: it earns its place by stopping a configuration that would run
+past 0.85, and every ratio point it takes off a configuration that would not is a small loss.
+
+### It is the tail, and the tail lands on the earliest blocks
+
+The peak is the same number for all three groupings once a cap equalizes it, and the outcomes are
+still eight perplexity apart. What differs is how much of the allocation sits behind that peak, and
+where:
+
+| at ratio 0.5, cap 0.7, `truncation` | matrices at the cap | above 0.6 | layers holding the top 8 | wikitext |
+|---|---|---|---|---|
+| `decoder` | **1** | 8 | 0, 1, 2, 3, 4, 5, 6 | **25.05** |
+| `type` | 8 | 18 | 0, 1 | 33.56 |
+| `global` | 8 | 22 | 0, 1, 2, 3 | 33.06 |
+
+`decoder` reaches the ceiling with one matrix and spreads its eight aggressive allocations one per
+block. `global` and `type` put eight matrices *at* the ceiling and concentrate their whole tail in
+the first two to four blocks. Uncapped, the same three matrices of layer 0 are the ones pinned at
+0.9.
+
+So the mechanism is not the peak and not the grouping as such: **the flat groupings over-compress the
+earliest blocks, and `param_share` prevents that structurally** by giving every block the same average
+ratio, which caps how much of the tail any one block can hold.
+
+**Block Influence already knows this.** From the stage 0 cache, layer 0 scores 0.4602 against 0.29 for
+layer 31 and 0.15 or less for everything else — it is three times the next block and by far the most
+important in the model:
+
+| layer | 0 | 1 | 2 | 4 | 8 | 16 | 24 | 31 |
+|---|---|---|---|---|---|---|---|---|
+| Block Influence | **0.4602** | 0.1414 | 0.1511 | 0.1361 | 0.1255 | 0.0874 | 0.0334 | 0.2909 |
+
+The outer level of the hierarchical allocator gives high-influence blocks *less* removal. It therefore
+does deliberately, and with a signal, what `decoder` does only as a side effect of flattening: protect
+layer 0 from the tail. That is the thesis contribution's motivation, and it is now an empirical
+prediction rather than an analogy — which is why stage 3c runs it next.
 
 ### The peak is predictable offline, exactly
 
@@ -56,27 +108,77 @@ decimals — it is the same allocator over the same cached spectra. So every one
 runs was identifiable before it was made, at zero cost. `figures/cap_binding.csv` says the same
 thing as a count: the four runs that pinned anything are four of the five that failed.
 
-### The grouping effect is real but second-order
+### Where the heterogeneity actually goes
 
-With the cap-hitting cells set aside, `decoder` still wins at every score, by much less than the
-catastrophes suggested:
+Under `decoder` + `eff_rank`, only the query and key projections move away from the flat ratio. At
+target 0.2 every other family sits within two ratio points of it:
 
-| score at ratio 0.5 | `decoder` | `global` | `type` |
-|---|---|---|---|
-| `eff_rank` | **23.91** | 24.28 | 25.23 |
-| `entropy` | **24.23** | 24.38 | 24.80 |
-| `truncation` | **25.05** | 39.09 (peak 0.90) | 43.38 (peak 0.90) |
+| family | mean ratio | range |
+|---|---|---|
+| `q_proj` | 0.2132 | 0.2029 to 0.2897 |
+| `k_proj` | 0.2150 | 0.2050 to 0.2870 |
+| `v_proj` | 0.2004 | 0.1856 to 0.2037 |
+| `o_proj` | 0.2030 | 0.1903 to 0.2069 |
+| `gate_proj` | 0.1976 | 0.1842 to 0.1995 |
+| `up_proj` | 0.1958 | 0.1814 to 0.1982 |
+| `down_proj` | 0.1948 | 0.1734 to 0.2254 |
 
-So `decoder` > `global` > `type` holds, at 0.4 to 1.3 perplexity. An earlier draft of this document
-explained the ranking as "cross-family budget movement helps, cross-depth movement hurts", reading
-the `truncation` catastrophes as evidence about depth. That was wrong: the same score under
-`decoder` reached a peak of only 0.6996 and lost 0.49, while under `global` and `type` it reached
-0.90. The catastrophes were peak effects, and the grouping ranking survives only as the small
-residual above.
+And the deviation is concentrated at the input end. Layer 0's `q_proj` has an effective rank of **109
+out of 4096** and takes 0.290; layer 1 takes 0.240; from layer 4 onward every `q_proj` sits between
+0.207 and 0.216.
 
-`decoder` keeps a mechanical advantage worth stating: `param_share` gives every block the same
-average ratio, which bounds how far the allocation can push any single matrix. It is the grouping
-least able to produce a dangerous peak, which is a different virtue from ranking matrices well.
+So the winning allocation is, to a good approximation, **compress q and k slightly harder than
+everything else, and compress the first two blocks' q and k much harder**. That is worth saying
+plainly rather than leaving implicit in a ratio map, and it suggests a control worth running: a
+hand-set family schedule that reproduces those means with no score at all. If it matches, the spectral
+machinery is an expensive way to discover that early attention is low rank, and the thesis should say
+so.
+
+**On comparability**, which is the obvious objection: `q`, `k`, `v` and `o` are all 4096x4096 and the
+MLP matrices are 11008x4096, so every matrix in the model has 4096 singular values and the effective
+ranks are on one scale. The low q/k values are a spectral property, not a units artifact. What
+`eff_rank` does not do is normalize by the matrix's own maximum; `normalized_effective_rank` already
+exists in `src/utils.py` for the Block Influence correlation, and registering it as a score metric
+would make a scale-free variant sweepable if that turns out to matter.
+
+**Ratios near zero are a different phenomenon.** They appear under the `softmax_temp` inner policy at
+low temperature, where the allocation goes bimodal: at temperature 0.05 every family has a matrix at
+0.0000 and one at the cap. That is the policy's aggressiveness, not a property of any one family.
+
+### How big the grouping effect is, and it depends on the score
+
+At matched peak, `decoder` wins at every score, but by amounts that differ by an order of magnitude:
+
+| at ratio 0.5 | `decoder` | `global` | `type` | spread |
+|---|---|---|---|---|
+| `eff_rank`, peaks 0.72 to 0.83 | **23.91** | 24.28 | 25.23 | 1.3 |
+| `entropy`, peaks 0.58 to 0.61 | **24.23** | 24.38 | 24.80 | 0.6 |
+| `truncation`, all capped to peak 0.70 | **25.05** | 33.06 | 33.56 | **8.5** |
+
+The offline map distance predicted exactly this ordering before any of it was measured. Capped alike,
+`decoder` and `global` differ by a mean of 0.0085 per matrix under `eff_rank` and 0.0364 under
+`truncation`, four times more, and the measured spreads are 0.37 and 8.01. **Where the allocations
+converge the outcomes converge, and where they do not the grouping is worth more than everything else
+in the grid put together.**
+
+So the useful statement is not "`decoder` is the best grouping" but: **the grouping matters exactly as
+much as the score makes it matter.** A score whose values move sharply across depth, like
+`truncation`, hands the grouping a large lever, because the grouping is what decides whether depth is
+allowed to absorb budget. A score that is flatter across depth, like `eff_rank`, leaves almost nothing
+for the grouping to do.
+
+`decoder` also keeps a mechanical advantage worth stating separately: `param_share` gives every block
+the same average ratio, which bounds how far the allocation can push any single matrix. It is the
+grouping least able to produce a dangerous peak, which is a different virtue from ranking well.
+
+### A note on the two machines
+
+The 11 cap runs were made on Colab and the other 31 elsewhere, and the whitening caches are not
+identical: at ratio 0.2 the three capped `decoder`/`eff_rank` runs all give peak 0.28969 and 7.85
+while the uncapped run from the other machine gives 0.28947 and 7.77. The offset is around 0.08 at
+ratio 0.2 and 0.14 at 0.5. It is temporary and the grid is going back to one machine, so it is
+recorded here only so that a 0.1 discrepancy between an old and a new number is not mistaken for a
+result. The gate report prints a note on any table that mixes the two.
 
 ### Ratio 0.2 is not flat, and aggressive allocation is what wins there
 
@@ -162,26 +264,46 @@ So `mean_rank` is a reported negative result, not a screen. Keep the offline pas
 facts it is reliable on: feasibility, degeneracy, dispersion, cap binding. Expect the ranking to
 invert.
 
-### The peak screen: the one offline number that predicts failure
+### The tail screen: what to read before every run
 
-Read **`max_ratio_assigned`** in `summary.csv` before every run, and drop any variant whose peak
-exceeds **0.85**. On the 28 collected runs this classifies all 28 correctly, with the boundary
-observed between 0.8325 (safe, and better than homogeneous) and 0.8743 (lost 8.88 perplexity).
+`figures/ratio_tail.csv` gives, per variant, the peak, how many matrices sit above 0.6, 0.7, 0.8 and
+0.85, and which layers hold the top eight. Read all three columns, in this order:
 
-It costs nothing and it is exact rather than indicative: the offline peak equalled the realized peak
-in every case, because the preview replays the same allocator. `figures/cap_binding.csv` is the same
-screen expressed as a count, and any variant pinning even one matrix is a variant to drop.
+1. **Peak above 0.85 is fatal.** On the 28 runs collected before the cap sweep this classified all 28
+   correctly, with the boundary observed between 0.8325 (safe, and better than homogeneous) and
+   0.8743 (lost 8.88). Drop the variant.
+2. **Mass behind the peak.** A variant with one matrix at 0.70 and one with eight are not the same
+   experiment: at ratio 0.5 they measure 25.05 and 33.06. Compare `above_0.6` and `above_0.7`.
+3. **Which layers.** A tail concentrated in layers 0 to 3 is the failure mode; a tail spread one
+   matrix per block is not. `layers_of_top_8` says which it is at a glance.
 
-**Do not use `ratio_std` for this.** An earlier draft of this document proposed it, and the 2b runs
-refute it: `eff_rank_sq` at ratio 0.2 has the *highest* dispersion in its sweep (0.104) and is the
-**best** run at that ratio (7.62). Wide dispersion is only fatal when it lands the peak past the
-safe band, so dispersion mislabels exactly the aggressive-but-safe allocations that produce the
-gain. Dispersion remains the right tool for the different job of matching two policies'
-aggressiveness.
+The peak is exact rather than indicative: it equalled the realized peak of all 28 runs to four
+decimals, because the preview replays the same allocator.
 
-The 0.85 line rests on 28 runs from one model at two budgets, and nothing in the tooling enforces
-it. Re-derive it per model, and note that the safe band did **not** scale with the budget between
-0.2 and 0.5, which is what makes an absolute threshold plausible in the first place.
+**Do not use `ratio_std` for this.** An earlier draft proposed it and the 2b runs refute it:
+`eff_rank_sq` at ratio 0.2 has the *highest* dispersion in its sweep (0.104) and is the **best** run
+at that ratio (7.62). Dispersion mislabels exactly the aggressive-but-safe allocations that produce
+the gain. It remains the right tool for comparing two policies' aggressiveness.
+
+The thresholds rest on 42 runs from one model at two budgets, and nothing in the tooling enforces
+them. Re-derive them per model, and note that the safe band did **not** scale with the budget between
+0.2 and 0.5, which is what makes an absolute line plausible.
+
+### The map-distance screen: two variants that are one experiment
+
+`figures/map_distance.csv` gives, for every pair of variants in a sweep, the mean and the largest
+per-matrix ratio difference between their allocations, plus each one's peak. A pair whose largest
+difference falls under 0.02 is reported on the console as one experiment run twice.
+
+The test is on the **largest** difference and not the mean, and the reason is worth keeping in mind
+when reading the file. Raising the cap from 0.75 to 0.9 on `type`/`truncation` at ratio 0.5 moves the
+allocation by 0.004 on average and by **0.15 on three matrices** — and those three matrices are the
+difference between a working model and one at 43.38 perplexity. A screen that tells you not to run
+something has to be wrong in the safe direction.
+
+It pays for itself immediately. The cap sweep this document originally prescribed for stage 3 turns
+out to produce a largest difference of exactly 0.0000 across all five caps at ratio 0.2, because the
+cap never binds at the winning configuration: four of those runs were the same run.
 
 ### Preview command
 
@@ -223,6 +345,8 @@ rank across the variants. The `checks` column is `ok` or the invariant that fail
 | `figures/influence_vs_effrank_rho.csv` | Spearman rho per matrix family, the gate on stage 6 |
 | `figures/ratio_by_type.csv` | mean ratio per matrix family, where rank-space bias shows |
 | `figures/oracle_gap.csv` | each objective against its greedy lower bound, for comparing across budgets |
+| `figures/map_distance.csv` | how far apart two variants allocate, with each one's peak: the screen against paying twice for one experiment |
+| `figures/ratio_tail.csv` | the peak, how many matrices sit above 0.6 to 0.85, and which layers hold the top eight: the screen against a run that is going to fail |
 | `budget/<variant>.log` | the captured `[BUDGET]` instrumentation of that variant |
 
 Variants are ranked by **mean rank across six objectives**, never by a single number. The obvious
@@ -468,7 +592,7 @@ Three cases end at step 2, with no GPU time at all:
 | 2b | `stage2b` | `matrices.csv`, the ratio column per matrix | whether a `_sq` score allocates differently from the score it derives from |
 | 2c | `stage2c` | `matrices.csv`, `figures/dispersion.csv` | whether `norm\|-inf` is signal or rounding noise, which decides the 2 conditional runs |
 | 4 | `stage4_knobs` | `max_ratio_assigned`, `figures/ratio_by_type.csv` | that the frozen cap brings all four policies inside the safe band; `--offset` is inert |
-| 3 | `stage3` | `max_ratio_assigned`, `figures/cap_binding.csv` | which caps bring the peak under 0.85, and which pin nothing and so change nothing |
+| 3, 3b | `stage3`, `stage3b` | `max_ratio_assigned`, `figures/map_distance.csv` | that every cap binds, and that no two runs allocate the same way |
 | 5, 5b | `stage5` | the exit code and `checks` | whether the bypassed budgets are feasible under the cap |
 | 6 | `stage6` | `figures/dispersion.csv`, plus the stage 0 rho | the offset for the fused score, and that the three alphas allocate distinctly |
 | 7 | `stage0` again, per model | the rho sign, `figures/scores_by_depth.csv` | whether the finalists transfer to that model |
@@ -715,54 +839,86 @@ python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
 
 ---
 
-## Stage 3: the per-matrix cap
+## Stage 3: the peak curve
 
-**Runs immediately after 2c, before stage 4.** The collected runs make this the first-order effect
-rather than a hyperparameter detail: the peak assigned ratio separated all 28 heterogeneous cells
-into safe and damaged with no exceptions, and three matrices out of 224 at the 0.9 cap cost 14 to 19
-perplexity. Nothing downstream can be compared until the cap is frozen somewhere safe.
+**Runs immediately after 2c, before stage 4.** The collected runs make the peak the first-order
+effect rather than a hyperparameter detail: it separated all 28 heterogeneous cells into safe and
+damaged with no exceptions, and three matrices out of 224 at the 0.9 cap cost 14 to 19 perplexity.
+Nothing downstream can be compared until the peak is understood and frozen somewhere safe.
 
-Because it now precedes stage 4, it runs at **stage 2's configuration** — `waterfill`, the policy
-every collected run used — not at `__BEST_INNER__`, which stage 4 has not yet resolved.
+**Purpose.** Trace perplexity against peak, and find where the safe band ends. This is the largest
+effect in the data and it is currently measured only at whatever peaks the scores happened to produce.
 
-**Purpose.** Locate the cap that keeps the peak inside the safe band, and test whether a tighter cap
-rescues the cells that blew up.
+**The cap can only lower a peak.** That governs the whole stage design. `--max_ratio` clips an
+allocation, so a curve needs a driver whose *uncapped* peak already sits at the top of the range:
 
-**Offline preview.** Bracket the boundary, and read `max_ratio_assigned` rather than the objectives.
+- At ratio 0.5, `type`/`truncation` peaks at 0.90 uncapped, so caps of 0.55 through 0.85 all bind and
+  the peak equals the cap exactly. It also happens to be the worst run collected, at 43.38, so the
+  curve runs from catastrophic back to safe on one configuration.
+- At the winning `decoder`/`eff_rank` the uncapped peak is 0.7242 at 0.5 and **0.2897 at 0.2**, so the
+  cap is inert there. Every cap between 0.6 and 0.9 produces a byte-identical allocation at ratio 0.2,
+  which `figures/map_distance.csv` reports as a largest difference of 0.0000. The four such runs an
+  earlier draft prescribed were one run.
+
+**Offline preview.** Already run, in `output/allocation_reports/stage3/`. Confirm the cap binds before
+adding a cap to the grid: `max_ratio_assigned` equal to the cap means it binds, equal to something
+lower means the run duplicates one you already have.
 
 ```bash
 python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
-    --group_criterion __BEST_GROUPING__ --score_metric __TOP1_SCORE__ \
-    --inner_allocation waterfill \
-    --sweep "compression_ratio=0.2,0.5" --sweep "max_ratio=0.6,0.7,0.8,0.85,0.9" \
+    --group_criterion type --score_metric truncation --inner_allocation waterfill \
+    --compression_ratio 0.5 --sweep "max_ratio=0.55,0.65,0.75,0.85" \
     --out_dir ./output/allocation_reports/stage3
 ```
 
-**Runs.** 12:
-- 8: caps `{0.6, 0.7, 0.8, 0.85}` x `{0.2, 0.5}` at `__BEST_GROUPING__` + `__TOP1_SCORE__` +
-  `waterfill`
-- 4: the **rescue test**, caps `{0.7, 0.85}` on `global`/`truncation` and `type`/`truncation` at 0.5
+**Mostly collected already.** Eleven cap runs exist: `decoder`/`eff_rank` at caps `{0.7, 0.8, 0.85}`
+at ratio 0.2 and `{0.6, 0.7, 0.8, 0.85}` at 0.5, and `global`/`truncation` and `type`/`truncation` at
+caps `{0.7, 0.85}` at 0.5. They are what the findings above are built on. All eleven ran on the second
+machine, so they are internally comparable and must not be read against the 31 earlier runs.
 
-The grid brackets 0.83 to 0.87, where the collected runs put the boundary, rather than the wider
-`{0.4, 0.6, 0.8}` of an earlier draft: a cap far below the boundary constrains the allocation for a
-reason that has nothing to do with the failure being studied.
+**Runs remaining.** 4, all at ratio 0.5, filling the low end of the curve:
 
-**The rescue test.** `global`/`truncation` reached 39.09 and `type`/`truncation` 43.38 against a
-homogeneous 24.56, and both pinned exactly 3 matrices of 224 at 0.9. Capping the same two cells at
-0.7 and 0.85 asks whether that is all the damage was. If they come back to within a perplexity of
-homogeneous, the score was never the problem and the stage 2 grouping ranking has to be re-read at
-the safe cap; if they do not, the score genuinely misallocates and the grouping result stands as
-written. This is the one place a stage file names a score literally: the two cells are recorded
-facts, not gate outputs.
+- 2: `type`/`truncation` at caps `{0.55, 0.65}`
+- 2: `global`/`truncation` at the same two
 
-**Stage 3b, a sub-experiment worth the two runs: peak headroom at 0.2.** No collected run at ratio
-0.2 pushed its peak past 0.533, and the two that came closest are the two best runs at that budget
-(`eff_rank_sq` at 0.533 gaining 0.17, `entropy_sq` at 0.473 gaining 0.05). If the safe band really
-is absolute at ~0.85 rather than proportional to the budget, there is untested headroom at 0.2 and
-the gain there should grow with the peak. Find a configuration whose peak at 0.2 lands in 0.70 to
-0.85 — offline, for nothing, by sweeping `score_metric` and `softmax_temp` and reading
-`max_ratio_assigned` — then run it against the homogeneous anchor. Two runs, and it tests the
-mechanism directly rather than another score.
+Together with the collected 0.70, 0.85 and uncapped points that gives five points per driver, from
+below the safe band to past it. Ratio 0.2 has no cap runs, because nothing at that budget reaches a
+cap worth setting; its arm is 3b.
+
+The three `decoder`/`eff_rank` cap runs at ratio 0.2 are worth keeping as a record even though they
+changed nothing: all three produce a peak of 0.28969 and measure 7.85, which is the clearest evidence
+in the grid that the cap is inert at the winning configuration.
+
+**What this replaces.** An earlier draft called this the rescue test and asked whether a tighter cap
+saves the two cells that blew up. That question is still here, and is answered by the first eight
+runs; what changed is that it is now read as a curve rather than as a yes or no, because the peak is
+a continuous variable and the interesting part is where its damage begins.
+
+## Stage 3b: peak headroom at 0.2
+
+**Purpose.** No collected run at ratio 0.2 pushed its peak past 0.533, and the two that came closest
+are the two best runs at that budget: `eff_rank_sq` at peak 0.533 gaining 0.17, `entropy_sq` at 0.473
+gaining 0.05. If the safe band is absolute at around 0.85 rather than proportional to the budget,
+there is untested headroom at 0.2 and the gain should keep growing with the peak until it collapses.
+This is the cleanest test of the mechanism in the whole grid.
+
+**The lever is aggressiveness, not the cap**, since the cap cannot raise a peak. The `softmax_temp`
+inner policy has a temperature that sets it continuously, and the preview gives this ladder at ratio
+0.2 with `eff_rank_sq` under `decoder`, cap 0.9:
+
+| `--softmax_temp` | 1.0 | 0.7 | 0.5 | 0.35 | 0.25 | 0.15 |
+|---|---|---|---|---|---|---|
+| peak | 0.3055 | 0.3524 | 0.4148 | 0.5071 | 0.6205 | 0.8362 |
+| smallest ratio | 0.079 | 0.053 | 0.030 | 0.013 | 0.004 | 0.0003 |
+
+**Runs.** 4: temperatures `{0.5, 0.35, 0.25, 0.15}` at ratio 0.2, giving peaks 0.41, 0.51, 0.62 and
+0.84 against the homogeneous 7.79 and the best collected 7.62.
+
+**Read it with the second row in view.** Under a fixed budget a peak cannot rise without something
+else falling, so the aggressive end also leaves matrices almost uncompressed — 0.0003 at temperature
+0.15. The curve therefore measures the whole shape of the allocation, not the peak alone, and a
+collapse at the top could be either the peak or the near-zero tail. If it collapses, the follow-up
+that separates them is a cap: clip the same temperature at 0.6 and see whether the damage goes.
 
 **Read the gate.**
 
@@ -774,19 +930,77 @@ python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
 
 **What to check in it.**
 
-- The **Stage 3 gate** table. The cap column is the whole stage, and `priced at` matters here
-  because the rescue entries only exist at 0.5.
-- Whether the winning cap is below 0.9. If it is, set `--max_ratio` in `args/base_args.json` before
-  running stage 4, and say in thesis 3.3 that the cap is a first-order hyperparameter.
-- The two rescue rows. If a tighter cap pulls `global`/`truncation` back from 39.09 towards the
-  homogeneous 24.56, the catastrophes were peak damage and the grouping ranking has to be re-read at
-  the safe cap. If it does not, the score is genuinely misallocating.
-- `figures/cap_binding.csv` per cap: a cap that pins nothing changed nothing, and its row should
-  read identically to the 0.9 baseline.
+- The **Stage 3 gate** table, read as a curve: perplexity against the cap, which at this driver is
+  the peak exactly. Where it turns is the end of the safe band, and the collected runs put that
+  between 0.83 and 0.87.
+- Whether the two drivers turn at the **same** peak. `type` and `global` differ only in where the
+  budget comes from, so a common turning point says the boundary is a property of the model rather
+  than of the allocation, which is the stronger claim.
+- How far the rescue goes. If capping pulls `type`/`truncation` from 43.38 back to within a
+  perplexity of homogeneous, the catastrophes were peak damage alone and the stage 2 grouping ranking
+  has to be re-read at the safe cap. If a gap remains, that residual is the score genuinely
+  misallocating, and it is the honest size of the score effect.
+- The two spine rows at caps 0.6 and 0.7 against the uncapped 23.91. Clipping the winner's peak from
+  0.7242 down should cost a little if the peak is doing useful work, and cost nothing if it is not.
+- `figures/map_distance.csv` before believing any row is new: a largest difference under 0.02 against
+  a run you already have means the cap changed nothing.
 
-**Gate.** If a lower cap wins, the RQ1 verdict is reported at that cap, and thesis 3.3 must state
-that the cap is a first-order hyperparameter rather than a guard rail. Carry the winning cap into
-stages 5, 6 and 8 by setting it in `args/base_args.json`.
+**Gate.** `--max_ratio` = the cap at the top of the safe band, carried into `args/base_args.json` for
+every later stage. Report the RQ1 verdict at that cap, and if it is below 0.9 say in thesis 3.3 that
+the cap is a first-order hyperparameter rather than a guard rail.
+
+---
+
+## Stage 3c: the outer level, and the early-layer control
+
+**This is the thesis contribution's own test, and after the cap sweep it is the highest-value stage in
+the grid.** It was a block inside stage 4; it is promoted here because the findings turned it from an
+analogy into a prediction.
+
+**The prediction.** The flat groupings lose eight perplexity by concentrating their tail on layers 0
+to 3, and layer 0 carries a Block Influence of 0.4602 against 0.15 or less for almost everything else.
+The outer level gives high-influence blocks less removal, so it should protect exactly the blocks that
+`global` and `type` over-compress, deliberately and from a signal, where `decoder` only manages it
+as a side effect of flattening every block alike. If the outer level is worth anything, this
+is where it shows.
+
+**Runs.** 6:
+
+- 4: `hierarchical` + `--outer_allocation waterfill` x `{truncation, __TOP1_SCORE__}` x
+  `{0.2, 0.5}`, inner held at `waterfill`. `truncation` is in the set because it is where the
+  grouping lever is largest, so it is where protection has the most to recover.
+- 2: the **early-layer control**, `global` and `type` with `truncation` at 0.5, capped at 0.7 and
+  `--bypass_early_layers 2`. This asks whether simply exempting the first two blocks recovers the
+  eight perplexity, which separates "the tail must be kept off the early layers" from "the outer level
+  allocates better".
+
+**Its baselines already exist**: `decoder` + `param_share` at both scores and both ratios, and the
+capped `global`/`type` runs from stage 3. `hierarchical` + `param_share` reproduces `decoder` exactly,
+so the outer policy is the only factor moving.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports \
+    -o output/gates/huggyllama_llama_7b/gates_stage3c.md
+```
+
+**What to check in it.**
+
+- The **Stage 4 gate: the outer level** table, which is where these rows land. Compare each against
+  `decoder` + `param_share` at the same score and ratio: that pair differs in one factor only.
+- `figures/ratio_tail.csv` for the hierarchical runs before reading any perplexity. If the outer level
+  is doing what it should, `layers_of_top_8` no longer starts at 0 and `above_0.7` falls.
+- The two control rows against their uncapped and capped siblings. If bypassing two blocks recovers
+  most of the eight perplexity, the story is about the early layers and any mechanism that protects
+  them will do; if it does not, the outer level's allocation is doing something a blunt exemption
+  cannot.
+- Whether `truncation` benefits more than `__TOP1_SCORE__`. The prediction is yes, because the lever
+  is proportional to how sharply the score varies across depth.
+
+**Gate.** Reporting, plus whichever of `decoder` + `param_share` and `hierarchical` + `waterfill` wins
+becomes the configuration stages 4 onward are held at.
 
 ---
 
@@ -1211,9 +1425,10 @@ In execution order, with the two completed stages marked.
 | 2 score x grouping | 18 **done** | wikitext | peak screen, prune degenerate cells |
 | 2b squared | 6 **done** | wikitext | compare ratio maps |
 | 2c Schatten | 4 **done** (+2 rejected by the peak screen) | wikitext | check `norm\|-inf` is not noise |
-| 3 cap | 12 | wikitext | brackets the peak boundary |
-| 3b peak headroom | 2 | wikitext | finds the configuration, for nothing |
-| 4 policies | 32 | wikitext | its knob preview is already run and settles them |
+| 3 peak curve | 4 (+11 **done**) | wikitext | confirms every cap binds, so no run repeats another |
+| 3b peak headroom | 4 | wikitext | the temperature ladder, already measured |
+| 3c outer level | 6 | wikitext | `ratio_tail`, to see whether the tail leaves layer 0 |
+| 4 policies | 24 | wikitext | its knob preview is already run and settles them |
 | 8 onset | 4 | wikitext | oracle-normalized, and where the shape claim lives |
 | 5 bypass | 36 | wikitext | catches infeasible budgets |
 | 5b bypass x grouping | 2 | wikitext | same preview as 5 |
@@ -1222,8 +1437,12 @@ In execution order, with the two completed stages marked.
 | 9 benchmarks | 9 | full suite **and c4** | needs its checkpoints rebuilt first |
 | 10 LoRA | 4 | wikitext, no recompression | not applicable |
 
-**100 compression runs remaining** on LLaMA-7B, on top of the 31 already collected, plus 13
+**97 compression runs remaining** on LLaMA-7B, on top of the 42 already collected, plus 13
 evaluation-only or update-only runs, plus 12 blocked, plus **roughly 10 recompressions** to rebuild
-the stage 9 and 10 checkpoint inputs that were deleted. At about an hour each that is four to five
-days of continuous GPU. Every stage is previewed offline first, at a cost of seconds, and the peak
-screen can now reject a cell before it is ever queued.
+the stage 9 and 10 checkpoint inputs that were deleted.
+
+GPU time is not the binding constraint on this grid, so these counts describe it rather than budget
+it: spend runs wherever they resolve something. What the offline pass buys is not saved hours but the
+guarantee that each hour buys a distinct experiment. The peak screen rejects a cell that is going to
+fail, and the map-distance screen rejects a cell that repeats one already collected — which is how
+four of the runs this document used to prescribe for stage 3 turned out to be one run.
