@@ -606,6 +606,11 @@ def row_from_run_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if model:
         row["model"] = sanitize_model_name(str(model))
 
+    # Two runs from different machines carry different whitening caches, and on
+    # LLaMA-7B that is worth more perplexity than most of what a gate compares
+    if run_args.get("save_path"):
+        row["environment"] = str(run_args["save_path"])
+
     # Target against actual, the only way a run whose allocation drifted off its
     # budget stays visibly incomparable to one that hit it
     if allocation.get("realized_overall_ratio") is not None:
@@ -1726,6 +1731,27 @@ def confound_notes(rows: List[Dict[str, Any]], axes: Tuple[str, ...]) -> List[st
     return notes
 
 
+def environment_notes(runs: List[Dict[str, Any]]) -> List[str]:
+    """
+    Runs a table mixes that were not produced on the same machine.
+
+    The whitening cache is an input to the allocation, not an output of it, so a
+    run whose cache came from a different machine is a different experiment. On
+    LLaMA-7B the two collected sets differ by 0.08 perplexity at ratio 0.2 and
+    0.14 at 0.5 on allocations that agree to four decimals, which is larger than
+    the entire spread the stage 2 grid was ranked on.
+    """
+    environments = sorted({str(run["environment"]) for run in runs if run.get("environment")})
+
+    if len(environments) < 2:
+        return []
+
+    return [
+        f"this table mixes {len(environments)} run environments ({', '.join(environments)}), whose "
+        "whitening caches are not the same input: compare within one before comparing across",
+    ]
+
+
 def drift_notes(pivot: List[PivotRow]) -> List[str]:
     """Runs whose realized removal missed the budget they are being compared at"""
     drifted: List[str] = []
@@ -1833,6 +1859,7 @@ def pivot_table(
         body.append(cells)
 
     extra_notes = resolution_notes(pivot, ratios)
+    extra_notes += environment_notes([run for row in pivot for run in row.runs.values()])
 
     if len(set(coverage.values())) > 1:
         extra_notes.append(
@@ -1895,6 +1922,14 @@ def gain_table(
         cells.append(Cell(text=mean_gain, bold=is_winner))
         body.append(cells)
 
+    paired_runs = [
+        run
+        for row in gain_rows
+        for pivot in ( row.het, row.hom )
+        if pivot is not None
+        for run in pivot.runs.values()
+    ]
+
     return Table(
         title=title,
         purpose=purpose,
@@ -1902,6 +1937,7 @@ def gain_table(
         rows=body,
         notes=[
             *(notes or []),
+            *environment_notes(paired_runs),
             "gain is hom minus het at the same setting, so a positive number means heterogeneous won",
         ],
     )
