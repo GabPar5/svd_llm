@@ -2,18 +2,10 @@
   {
     "--compression_ratio": 0.5,
     "--het": true,
-    "--group_criterion": "type",
+    "--group_criterion": "global",
     "--score_metric": "truncation",
     "--inner_allocation": "waterfill",
-    "--max_ratio": 0.55
-  },
-  {
-    "--compression_ratio": 0.5,
-    "--het": true,
-    "--group_criterion": "type",
-    "--score_metric": "truncation",
-    "--inner_allocation": "waterfill",
-    "--max_ratio": 0.65
+    "--max_ratio": 0.6
   },
   {
     "--compression_ratio": 0.5,
@@ -21,7 +13,7 @@
     "--group_criterion": "global",
     "--score_metric": "truncation",
     "--inner_allocation": "waterfill",
-    "--max_ratio": 0.55
+    "--max_ratio": 0.7
   },
   {
     "--compression_ratio": 0.5,
@@ -29,6 +21,62 @@
     "--group_criterion": "global",
     "--score_metric": "truncation",
     "--inner_allocation": "waterfill",
-    "--max_ratio": 0.65
+    "--max_ratio": 0.8
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "global",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.85
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.6
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.7
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.8
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "truncation",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.85
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.6
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "waterfill",
+    "--max_ratio": 0.7
   }
 ]

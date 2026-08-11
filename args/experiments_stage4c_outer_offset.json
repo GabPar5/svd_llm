@@ -1,0 +1,92 @@
+[
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.2
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.2
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 2.0
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 2.0
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 3.0
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 3.0
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 6.0
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 6.0
+  }
+]

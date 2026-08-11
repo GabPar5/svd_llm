@@ -1,27 +1,24 @@
 [
   {
     "--model": "Qwen/Qwen2.5-7B",
+    "--use_compressed": false
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
     "--compression_ratio": 0.2,
     "--het": true,
     "--group_criterion": "__FINALIST1_GROUPING__",
     "--score_metric": "__FINALIST1_SCORE__",
-    "--inner_allocation": "__FINALIST1_INNER__"
-  },
-  {
-    "--model": "Qwen/Qwen2.5-7B",
-    "--compression_ratio": 0.2,
-    "--het": true,
-    "--group_criterion": "__FINALIST2_GROUPING__",
-    "--score_metric": "__FINALIST2_SCORE__",
-    "--inner_allocation": "__FINALIST2_INNER__"
-  },
-  {
-    "--model": "Qwen/Qwen2.5-7B",
-    "--compression_ratio": 0.2,
-    "--het": true,
-    "--group_criterion": "__FINALIST3_GROUPING__",
-    "--score_metric": "__FINALIST3_SCORE__",
-    "--inner_allocation": "__FINALIST3_INNER__"
+    "--inner_allocation": "__FINALIST1_INNER__",
+    "--outer_allocation": "__FINALIST1_OUTER__"
   },
   {
     "--model": "Qwen/Qwen2.5-7B",
@@ -29,7 +26,17 @@
     "--het": true,
     "--group_criterion": "__FINALIST1_GROUPING__",
     "--score_metric": "__FINALIST1_SCORE__",
-    "--inner_allocation": "__FINALIST1_INNER__"
+    "--inner_allocation": "__FINALIST1_INNER__",
+    "--outer_allocation": "__FINALIST1_OUTER__"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "__FINALIST2_GROUPING__",
+    "--score_metric": "__FINALIST2_SCORE__",
+    "--inner_allocation": "__FINALIST2_INNER__",
+    "--outer_allocation": "__FINALIST2_OUTER__"
   },
   {
     "--model": "Qwen/Qwen2.5-7B",
@@ -37,7 +44,17 @@
     "--het": true,
     "--group_criterion": "__FINALIST2_GROUPING__",
     "--score_metric": "__FINALIST2_SCORE__",
-    "--inner_allocation": "__FINALIST2_INNER__"
+    "--inner_allocation": "__FINALIST2_INNER__",
+    "--outer_allocation": "__FINALIST2_OUTER__"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "__FINALIST3_GROUPING__",
+    "--score_metric": "__FINALIST3_SCORE__",
+    "--inner_allocation": "__FINALIST3_INNER__",
+    "--outer_allocation": "__FINALIST3_OUTER__"
   },
   {
     "--model": "Qwen/Qwen2.5-7B",
@@ -45,7 +62,20 @@
     "--het": true,
     "--group_criterion": "__FINALIST3_GROUPING__",
     "--score_metric": "__FINALIST3_SCORE__",
-    "--inner_allocation": "__FINALIST3_INNER__"
+    "--inner_allocation": "__FINALIST3_INNER__",
+    "--outer_allocation": "__FINALIST3_OUTER__"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-32B",
+    "--use_compressed": false
+  },
+  {
+    "--model": "Qwen/Qwen2.5-32B",
+    "--compression_ratio": 0.2
+  },
+  {
+    "--model": "Qwen/Qwen2.5-32B",
+    "--compression_ratio": 0.5
   },
   {
     "--model": "Qwen/Qwen2.5-32B",
@@ -53,23 +83,8 @@
     "--het": true,
     "--group_criterion": "__FINALIST1_GROUPING__",
     "--score_metric": "__FINALIST1_SCORE__",
-    "--inner_allocation": "__FINALIST1_INNER__"
-  },
-  {
-    "--model": "Qwen/Qwen2.5-32B",
-    "--compression_ratio": 0.2,
-    "--het": true,
-    "--group_criterion": "__FINALIST2_GROUPING__",
-    "--score_metric": "__FINALIST2_SCORE__",
-    "--inner_allocation": "__FINALIST2_INNER__"
-  },
-  {
-    "--model": "Qwen/Qwen2.5-32B",
-    "--compression_ratio": 0.2,
-    "--het": true,
-    "--group_criterion": "__FINALIST3_GROUPING__",
-    "--score_metric": "__FINALIST3_SCORE__",
-    "--inner_allocation": "__FINALIST3_INNER__"
+    "--inner_allocation": "__FINALIST1_INNER__",
+    "--outer_allocation": "__FINALIST1_OUTER__"
   },
   {
     "--model": "Qwen/Qwen2.5-32B",
@@ -77,7 +92,17 @@
     "--het": true,
     "--group_criterion": "__FINALIST1_GROUPING__",
     "--score_metric": "__FINALIST1_SCORE__",
-    "--inner_allocation": "__FINALIST1_INNER__"
+    "--inner_allocation": "__FINALIST1_INNER__",
+    "--outer_allocation": "__FINALIST1_OUTER__"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-32B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "__FINALIST2_GROUPING__",
+    "--score_metric": "__FINALIST2_SCORE__",
+    "--inner_allocation": "__FINALIST2_INNER__",
+    "--outer_allocation": "__FINALIST2_OUTER__"
   },
   {
     "--model": "Qwen/Qwen2.5-32B",
@@ -85,7 +110,17 @@
     "--het": true,
     "--group_criterion": "__FINALIST2_GROUPING__",
     "--score_metric": "__FINALIST2_SCORE__",
-    "--inner_allocation": "__FINALIST2_INNER__"
+    "--inner_allocation": "__FINALIST2_INNER__",
+    "--outer_allocation": "__FINALIST2_OUTER__"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-32B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "__FINALIST3_GROUPING__",
+    "--score_metric": "__FINALIST3_SCORE__",
+    "--inner_allocation": "__FINALIST3_INNER__",
+    "--outer_allocation": "__FINALIST3_OUTER__"
   },
   {
     "--model": "Qwen/Qwen2.5-32B",
@@ -93,6 +128,7 @@
     "--het": true,
     "--group_criterion": "__FINALIST3_GROUPING__",
     "--score_metric": "__FINALIST3_SCORE__",
-    "--inner_allocation": "__FINALIST3_INNER__"
+    "--inner_allocation": "__FINALIST3_INNER__",
+    "--outer_allocation": "__FINALIST3_OUTER__"
   }
 ]

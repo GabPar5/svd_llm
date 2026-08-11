@@ -1,0 +1,58 @@
+[
+  {
+    "--compression_ratio": 0.2,
+    "--seed": 7777,
+    "--whitening_mat_path": "./output/whitening_matrices_seed7777"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "waterfill",
+    "--seed": 7777,
+    "--whitening_mat_path": "./output/whitening_matrices_seed7777"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--seed": 7777,
+    "--whitening_mat_path": "./output/whitening_matrices_seed7777"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "waterfill",
+    "--seed": 7777,
+    "--whitening_mat_path": "./output/whitening_matrices_seed7777"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--seed": 8888,
+    "--whitening_mat_path": "./output/whitening_matrices_seed8888"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "waterfill",
+    "--seed": 8888,
+    "--whitening_mat_path": "./output/whitening_matrices_seed8888"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--seed": 8888,
+    "--whitening_mat_path": "./output/whitening_matrices_seed8888"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "waterfill",
+    "--seed": 8888,
+    "--whitening_mat_path": "./output/whitening_matrices_seed8888"
+  }
+]

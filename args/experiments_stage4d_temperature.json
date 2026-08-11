@@ -1,0 +1,138 @@
+[
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.15
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.15
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.25
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.25
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.35
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.35
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.5
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.5
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.15,
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.15,
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.25,
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.25,
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.35,
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.35,
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.5,
+    "--outer_allocation": "waterfill"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "softmax_temp",
+    "--softmax_temp": 0.5,
+    "--outer_allocation": "waterfill"
+  }
+]

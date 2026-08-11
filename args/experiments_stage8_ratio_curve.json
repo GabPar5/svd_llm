@@ -1,22 +1,68 @@
 [
   {
-    "--compression_ratio": 0.35
+    "--compression_ratio": 0.1
   },
   {
-    "--compression_ratio": 0.35,
+    "--compression_ratio": 0.1,
     "--het": true,
     "--group_criterion": "__BEST_GROUPING__",
     "--score_metric": "__TOP1_SCORE__",
-    "--inner_allocation": "__BEST_INNER__"
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "__BEST_OUTER__"
   },
   {
-    "--compression_ratio": 0.65
+    "--compression_ratio": 0.3
   },
   {
-    "--compression_ratio": 0.65,
+    "--compression_ratio": 0.3,
     "--het": true,
     "--group_criterion": "__BEST_GROUPING__",
     "--score_metric": "__TOP1_SCORE__",
-    "--inner_allocation": "__BEST_INNER__"
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "__BEST_OUTER__"
+  },
+  {
+    "--compression_ratio": 0.4
+  },
+  {
+    "--compression_ratio": 0.4,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "__BEST_OUTER__"
+  },
+  {
+    "--compression_ratio": 0.6
+  },
+  {
+    "--compression_ratio": 0.6,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "__BEST_OUTER__"
+  },
+  {
+    "--compression_ratio": 0.7
+  },
+  {
+    "--compression_ratio": 0.7,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "__BEST_OUTER__"
+  },
+  {
+    "--compression_ratio": 0.8
+  },
+  {
+    "--compression_ratio": 0.8,
+    "--het": true,
+    "--group_criterion": "__BEST_GROUPING__",
+    "--score_metric": "__TOP1_SCORE__",
+    "--inner_allocation": "__BEST_INNER__",
+    "--outer_allocation": "__BEST_OUTER__"
   }
 ]

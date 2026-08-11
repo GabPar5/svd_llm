@@ -1,0 +1,30 @@
+[
+  {
+    "--compression_ratio": 0.2,
+    "--compress_mlp": false
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--compress_att_q": false,
+    "--compress_att_k": false,
+    "--compress_att_v": false,
+    "--compress_att_out": false
+  },
+  {
+    "--compression_ratio": 0.2,
+    "--compress_att_q": false,
+    "--compress_att_k": false
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--compress_att_q": false,
+    "--compress_att_k": false,
+    "--compress_att_v": false,
+    "--compress_att_out": false
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--compress_att_q": false,
+    "--compress_att_k": false
+  }
+]
