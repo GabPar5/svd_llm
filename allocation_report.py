@@ -68,6 +68,21 @@ DUPLICATE_MAP_MAX_DELTA = 0.02
 # the console prints enough to act on
 MAX_REPORTED_DUPLICATES = 10
 
+# The fraction of a decoder block's parameters that may be removed before the
+# block stops carrying its function. Measured on LLaMA-7B over 39 allocations at
+# ratio 0.5: all 12 that pushed a block past 0.63 landed at 28.5 perplexity or
+# worse against a homogeneous 24.56, and the block at the peak was layer 0 in
+# every one of them. It screens twice as well as the peak per-matrix ratio it
+# replaces (Spearman +0.73 against +0.41), because a matrix can be truncated hard
+# as long as its siblings in the same block are not.
+#
+# The test is one-sided, and reading it as a guarantee is the trap. Staying under
+# the threshold rules out the depth failure and nothing else: `param_share` pins
+# every block at the target by construction, and those allocations still span 23
+# to 44 perplexity on how they split a block internally. A pass here means the
+# grouping and the outer policy are safe, not the score and the inner policy
+BLOCK_RATIO_DANGER = 0.60
+
 MATRIX_TYPES = (
     "self_attn.q_proj",
     "self_attn.k_proj",
@@ -251,6 +266,54 @@ def spearman(xs: List[float], ys: List[float]) -> float:
 def matrix_type_of(key: str) -> str:
     """`model.layers.7.mlp.gate_proj` -> `mlp.gate_proj`"""
     return key.partition(f".layers.{get_layer_idx_from_key(key)}.")[2]
+
+
+def block_ratios(inputs: Inputs, ratio_map: Dict[str, float]) -> Dict[int, float]:
+    """
+    Parameter-weighted removed fraction per decoder block, over the targeted matrices.
+
+    This is the quantity that predicts whether an allocation survives, so it is
+    derived in one place and read by the summary, the tail screen and layers.csv.
+    Weighting by parameters rather than averaging the ratios matters: an MLP
+    matrix carries between two and three times an attention matrix, so the mean
+    of the seven ratios in a block is not the fraction the block actually loses.
+
+    The denominator is what the run compresses, not what the block holds, so a
+    partial selection reports a fraction of that selection — which is why
+    `selection_is_complete` guards the threshold rather than this function.
+    """
+    removed: Dict[int, float] = defaultdict(float)
+    params: Dict[int, float] = defaultdict(float)
+
+    for key in inputs.layers_str:
+        layer = get_layer_idx_from_key(key)
+        count = inputs.param_count_map[key]
+        removed[layer] += count * ratio_map.get(key, 0.0)
+        params[layer] += count
+
+    return {layer: removed[layer] / params[layer] for layer in sorted(params) if params[layer]}
+
+
+def peak_block(block_map: Dict[int, float]) -> Tuple[int, float]:
+    """The block losing the most, and how much. `(-1, nan)` on an empty map"""
+    if not block_map:
+        return -1, float("nan")
+
+    layer = max(block_map, key=lambda item: block_map[item])
+    return layer, block_map[layer]
+
+
+def selection_is_complete(inputs: Inputs) -> bool:
+    """
+    Whether every matrix family in a block is a compression target.
+
+    `BLOCK_RATIO_DANGER` was calibrated on runs compressing all seven, so on a
+    partial selection the same number means something else: an attention-only run
+    at an overall 0.2 removes 0.60 of the attention it targets while the block
+    itself loses 0.2, and screening that as doomed would be reading one
+    denominator against a threshold fitted to another
+    """
+    return {matrix_type_of(key) for key in inputs.layers_str} == set(MATRIX_TYPES)
 
 
 def load_inputs(args: argparse.Namespace) -> Inputs:
@@ -942,6 +1005,7 @@ def write_reports(
             "variant", *sorted(SWEEPABLE), "outer_allocation", "ratio_scope",
             "realized_ratio", "mean_rank", *objective_columns,
             "min_ratio", "max_ratio_assigned", "mean_ratio", "ratio_std",
+            "max_block_ratio", "max_block_layer", "block0_ratio",
             "score_ratio_rho", "checks",
         ])
 
@@ -951,6 +1015,9 @@ def write_reports(
                 [result.ratio_map.get(key, 0.0) for key in inputs.layers_str],
                 dtype=torch.float64,
             )
+
+            blocks = block_ratios(inputs, result.ratio_map)
+            hot_layer, hot_ratio = peak_block(blocks)
 
             objective_cells: List[str] = []
             for objective in OBJECTIVES:
@@ -982,6 +1049,9 @@ def write_reports(
                 f"{ratios.max().item():.6f}",
                 f"{ratios.mean().item():.6f}",
                 f"{ratios.std().item():.6f}",
+                f"{hot_ratio:.6f}" if math.isfinite(hot_ratio) else "",
+                str(hot_layer) if hot_layer >= 0 else "",
+                f"{blocks[0]:.6f}" if 0 in blocks else "",
                 f"{result.score_ratio_rho:+.4f}" if not math.isnan(result.score_ratio_rho) else "",
                 "; ".join(result.checks),
             ])
@@ -1032,6 +1102,7 @@ def write_reports(
 
         for variant in variants:
             result = results[variant.name]
+            blocks = block_ratios(inputs, result.ratio_map)
             per_layer: Dict[int, List[str]] = defaultdict(list)
 
             for key in inputs.layers_str:
@@ -1040,15 +1111,14 @@ def write_reports(
             for layer in sorted(per_layer):
                 keys = per_layer[layer]
                 params = sum(inputs.param_count_map[key] for key in keys)
-                removed = sum(inputs.param_count_map[key] * result.ratio_map.get(key, 0.0) for key in keys)
                 influence = inputs.importance.get(layer) if inputs.importance else None
 
                 writer.writerow([
                     variant.name,
                     layer,
                     params,
-                    f"{removed:.0f}",
-                    f"{removed / params:.6f}" if params else "",
+                    f"{params * blocks[layer]:.0f}" if layer in blocks else "",
+                    f"{blocks[layer]:.6f}" if layer in blocks else "",
                     f"{influence:.6f}" if influence is not None else "",
                 ])
 
@@ -1556,40 +1626,85 @@ def figure_cap_binding(fig_dir: str, inputs: Inputs, variants: List[Variant], re
     save_figure(fig_dir, "cap_binding", figure, plt)
 
 
-def figure_ratio_tail(fig_dir: str, variants: List[Variant], results: Dict[str, VariantResult]) -> None:
+def figure_ratio_tail(
+        fig_dir: str,
+        inputs: Inputs,
+        variants: List[Variant],
+        results: Dict[str, VariantResult]
+) -> None:
     """
     How much of the allocation sits in the aggressive region, and where it sits.
 
-    The peak alone is not enough. At ratio 0.5 with a cap of 0.7, `decoder` puts
-    one matrix at the ceiling and `global` puts eight, and the two measure 25.05
-    and 33.06: the peak is identical and the mass behind it is not. The layers
-    matter too, because the matrices that reach the ceiling under a flat grouping
-    are the earliest blocks, which are the ones Block Influence rates highest.
+    The per-matrix peak is the wrong screen, and two runs at ratio 0.5 show why:
+    `decoder` with `softmax_temp` reaches 0.900 on 31 matrices and measures 23.16,
+    while `type` with `softmax_temp` reaches the same 0.900 on 11 and measures
+    78.19. The first spreads its tail over 26 of 32 blocks and touches only q and
+    k; the second concentrates it on blocks 0 to 2 across all seven families. What
+    separates them is `max_block_ratio`, the fraction a whole block loses, which
+    is why that column leads here and `peak` is kept only as context.
     """
     thresholds = ( 0.6, 0.7, 0.8, 0.85 )
     rows: List[List[Any]] = []
+    doomed: List[Tuple[str, int, float]] = []
+    screenable = selection_is_complete(inputs)
 
     for variant in variants:
-        ratio_map = results[variant.name].ratio_map
+        result = results[variant.name]
+        ratio_map = result.ratio_map
 
         if not ratio_map:
             continue
 
+        blocks = block_ratios(inputs, ratio_map)
+        hot_layer, hot_ratio = peak_block(blocks)
         ranked = sorted(ratio_map.items(), key=lambda item: -item[1])
         top_layers = sorted({get_layer_idx_from_key(key) for key, _ in ranked[:8]})
 
         rows.append([
             variant.name,
+            f"{hot_ratio:.6f}" if math.isfinite(hot_ratio) else "",
+            hot_layer if hot_layer >= 0 else "",
+            f"{blocks[0]:.6f}" if 0 in blocks else "",
+            sum(1 for value in blocks.values() if value > BLOCK_RATIO_DANGER),
             f"{max(ratio_map.values()):.6f}",
             *[sum(1 for value in ratio_map.values() if value > threshold) for threshold in thresholds],
             ";".join(str(layer) for layer in top_layers),
         ])
 
+        if screenable and math.isfinite(hot_ratio) and hot_ratio > BLOCK_RATIO_DANGER:
+            doomed.append(( variant.label, hot_layer, hot_ratio ))
+
     write_figure_csv(
         fig_dir,
         "ratio_tail",
-        [ "variant", "peak", *[f"above_{threshold}" for threshold in thresholds], "layers_of_top_8" ],
+        [
+            "variant", "max_block_ratio", "max_block_layer", "block0_ratio", "blocks_above_danger",
+            "peak", *[f"above_{threshold}" for threshold in thresholds], "layers_of_top_8",
+        ],
         rows,
+    )
+
+    if not screenable:
+        print(
+            "\n[REPORT] Not every matrix family is a target, so `max_block_ratio` is a fraction of "
+            f"the selection and the {BLOCK_RATIO_DANGER:.2f} screen does not apply to this sweep"
+        )
+        return
+
+    if not doomed:
+        return
+
+    print(
+        f"\n[REPORT][WARNING] {len(doomed)} variant(s) push a decoder block past "
+        f"{BLOCK_RATIO_DANGER:.2f} of its parameters:"
+    )
+
+    for label, layer, ratio in sorted(doomed, key=lambda item: -item[2]):
+        print(f"  {label}   block {layer} loses {ratio:.4f}")
+
+    print(
+        "  every allocation measured past this point cost at least 3 perplexity against homogeneous;\n"
+        "  staying under it rules out the depth failure only, not a bad split inside a block"
     )
 
 
@@ -1843,7 +1958,7 @@ def write_figures(
     figure_ratio_by_type(fig_dir, inputs, variants, results, plt)
     figure_cap_binding(fig_dir, inputs, variants, results, plt)
 
-    figure_ratio_tail(fig_dir, variants, results)
+    figure_ratio_tail(fig_dir, inputs, variants, results)
     figure_map_distance(fig_dir, variants, results)
     figure_objectives(fig_dir, variants, results, ranks, plt)
     figure_oracle_gap(fig_dir, variants, results, oracles, plt)
@@ -1863,6 +1978,7 @@ def format_table_row(cells: List[str], widths: List[int]) -> str:
 
 def render_summary_table(
         variants: List[Variant],
+        inputs: Inputs,
         results: Dict[str, VariantResult],
         ranks: Dict[str, Dict[str, float]],
         mean_rank: Dict[str, float]
@@ -1873,12 +1989,16 @@ def render_summary_table(
     Widths are measured from the cells instead of fixed, because a variant name
     is as long as the sweep makes it: a name overflowing a fixed field shifts
     every column to its right by its own excess, and no two rows line up.
+
+    `worst block` carries the screen rather than the objectives, which rank the
+    allocations backwards: it is the only column here that has been shown to
+    order runs the same way a measured perplexity does.
     """
     axes = variants[0].axes if variants else ()
     rows: List[List[str]] = []
     header = [
         " / ".join(axes) if axes else "variant",
-        "realized", "mean rk",
+        "realized", "worst block", "mean rk",
         *(objective.name for objective in OBJECTIVES),
         "checks",
     ]
@@ -1902,9 +2022,17 @@ def render_summary_table(
 
             cells.append(cell)
 
+        hot_layer, hot_ratio = peak_block(block_ratios(inputs, result.ratio_map))
+        block_cell = "-"
+
+        if math.isfinite(hot_ratio):
+            over = hot_ratio > BLOCK_RATIO_DANGER and selection_is_complete(inputs)
+            block_cell = f"{hot_ratio:.3f} (L{hot_layer}){'!' if over else ''}"
+
         rows.append([
             variant.label,
             f"{result.realized_ratio:.4f}" if math.isfinite(result.realized_ratio) else "-",
+            block_cell,
             f"{mean_rank[variant.name]:.2f}" if not math.isnan(mean_rank[variant.name]) else "-",
             *cells,
             "ok" if not result.checks else "; ".join(result.checks),
@@ -1959,7 +2087,7 @@ def main() -> None:
     mean_rank = {name: mean_objective_rank(ranks, name) for name in results}
     oracles = compute_oracles(inputs, variants, results)
 
-    render_summary_table(variants, results, ranks, mean_rank)
+    render_summary_table(variants, inputs, results, ranks, mean_rank)
 
     print(
         "\n  Cells are the objective, with its rank across variants in parentheses and 1\n"
