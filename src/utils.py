@@ -3308,7 +3308,14 @@ def ppl_eval(
     # --- Step 4: compute final perplexity ---
     # exp(mean NLL over all tokens) matches the original's
     # np.exp(torch.cat(nlls, dim=-1).mean().item())
-    ppl = torch.exp(torch.cat(nlls).mean()).item()
+    #
+    # The cast to fp64 is not cosmetic. With a fp16 model the per-token losses come
+    # out of the criterion in fp16, so both the mean and its exponential land on the
+    # fp16 grid: near perplexity 7.8 that grid is spaced 0.0039, and a screening
+    # ratio whose whole field of configurations spans 0.24 was being reported at
+    # 1.6% granularity, with distinct allocations colliding on one value. The
+    # methodology is untouched — still the uniform mean over every token position
+    ppl = torch.exp(torch.cat(nlls).to(torch.float64).mean()).item()
     print(f"[PPL EVAL] Perplexity: {ppl:.4f}")
     return ppl
 
