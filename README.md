@@ -499,10 +499,16 @@ python generate_tables.py ./output/eval/huggyllama_llama_7b \
 
 The gate report ranks configurations **within each ratio** and averages those ranks, never comparing raw perplexity between budgets, and reports the number of ratios each row was priced at so a partially-run configuration cannot quietly win. Every gate holds the dimensions it is not sweeping fixed and says which runs that excluded, since a later stage's sweep otherwise shares an earlier gate's axes and decides it through a dimension the stage was never comparing. The dimensions come from the sidecar, which is the only place most of them exist; a run without one is counted and left out.
 
-Two things it says out loud rather than leaving to the reader:
+Two gates need more than holding a dimension fixed, because they compare arms rather than settings:
+
+- The **outer-level gate** (stage 3c) additionally **intersects** the scores its arms share, and names the ones it dropped. A mean rank taken over cells one arm has and another does not lets the arm with the wider or better-behaved set win on its extra cells rather than on the factor under test. This gate also owns `__BEST_GROUPING__` from stage 3c onward, alongside `__BEST_OUTER__`: stage 2 can only nominate among the flat criteria, so leaving the placeholder there would hold every later stage at `decoder` however far ahead `hierarchical` finished.
+- The **policy gate** (stage 4) emits **one panel per grouping arm** plus a table of each policy's place across the arms, and reads `__BEST_INNER__` from the arm `__BEST_GROUPING__` names. Pooling the arms would rank the policies through the grouping instead of within it, and the two do not commute: a rank-space policy prices a rank at `out + in`, so it reallocates between matrix families wherever a group mixes shapes and is inert wherever every shape in a group is equal.
+
+Three things it says out loud rather than leaving to the reader:
 
 - A placeholder decided by a table holding a single entrant is marked **`provisional (1 candidate)`** instead of `ready`. It is a real value, but it reports the only run that has happened rather than a winner.
 - A ratio whose rows span less than 1% of its best value is flagged as **not resolvable**: the ranking there carries no information and the mean rank is decided by the other ratios.
+- A table whose runs come from more than one `--save_path` is flagged as **mixing run environments**, since their whitening caches are not the same input.
 
 ### `generate_text.py`
 

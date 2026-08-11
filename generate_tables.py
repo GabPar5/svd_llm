@@ -1249,12 +1249,15 @@ RESOLUTION_SPREAD = 0.01
 PLACEHOLDER_SOURCES: Dict[str, str] = {
     "__CKPT_HOM_0.2__": "stage 1",
     "__CKPT_HOM_0.5__": "stage 1",
-    "__BEST_GROUPING__": "stage 2",
+    "__BEST_GROUPING__": "stage 2, re-resolved by 3c",
     "__BEST_FLAT_GROUPING__": "stage 2",
     "__TOP1_SCORE__": "stage 2, promotable by 2b or 2c",
     "__TOP2_SCORE__": "stage 2",
     "__CKPT_BEST_SCORE_0.2__": "stage 2",
     "__CKPT_BEST_SCORE_0.5__": "stage 2",
+    "__BEST_OUTER__": "stage 3c",
+    "__CKPT_BEST_OUTER_0.2__": "stage 3c",
+    "__CKPT_BEST_OUTER_0.5__": "stage 3c",
     "__BEST_INNER__": "stage 4",
     "__CKPT_BEST_POLICY_0.2__": "stage 4",
     "__CKPT_BEST_POLICY_0.5__": "stage 4",
@@ -1270,7 +1273,7 @@ PLACEHOLDER_SOURCES: Dict[str, str] = {
 PLACEHOLDER_SOURCES.update({
     f"__FINALIST{index}_{role}__": "stages 2 to 6"
     for index in ( 1, 2, 3 )
-    for role in ( "GROUPING", "SCORE", "INNER" )
+    for role in ( "GROUPING", "SCORE", "INNER", "OUTER" )
 })
 
 # In rank order, because stages 2b and 2c re-resolve both of them together: a
@@ -1284,6 +1287,7 @@ OFFLINE_FIGURES = (
     "cap_binding",
     "influence_vs_effrank_rho",
     "ratio_by_type",
+    "ratio_tail",
 )
 
 
@@ -1656,6 +1660,62 @@ def best_checkpoints(pivot: List[PivotRow], prefix: str) -> Dict[str, Resolution
     return resolved
 
 
+def dominant_of(values: List[str]) -> str:
+    """The most common of a list, ties broken by name so a report is reproducible"""
+    counted = Counter(values)
+    return min(counted.items(), key=lambda item: ( -item[1], item[0] ))[0]
+
+
+def policy_interaction_table(pivots: Dict[str, List[PivotRow]]) -> Table:
+    """
+    The inner-policy ranking side by side across the grouping arms.
+
+    The point of running more than one arm is that the ranking is not expected to
+    agree, and a reader should not have to diff two panels to find out. Where the
+    orders differ, policy and grouping cannot be chosen independently, which is
+    itself an answer to RQ3 rather than an obstacle to one.
+    """
+    arms = sorted(pivots)
+    ranked = {arm: best_by(pivots[arm], 0) for arm in arms}
+    policies = sorted({policy for order in ranked.values() for policy, _ in order})
+    rows: List[List[Cell]] = []
+
+    for policy in policies:
+        cells = [Cell(text=f"`{policy}`")]
+
+        for arm in arms:
+            order = ranked[arm]
+            place = next((index for index, ( name, _ ) in enumerate(order) if name == policy), None)
+            mean = next((rank for name, rank in order if name == policy), None)
+            text = "-" if place is None else f"{place + 1} ({mean:.2f})"
+            cells.append(Cell(text=text, bold=place == 0))
+
+        rows.append(cells)
+
+    winners = {order[0][0] for order in ranked.values() if order}
+    notes = ["cells are the policy's place under that grouping, with its mean rank in parentheses"]
+
+    if len(winners) > 1:
+        notes.append(
+            "the arms disagree on the winner, so `__BEST_INNER__` is only valid alongside "
+            "`__BEST_GROUPING__`: report the interaction rather than a single policy"
+        )
+    else:
+        notes.append("the arms agree on the winner, so the policy choice survives a change of grouping")
+
+    return Table(
+        title="Stage 4 gate: policy ranking across grouping arms",
+        purpose=(
+            "Whether the inner policy can be chosen independently of the grouping. `drank_lagrangian` "
+            "prices a rank at `out + in`, so it is expected to move budget between matrix families "
+            "wherever a group mixes shapes and to be inert wherever every shape in a group is equal"
+        ),
+        headers=[ "inner_allocation", *(f"place under {arm}" for arm in arms) ],
+        rows=rows,
+        notes=notes,
+    )
+
+
 def dominant_value(rows: List[Dict[str, Any]], dimension: str) -> Optional[str]:
     """Whichever value of a dimension the most runs share, ties broken by name for reproducibility"""
     counted = Counter(dimension_text(dimension, row[dimension]) for row in rows if dimension in row)
@@ -1705,6 +1765,52 @@ def hold_at(
 def hold_dominant(rows: List[Dict[str, Any]], dimension: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     """`hold_at` the value the selection itself is mostly made of"""
     return hold_at(rows, dimension, dominant_value(rows, dimension))
+
+
+def hold_shared(
+        rows: List[Dict[str, Any]],
+        dimension: str,
+        across: str
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Drop values of `dimension` that not every value of `across` was run at.
+
+    A mean rank over cells one arm has and another does not is not an ablation:
+    the arm with the wider or better-behaved set wins on its extra cells rather
+    than on the factor under test. Intersecting first is what makes an aggregate
+    over arms mean "the same experiment, one factor changed".
+    """
+    per_arm: Dict[str, set] = defaultdict(set)
+
+    for row in rows:
+        if dimension in row and across in row:
+            per_arm[dimension_text(across, row[across])].add(dimension_text(dimension, row[dimension]))
+
+    if len(per_arm) < 2:
+        return rows, []
+
+    shared = set.intersection(*per_arm.values())
+    kept = [
+        row for row in rows
+        if dimension not in row or dimension_text(dimension, row[dimension]) in shared
+    ]
+
+    if len(kept) == len(rows):
+        return rows, []
+
+    dropped = sorted(set.union(*per_arm.values()) - shared)
+
+    if not shared:
+        return rows, [
+            f"no value of `{dimension}` was run under every `{across}`, so this table is not a "
+            f"controlled comparison: {', '.join(dropped)} each appear under one arm only"
+        ]
+
+    return kept, [
+        f"restricted to the `{dimension}` values every `{across}` was run at "
+        f"({', '.join(sorted(shared))}); {', '.join(dropped)} ran under one arm only and would let "
+        f"it win on cells the others never had"
+    ]
 
 
 def confound_notes(rows: List[Dict[str, Any]], axes: Tuple[str, ...]) -> List[str]:
@@ -2423,80 +2529,176 @@ def gate_stage2c_schatten(context: GateContext) -> GateResult:
     )
 
 
-def gate_stage4_policies(context: GateContext) -> GateResult:
-    """Stage 4 (RQ3): whether the policy spending a group budget matters apart from the score"""
-    grouping = resolved_value(context.resolved, "__BEST_GROUPING__")
-    top_scores = [resolved_value(context.resolved, name) for name in ( "__TOP1_SCORE__", "__TOP2_SCORE__" )]
-    top_scores = [score for score in top_scores if score]
+def gate_stage3c_outer(context: GateContext) -> GateResult:
+    """
+    Stage 3c: the outer level, which is the thesis contribution's own test.
 
-    inner_axes = ( "inner_allocation", "score_metric" )
-
-    def select_inner(row: Dict[str, Any]) -> bool:
-        return (
-            is_baseline_heterogeneous(row)
-            and row.get("outer_allocation") == DEFAULT_OUTER_ALLOCATION
-            and ( grouping is None or row.get("group_criterion") == grouping )
-            and ( not top_scores or row.get("score_metric") in top_scores )
-        )
-
-    inner_rows, inner_skipped = gate_rows(context.rows, inner_axes, select_inner)
-    inner_rows, inner_held = hold_dominant(inner_rows, "max_ratio")
-    inner_pivot = build_pivot(inner_rows, inner_axes, context.metric)
-
-    tables = [pivot_table(
-        title="Stage 4 gate: inner allocation policies",
-        purpose=(
-            "The four inner policies at the grouping and scores stage 2 chose. Their knobs must first "
-            "be matched on ratio dispersion, or this table prices shape and aggressiveness at once"
-        ),
-        pivot=inner_pivot,
-        axis_headers=[ "inner_allocation", "score_metric" ],
-        metric=context.metric,
-        baselines=homogeneous_baselines(context.rows, context.metric),
-        notes=[ *skipped_note(inner_skipped), *inner_held, *confound_notes(inner_rows, inner_axes) ],
-    )]
-
+    This gate owns `__BEST_GROUPING__` from here on. Stage 2 can only nominate
+    among the flat criteria, so leaving the placeholder with it would hold every
+    later stage at `decoder` however far ahead `hierarchical` finished — the
+    outer level is not on stage 2's ballot.
+    """
     # The score stays an axis rather than being fixed: the ablation is only
     # controlled when the two groupings are compared at the same score
-    outer_axes = ( "group_criterion", "outer_allocation", "inner_allocation", "score_metric" )
+    axes = ( "group_criterion", "outer_allocation", "inner_allocation", "score_metric" )
 
-    def select_outer(row: Dict[str, Any]) -> bool:
+    def select(row: Dict[str, Any]) -> bool:
         return is_baseline_heterogeneous(row) and row.get("group_criterion") in BLOCK_GROUPINGS
 
-    outer_rows, outer_skipped = gate_rows(context.rows, outer_axes, select_outer)
-    outer_rows, outer_held = hold_dominant(outer_rows, "max_ratio")
-    outer_pivot = build_pivot(outer_rows, outer_axes, context.metric)
+    rows, skipped = gate_rows(context.rows, axes, select)
+    rows, held = hold_dominant(rows, "max_ratio")
 
-    tables.append(pivot_table(
-        title="Stage 4 gate: the outer level",
+    # The inner policy has to be held, or the aggregate below compares an arm
+    # carrying every policy against one carrying a single policy and reads the
+    # difference as the outer level. `decoder` has the whole stage-4 block behind
+    # it, including two allocations that cost eleven and twenty perplexity
+    rows, inner_held = hold_dominant(rows, "inner_allocation")
+    rows, score_held = hold_shared(rows, "score_metric", "group_criterion")
+    pivot = build_pivot(rows, axes, context.metric)
+
+    tables = [pivot_table(
+        title="Stage 3c gate: the outer level",
         purpose=(
             "`decoder` + `param_share` against `hierarchical` + `waterfill`. The two criteria bucket "
             "matrices identically and differ only in whether Block Influence may move budget between "
             "blocks, which makes this the thesis contribution's own controlled test"
         ),
-        pivot=outer_pivot,
+        pivot=pivot,
         axis_headers=[ "group_criterion", "outer_allocation", "inner_allocation", "score_metric" ],
         metric=context.metric,
         baselines=homogeneous_baselines(context.rows, context.metric),
         notes=[
-            *skipped_note(outer_skipped),
-            *outer_held,
-            "report this apart from the inner-policy comparison: it answers a different question",
+            *skipped_note(skipped),
+            *held,
+            *inner_held,
+            *score_held,
+            "read `figures/ratio_tail.csv` beside this: the mechanism is whether `max_block_ratio` "
+            "leaves layer 0, and a win without that movement is a win for something else",
         ],
-    ))
+    )]
 
     resolved: Dict[str, Resolution] = {}
-    policies = best_by(inner_pivot, 0)
+    levels = best_by(pivot, 0)
 
-    if policies:
-        resolved["__BEST_INNER__"] = Resolution(value=policies[0][0], candidates=len(policies))
-        resolved.update(best_checkpoints(inner_pivot, "__CKPT_BEST_POLICY"))
+    if levels:
+        winner = levels[0][0]
+        resolved["__BEST_GROUPING__"] = Resolution(value=winner, candidates=len(levels))
+        resolved.update(best_checkpoints(pivot, "__CKPT_BEST_OUTER"))
+
+        # The outer policy travels with the criterion that won, because
+        # `hierarchical` + `param_share` reproduces `decoder` exactly and pairing
+        # the winner with the wrong policy would silently undo the stage
+        outer = [row.key[1] for row in pivot if row.key[0] == winner and row.mean_rank is not None]
+
+        if outer:
+            resolved["__BEST_OUTER__"] = Resolution(
+                value=dominant_of(outer),
+                candidates=len(set(outer)),
+            )
+
         tables.append(aggregate_table(
-            title="Stage 4 gate: inner policy aggregate",
-            purpose="Averaged over the scores and ratios it was run at, which is what decides `__BEST_INNER__`",
-            header="inner_allocation",
-            ranked=policies,
+            title="Stage 3c gate: grouping aggregate",
+            purpose=(
+                "Averaged over the scores, inner policies and ratios each criterion was run at, which "
+                "is what re-resolves `__BEST_GROUPING__` and picks `__BEST_OUTER__` alongside it"
+            ),
+            header="group_criterion",
+            ranked=levels,
         ))
+
+    tables += offline_tables(
+        context,
+        "3c",
+        figures=(
+            (
+                "ratio_tail",
+                "Stage 3c preview: where the block tail sits",
+                "`max_block_ratio` and its layer. The outer level earns its place by moving the worst "
+                "block off layer 0, and this is where that is visible before any GPU time is spent",
+            ),
+        ),
+    )
+
+    return GateResult(tables=tables, resolved=resolved)
+
+
+def gate_stage4_policies(context: GateContext) -> GateResult:
+    """Stage 4 (RQ3): whether the policy spending a group budget matters apart from the score"""
+    top_scores = [resolved_value(context.resolved, name) for name in ( "__TOP1_SCORE__", "__TOP2_SCORE__" )]
+    top_scores = [score for score in top_scores if score]
+
+    inner_axes = ( "inner_allocation", "score_metric" )
+
+    def select_arm(arm: str) -> Callable[[Dict[str, Any]], bool]:
+        def select(row: Dict[str, Any]) -> bool:
+            return (
+                is_baseline_heterogeneous(row)
+                and row.get("group_criterion") == arm
+                and ( not top_scores or row.get("score_metric") in top_scores )
+            )
+
+        return select
+
+    # One panel per grouping arm. Pooling them would rank the policies through
+    # the grouping instead of within it, and the two do not commute:
+    # `drank_lagrangian` prices a rank at `out + in`, so it reallocates between
+    # matrix families wherever a group mixes shapes and is inert wherever it
+    # does not
+    arms = sorted({
+        dimension_text("group_criterion", row["group_criterion"])
+        for row in context.rows
+        if is_baseline_heterogeneous(row) and row.get("group_criterion")
+    })
+
+    tables: List[Table] = []
+    pivots: Dict[str, List[PivotRow]] = {}
+
+    for arm in arms:
+        arm_rows, arm_skipped = gate_rows(context.rows, inner_axes, select_arm(arm))
+        arm_rows, arm_held = hold_dominant(arm_rows, "max_ratio")
+        arm_pivot = build_pivot(arm_rows, inner_axes, context.metric)
+
+        if not arm_pivot:
+            continue
+
+        pivots[arm] = arm_pivot
+        tables.append(pivot_table(
+            title=f"Stage 4 gate: inner allocation policies under `{arm}`",
+            purpose=(
+                f"The inner policies at `{arm}`, with the outer level whatever that criterion carries. "
+                "Their aggressiveness cannot be matched — only `--softmax_temp` is a live knob — so "
+                "report the dispersion beside the result rather than implying it was controlled"
+            ),
+            pivot=arm_pivot,
+            axis_headers=[ "inner_allocation", "score_metric" ],
+            metric=context.metric,
+            baselines=homogeneous_baselines(context.rows, context.metric),
+            notes=[ *skipped_note(arm_skipped), *arm_held, *confound_notes(arm_rows, inner_axes) ],
+        ))
+
+    resolved: Dict[str, Resolution] = {}
+    grouping = resolved_value(context.resolved, "__BEST_GROUPING__")
+    deciding = pivots.get(grouping or "", [])
+
+    if deciding:
+        policies = best_by(deciding, 0)
+
+        if policies:
+            resolved["__BEST_INNER__"] = Resolution(value=policies[0][0], candidates=len(policies))
+            resolved.update(best_checkpoints(deciding, "__CKPT_BEST_POLICY"))
+            tables.append(aggregate_table(
+                title="Stage 4 gate: inner policy aggregate",
+                purpose=(
+                    f"Averaged over the scores and ratios each policy was run at, under `{grouping}` "
+                    "alone. `__BEST_INNER__` is read from the arm that will actually be used, because "
+                    "the policy ranking flips between arms"
+                ),
+                header="inner_allocation",
+                ranked=policies,
+            ))
+
+    if len(pivots) > 1:
+        tables.append(policy_interaction_table(pivots))
 
     tables += offline_tables(
         context,
@@ -2730,7 +2932,10 @@ def gate_stage6_composite(context: GateContext) -> GateResult:
 
 def gate_stage7_finalists(context: GateContext) -> GateResult:
     """Stage 7: the three configurations worth spending another model on"""
-    axes = ( "group_criterion", "score_metric", "inner_allocation" )
+    # `outer_allocation` is an axis rather than a held dimension because a finalist
+    # naming `hierarchical` is only reproducible with the outer policy that won
+    # beside it: `hierarchical` + `param_share` is `decoder` under another name
+    axes = ( "group_criterion", "score_metric", "inner_allocation", "outer_allocation" )
     rows, skipped = gate_rows(context.rows, axes, is_baseline_heterogeneous)
     rows, held = hold_dominant(rows, "max_ratio")
     pivot = build_pivot(rows, axes, context.metric)
@@ -2739,7 +2944,7 @@ def gate_stage7_finalists(context: GateContext) -> GateResult:
     resolved: Dict[str, Resolution] = {}
 
     for index, row in enumerate(finalists, start=1):
-        for role, position in ( ( "GROUPING", 0 ), ( "SCORE", 1 ), ( "INNER", 2 ) ):
+        for role, position in ( ( "GROUPING", 0 ), ( "SCORE", 1 ), ( "INNER", 2 ), ( "OUTER", 3 ) ):
             candidates = len({other.key[position] for other in pivot})
             resolved[f"__FINALIST{index}_{role}__"] = Resolution(value=row.key[position], candidates=candidates)
 
@@ -2758,7 +2963,7 @@ def gate_stage7_finalists(context: GateContext) -> GateResult:
             "`__FINALIST*__` placeholders, and the first also answers `__CKPT_HET_*__` for stage 10"
         ),
         pivot=pivot,
-        axis_headers=[ "group_criterion", "score_metric", "inner_allocation" ],
+        axis_headers=[ "group_criterion", "score_metric", "inner_allocation", "outer_allocation" ],
         metric=context.metric,
         baselines=homogeneous_baselines(context.rows, context.metric),
         notes=[
@@ -2946,6 +3151,7 @@ GATES: Tuple[Callable[[GateContext], GateResult], ...] = (
     gate_stage2b_squared,
     gate_stage2c_schatten,
     gate_stage3_cap,
+    gate_stage3c_outer,
     gate_stage4_policies,
     gate_stage5_bypass,
     gate_stage6_composite,
