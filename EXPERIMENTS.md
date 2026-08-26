@@ -314,19 +314,28 @@ collapses to one run because the cap never binds at the winner.
 ### Preview command
 
 ```bash
-python allocation_report.py \
-    --model "huggyllama/llama-7b" --run_v2 \
-    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
-    --ratio_scope all --compression_ratio 0.2 \
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --compression_ratio 0.2 \
     --sweep "group_criterion=global,type,decoder" \
     --sweep "score_metric=truncation,entropy,eff_rank" \
-    --out_dir ./output/allocation_reports/stage2 \
-    --plots
+    --out_dir ./output/allocation_reports/stage2 --plots
 ```
 
 `--sweep` is repeatable and taken as a cartesian product; anything not swept is passed as a plain flag
 and held fixed, exactly as `run_experiments.py` would pass it. `--plots` adds PNGs when matplotlib is
 installed; the CSVs are written either way.
+
+**No `--compress_*` flag means every family**, unlike `main.py` where each one opts in, and with all
+seven targeted the `all` and `selected` denominators coincide. That is why none of the per-stage
+commands below carries either flag; stage 6b, whose experiment *is* the target selection, is the one
+place both appear.
+
+**`waterfill` gets its own invocation wherever it appears.** It is the only outer policy and it is
+defined only on `hierarchical`, so crossing it with a `group_criterion` sweep fills the table with
+`rejected` rows and, because a rejection counts as a failed invariant, takes the exit code with
+them. Stages 3c, 4 and 4d therefore each carry two commands. A `map_distance` report that
+`hierarchical` + `param_share` allocates identically to `decoder` is the expected result and not a
+duplicated run: it is the equivalence stage 3c is built on.
 
 **Name `--out_dir` after the stage it previews**: `stage2`, `stage3c`, `stage4`, and so on under
 `output/allocation_reports/`. `generate_tables.py --allocation_dir` discovers stage directories by
@@ -534,13 +543,13 @@ Four cases end at step 2, with no GPU time at all:
 | 2b | `stage2b` | `matrices.csv`, `map_distance` | whether a `_sq` score allocates differently from the score it derives from |
 | 2c | `stage2c` | `matrices.csv`, `figures/dispersion.csv` | whether a Schatten norm is signal or rounding noise |
 | 3 | `stage3` | `figures/cap_binding.csv`, `map_distance` | that every cap binds, and that no two runs allocate the same way |
-| 3c | `stage3c` | `figures/layer_ratios.csv`, `ratio_tail` | whether the outer level moves the worst block off layer 0 at all |
-| 4 | `stage4` | `max_block_ratio` per policy, `figures/ratio_by_type.csv` | which policies the cap still lets past the screen, and where the shape bias lands |
+| 3c | `stage3c` + `stage3c_equivalence` | `figures/layer_ratios.csv`, `ratio_tail`; `map_distance` in the second | whether the outer level moves the worst block off layer 0, and that it is neutral under `param_share` |
+| 4 | `stage4` + `stage4_hierarchical` | `max_block_ratio` per policy, `figures/ratio_by_type.csv` | which policies the cap still lets past the screen, and where the shape bias lands |
 | 4c | `stage4c` | `max_block_ratio` against `--outer_offset` | the ladder's usable range, which is not monotone |
-| 4d | `stage4d` | `max_block_ratio` per temperature | which temperatures are runnable at each ratio |
+| 4d | `stage4d` + `stage4d_hierarchical` | `max_block_ratio` per temperature | which temperatures are runnable at each ratio and under each depth regime |
 | 5, 5b | `stage5` | the exit code and `checks` | whether the bypassed budgets are feasible under the cap |
 | 6 | `stage6` | `figures/dispersion.csv`, plus the stage 0 rho | the offset for the fused score, and that the three alphas allocate distinctly |
-| 6b | `stage6b` | the exit code | which selections can absorb the budget at all; the screen stands down here |
+| 6b | `stage6b`, `_mlp`, `_attention` | the exit code | which selections can absorb the budget at all; the screen stands down here |
 | 7 | `stage0` again, per model | the rho sign, `figures/scores_by_depth.csv` | whether the finalists transfer |
 | 8 | `stage8` | the `<objective>_oracle_ratio` columns | the shape claim, made offline and never costing a run |
 | 9, 10 | none | | both load existing checkpoints and allocate nothing |
@@ -555,8 +564,7 @@ Re-run stage 0 whenever the whitening cache changes.
 
 ```bash
 python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
-    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
-    --ratio_scope all --sweep "compression_ratio=0.2,0.5" \
+    --sweep "compression_ratio=0.2,0.5" \
     --out_dir ./output/allocation_reports/stage0 --plots
 ```
 
@@ -579,6 +587,9 @@ before stage 6 is worth running.
 
 Every gain figure in the grid is measured against these two, and every checkpoint role that names a
 homogeneous arm points at them, so they are kept on disk permanently.
+
+**Preview.** None. A homogeneous run assigns the target ratio to every matrix, so there is no
+allocation to inspect and `allocation_report.py` has nothing to add.
 
 **Read the gate.**
 
@@ -612,6 +623,16 @@ are the expensive part of this stage.
 number is the resolution of the whole grid: any later difference smaller than it is not a result, and
 the gate report's low-spread note should be read against it rather than against a guess.
 
+**Preview.** None. Both arms are already covered by the stage 1 and stage 2 previews, and a change
+of seed changes the calibration draw rather than the allocator.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage1b.md
+```
+
 **Gate.** Reporting only. Nothing downstream is held on it, but every table that ranks two rows should
 cite it.
 
@@ -626,6 +647,16 @@ cite it.
 
 `hierarchical` is deliberately absent: with `param_share` it reproduces `decoder` exactly, and with
 `waterfill` it is stage 3c's experiment rather than this one's.
+
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "group_criterion=global,type,decoder" \
+    --sweep "score_metric=truncation,entropy,eff_rank" \
+    --out_dir ./output/allocation_reports/stage2 --plots
+```
 
 **Read the gate.**
 
@@ -658,14 +689,32 @@ python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
 **Runs.** 6, `args/experiments_stage2b_squared.json`: the three squared scores under
 `__BEST_GROUPING__` at both ratios.
 
-**Offline first.** `map_distance` against the unsquared incumbent. A squared score whose ratio map
-matches the score it derives from cannot win a promotion, and the run can be dropped without a GPU.
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion __BEST_GROUPING__ \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "score_metric=truncation,truncation_sq,entropy,entropy_sq,eff_rank,eff_rank_sq" \
+    --out_dir ./output/allocation_reports/stage2b
+```
+
+Each unsquared score is swept beside its squared counterpart on purpose, so that
+`map_distance` pairs them: a squared score whose ratio map matches the score it derives from
+cannot win a promotion, and the run can be dropped without a GPU.
 
 **What to check in it.** The promotion table, and specifically whether a score wins at one ratio and
 loses at the other. On the pilot `eff_rank_sq` was the single best run at 0.2 (7.625 against 7.789)
 and third-worst at 0.5 (34.44), which is the ratio-dependence finding above. **A score that wins only
 at one budget must not take a `__TOP*_SCORE__` slot** — say so in the thesis and leave the incumbent
 in place, because every later stage runs at both.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage2b.md
+```
 
 **Gate.** May promote either `__TOP1_SCORE__` or `__TOP2_SCORE__`.
 
@@ -682,6 +731,26 @@ catastrophe (33.44 at 0.5, block 0 above the screen) — and the conditional `no
 been dropped rather than kept as a placeholder. Re-running the two is still worth it: they bracket the
 family, and "the extremes of the Schatten family are homogeneous and catastrophic respectively" is a
 cleaner sentence with fresh numbers behind it.
+
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion __BEST_GROUPING__ \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "score_metric=norm|1,norm|inf,__TOP1_SCORE__" \
+    --out_dir ./output/allocation_reports/stage2c
+```
+
+The pipe in `norm|1` is inside a quoted `--sweep` value, so the shell leaves it alone. The
+incumbent rides along to give `map_distance` something to pair the two norms against.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage2c.md
+```
 
 **Gate.** May promote either score placeholder. Same one-ratio rule as 2b.
 
@@ -709,6 +778,23 @@ rows at the winner are kept to show exactly that, not to sweep it.
 - `max_block_ratio` at each cap. The cap bounds a matrix, not a block, which is why it only partly
   rescues a run whose block 0 is at 0.76.
 
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --compression_ratio 0.5 --score_metric truncation \
+    --sweep "group_criterion=global,type" \
+    --sweep "max_ratio=0.6,0.7,0.8,0.85,0.9" \
+    --out_dir ./output/allocation_reports/stage3
+```
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage3.md
+```
+
 **Gate.** `--max_ratio` into `args/base_args.json`. Expect it to stay at 0.9.
 
 ---
@@ -735,9 +821,30 @@ identically and differ only in that.
 Its baselines already exist in stage 2 and stage 3, and `hierarchical` + `param_share` reproduces
 `decoder` exactly, so the outer policy is the only factor moving.
 
-**Offline first.** `figures/layer_ratios.csv` and `ratio_tail`. If the outer level is doing what it
-should, `max_block_ratio` leaves layer 0 — on the pilot cache it moves to L27 and block 0 falls from
-0.500 to 0.346. A win without that movement is a win for something else.
+**Preview.** Two invocations rather than one crossed sweep, because `waterfill` is only defined on
+`hierarchical` and crossing the two would fill a third of the table with `rejected` rows and take
+the exit code with them:
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "group_criterion=decoder,hierarchical" \
+    --sweep "score_metric=truncation,__TOP1_SCORE__" \
+    --out_dir ./output/allocation_reports/stage3c_equivalence
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion hierarchical --outer_allocation waterfill \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "score_metric=truncation,__TOP1_SCORE__" \
+    --out_dir ./output/allocation_reports/stage3c --plots
+```
+
+The first exists to be boring: `map_distance` should report every `hierarchical` cell as identical
+to its `decoder` twin, which is the equivalence this stage rests on, and a difference there means
+the outer level is not neutral under `param_share` and the ablation is not controlled.
+The second is the arm under test. Read `figures/layer_ratios.csv` and `ratio_tail` from it: if the
+outer level is doing what it should, `max_block_ratio` leaves layer 0 — on the pilot cache it moves
+to L27 and block 0 falls from 0.500 to 0.346. A win without that movement is a win for something
+else.
 
 **What to check in it.**
 
@@ -749,6 +856,13 @@ should, `max_block_ratio` leaves layer 0 — on the pilot cache it moves to L27 
 - The two control rows against their siblings.
 - Ratio 0.2 separately. The pilot's -0.08 there is the size of the environment offset; with one
   machine and the fp64 metric this is finally answerable.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage3c.md
+```
 
 **Gate.** `__BEST_GROUPING__` (re-resolved), `__BEST_OUTER__`, `__CKPT_BEST_OUTER_*__`. Whichever of
 the two pairs wins is the configuration stages 4 onward are held at.
@@ -784,6 +898,27 @@ under `decoder` (23.16 against `waterfill`'s 23.91) and the worst under `type` (
 same peak lands one-or-two-per-block on q and k in the first case and hollows out blocks 0 to 2 across
 all seven families in the second. If that reproduces, the interaction is the RQ3 answer and a single
 `__BEST_INNER__` is meaningless without `__BEST_GROUPING__` beside it.
+
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --score_metric __TOP1_SCORE__ \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "group_criterion=decoder,type" \
+    --sweep "inner_allocation=waterfill,drank_lagrangian,swift_pool,softmax_temp" \
+    --out_dir ./output/allocation_reports/stage4 --plots
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --score_metric __TOP1_SCORE__ \
+    --group_criterion hierarchical --outer_allocation waterfill \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "inner_allocation=waterfill,drank_lagrangian,swift_pool,softmax_temp" \
+    --out_dir ./output/allocation_reports/stage4_hierarchical
+```
+
+One score is enough for both: the preview answers the block screen per policy and the shape bias
+in `figures/ratio_by_type.csv`, and neither depends on which score ranks the matrices. The gate
+attaches the unsuffixed directory, so the hierarchical arm is read by hand.
 
 **Read the gate.**
 
@@ -838,6 +973,27 @@ level. 1.05 is included as the danger control precisely because the screen rejec
 the optimum is the same at both ratios. If it is not, `--outer_offset` is budget-dependent and the
 thesis has to say so rather than quoting one value.
 
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion hierarchical --outer_allocation waterfill \
+    --score_metric __TOP1_SCORE__ --inner_allocation __BEST_INNER__ \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "outer_offset=1.05,1.2,1.5,2.0,3.0,6.0" \
+    --out_dir ./output/allocation_reports/stage4c --plots
+```
+
+This is the preview the table above came from, so it doubles as a check that the cache still
+reproduces it. `figures/layer_ratios.csv` is the figure: the ladder is a family of depth profiles.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage4c.md
+```
+
 **Gate.** Reporting, plus the offset every later stage runs at if it is not the default.
 
 ---
@@ -854,7 +1010,24 @@ or a point on the way up.
 This replaces the pilot's stage 3b, which ran the ladder at ratio 0.2 only and against a score that
 turned out to be a one-ratio winner.
 
-**Offline first, and expect rejections.** Lower temperatures pin matrices at the cap: on the pilot
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --inner_allocation softmax_temp --score_metric __TOP1_SCORE__ \
+    --group_criterion decoder \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "softmax_temp=0.15,0.25,0.35,0.5,1.0" \
+    --out_dir ./output/allocation_reports/stage4d
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --inner_allocation softmax_temp --score_metric __TOP1_SCORE__ \
+    --group_criterion hierarchical --outer_allocation waterfill \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "softmax_temp=0.15,0.25,0.35,0.5,1.0" \
+    --out_dir ./output/allocation_reports/stage4d_hierarchical
+```
+
+**Expect rejections, and honour them.** Lower temperatures pin matrices at the cap: on the pilot
 cache, temperature 0.2 and 0.05 pinned a seventh of all matrices at ratio **0.2**, which the screen
 rejects outright. Run only the temperatures that survive, and record which were rejected and why —
 a rejected temperature is a finding about the policy.
@@ -863,6 +1036,13 @@ a rejected temperature is a finding about the policy.
 `decoder` the aggressive allocation has nowhere to concentrate except within a block; under
 `hierarchical` the outer level has already spent the depth budget, so the same temperature may be too
 much. That interaction is the reason both arms are here.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage4d.md
+```
 
 **Gate.** Reporting, plus the temperature `__BEST_INNER__` is quoted at if it is `softmax_temp`.
 
@@ -892,9 +1072,25 @@ inverted depth profile cost 1.72 and 1.28 perplexity. Under `decoder` + `eff_ran
 sane, so this stage is a fair test rather than a rerun of that — but the burden of proof is on the
 bypass.
 
-**Offline first.** Bypassing pushes budget onto the rest, and at ratio 0.5 with eight blocks skipped
-the remainder may not absorb it under the cap. That surfaces as a budget-drift violation and a
-non-zero exit, for free.
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion decoder --score_metric __TOP1_SCORE__ \
+    --inner_allocation __BEST_INNER__ \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "bypass_early_layers=-1,1,2,4,8" \
+    --sweep "bypass_late_layers=-1,1,2,4,8" \
+    --out_dir ./output/allocation_reports/stage5
+```
+
+The sweep is the full cross of the two ends, which covers the nine settings the stage runs and the
+combinations it does not, for the price of nothing. **It exits non-zero, and that is the point.**
+Bypassing pushes an exempt block's budget onto the rest, and one cell cannot absorb it: exempting
+eight blocks at each end at ratio 0.5 leaves sixteen of thirty-two blocks to carry the whole budget
+and lands at a realized 0.45 against a target of 0.50, a ten percent drift the cap will not let it
+close. That cell is not among the nine the stage runs, so the failure is information rather than a
+blocker: read `checks` in `summary.csv` and confirm the drift sits only there before dismissing it.
 
 **What to check in it.**
 
@@ -907,6 +1103,13 @@ non-zero exit, for free.
   block, so a setting safe at bypass 0 can cross the screen once eight are exempt.
 - Any missing heterogeneous cell, which means that setting was infeasible and the offline pass should
   have caught it.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage5.md
+```
 
 **Gate.** `__BEST_BYPASS_EARLY__`, `__BEST_BYPASS_LATE__`, `__CKPT_BEST_BYPASS_0.2__`.
 
@@ -950,6 +1153,27 @@ statement is this one.
 - `max_block_ratio`, since the fused score is what is supposed to keep the tail off the early blocks
   under a flat grouping. If it does not, the composite is not doing its job whatever the perplexity.
 
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion __BEST_FLAT_GROUPING__ \
+    --score_metric "composite|__TOP1_SCORE__|block_influence" \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "fusion_alpha=0.25,0.5,0.75" \
+    --out_dir ./output/allocation_reports/stage6 --plots
+```
+
+`figures/dispersion.csv` sets the offset for the fused score and shows whether the three alphas
+allocate distinctly; `figures/influence_vs_effrank_rho.csv` from stage 0 is what opens the stage.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage6.md
+```
+
 **Gate.** `__CKPT_BEST_COMPOSITE_0.2__`.
 
 ---
@@ -984,6 +1208,35 @@ this and says so instead of warning.
 If it does, the spectral machinery is confirming something simpler — that early attention is low rank
 — and the thesis should say so plainly and price the machinery against a hand-set family schedule.
 
+**Preview.** One invocation per selection, since the target set is a flag rather than a sweepable
+axis, and `--ratio_scope all` is what keeps the global budget comparable across them:
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 --ratio_scope all \
+    --compress_att_v --compress_att_out --compress_mlp \
+    --sweep "compression_ratio=0.2,0.5" \
+    --out_dir ./output/allocation_reports/stage6b
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 --ratio_scope all \
+    --compress_mlp \
+    --sweep "compression_ratio=0.2,0.5" \
+    --out_dir ./output/allocation_reports/stage6b_mlp
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 --ratio_scope all \
+    --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
+    --compression_ratio 0.2 \
+    --out_dir ./output/allocation_reports/stage6b_attention
+```
+
+Only the exit code and `checks` matter here: attention alone cannot absorb the budget at 0.5,
+which is why that arm is one ratio rather than two, and the tool says so rather than drifting off
+the target. The gate attaches the unsuffixed directory, so the other two are read by hand.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage6b.md
+```
+
 **Gate.** Reporting. This stage constrains the interpretation of RQ2 and RQ3 rather than any later
 run.
 
@@ -1008,6 +1261,24 @@ and 32B needs the JAX GPU eigendecomposition path.
 Spearman sign, the Block Influence profile across depth, and the score-versus-depth shape. The
 finalists are only expected to transfer where those agree, and where they disagree the interesting
 result is *which* of the three degrades.
+
+**Preview.** Stage 0 again, once per model, which is the gate on whether the finalists are even
+expected to transfer:
+
+```bash
+for model in "Qwen/Qwen2.5-7B" "Qwen/Qwen2.5-32B"; do
+    python allocation_report.py --model "$model" --run_v2 \
+        --sweep "compression_ratio=0.2,0.5" \
+        --out_dir "./output/allocation_reports/stage0_$(basename "$model")" --plots
+done
+```
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage7.md
+```
 
 **Gate.** Reporting. Nothing downstream depends on it.
 
@@ -1034,6 +1305,26 @@ than four hours and answers a question the thesis asks in its first chapter.
   screen explains RQ1, which is a much stronger claim than a gain table.
 - The `<objective>_oracle_ratio` columns, which make the shape claim offline and cost nothing.
 
+**Preview.**
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion __BEST_GROUPING__ --outer_allocation __BEST_OUTER__ \
+    --score_metric __TOP1_SCORE__ --inner_allocation __BEST_INNER__ \
+    --sweep "compression_ratio=0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8" \
+    --out_dir ./output/allocation_reports/stage8 --plots
+```
+
+The `<objective>_oracle_ratio` columns are the point: they divide out the budget's own
+contribution, which is the only way an objective compares across eight of them.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage8.md
+```
+
 **Gate.** Reporting, and the headline figure of the results chapter.
 
 ---
@@ -1059,6 +1350,15 @@ costs a compression run before this stage can start.
 - `merge_eval_results` means adding a task later cannot delete an earlier one, so a partial suite can
   be topped up rather than re-run.
 
+**Preview.** None. These runs load an existing checkpoint and allocate nothing.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage9.md
+```
+
 **Gate.** Reporting. These are the thesis's headline tables.
 
 ---
@@ -1075,6 +1375,15 @@ homogeneous anchors and the two heterogeneous winners, `lora` method, `trainer` 
 more of the homogeneous gap than the heterogeneous one, the two techniques compete; if it closes both
 equally, they compose, and the thesis can claim the allocation and the update are independent
 contributions.
+
+**Preview.** None. The update reuses the allocation its checkpoint was built with.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage10.md
+```
 
 **Gate.** Reporting.
 
