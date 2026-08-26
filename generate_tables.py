@@ -2787,6 +2787,236 @@ def gate_stage3_cap(context: GateContext) -> GateResult:
     return GateResult(tables=tables, resolved=resolved)
 
 
+def varying_labels(keys: List[Tuple[str, ...]], dimensions: Tuple[str, ...]) -> Dict[Tuple[str, ...], str]:
+    """
+    Name each configuration by the dimensions that actually differ between them.
+
+    A replicate table is keyed on every dimension so that two runs are only
+    pooled when they truly match, but printing all of them makes the row
+    unreadable and hides the one or two that identify it.
+    """
+    # Compared within one scheme, not across: a heterogeneous key differs from a
+    # homogeneous one on every allocation dimension simply because the second has
+    # none, and listing all of them says nothing about which row this is
+    scheme = dimensions.index("scheme") if "scheme" in dimensions else 0
+    families: Dict[str, List[Tuple[str, ...]]] = defaultdict(list)
+
+    for key in keys:
+        families[key[scheme]].append(key)
+
+    labels: Dict[Tuple[str, ...], str] = {}
+
+    for family, members in families.items():
+        varying = [
+            index for index in range(len(dimensions))
+            if index != scheme and len({key[index] for key in members}) > 1
+        ]
+
+        for key in members:
+            parts = [key[index] for index in varying if key[index] not in ( "", "--", "none", "None" )]
+            labels[key] = " / ".join([ family, *parts ])
+
+    return labels
+
+
+def gate_stage1b_replicates(context: GateContext) -> GateResult:
+    """
+    Stage 1b: how far apart two runs of the same configuration land.
+
+    The pipeline is deterministic given its whitening cache, so the spread this
+    reports is the spread of the calibration draw. It resolves nothing and is
+    read by every later table: a difference smaller than this is not a result.
+    """
+    # Two runs are replicates only if every dimension except the seed agrees.
+    # Keying on fewer than all of them lets a swept axis masquerade as noise: on
+    # the pilot corpus, keying on the grouping and score alone reported the cap
+    # sweep's six-perplexity range as the resolution of the grid
+    identity = ( "scheme", "matrices", *(d for d in GATE_DIMENSIONS if d != "seed") )
+    rows = [row for row in context.rows if is_compression_run(row)]
+    grouped: Dict[Tuple[str, ...], Dict[float, List[Tuple[str, float]]]] = defaultdict(lambda: defaultdict(list))
+
+    for row in rows:
+        value = as_float(row.get(context.metric))
+        ratio = as_float(row.get("compression_ratio"))
+
+        if value is None or ratio is None:
+            continue
+
+        key = tuple(dimension_text(axis, row.get(axis)) for axis in identity)
+        grouped[key][ratio].append(( dimension_text("seed", row.get("seed")), value ))
+
+    body: List[List[Cell]] = []
+    widest = 0.0
+    labels = varying_labels(sorted(grouped), identity)
+
+    for key in sorted(grouped):
+        for ratio in sorted(grouped[key]):
+            seeded = grouped[key][ratio]
+            values = [value for _, value in seeded]
+
+            # Two runs of one configuration at one seed are the same run written
+            # twice, not a replicate, so the seeds have to actually differ
+            if len(values) < 2 or len({seed for seed, _ in seeded}) < 2:
+                continue
+
+            spread = max(values) - min(values)
+            widest = max(widest, spread)
+            body.append([
+                Cell(text=labels[key]),
+                Cell(text=axis_text(ratio)),
+                Cell(text=str(len({seed for seed, _ in seeded}))),
+                Cell(text=fmt_ppl(min(values))),
+                Cell(text=fmt_ppl(max(values))),
+                Cell(text=f"{spread:.3f}", bold=True),
+            ])
+
+    notes = [
+        "a row needs two seeds of one otherwise identical configuration, so an empty table means the "
+        "replicates have not been run, or that they reused the shared whitening directory and collapsed "
+        "onto the same allocation",
+    ]
+
+    if body:
+        notes.append(
+            f"the widest spread is {widest:.3f}: treat any later difference below it as unresolved, and "
+            "read the low-spread notes on the other gates against this number rather than against 1%",
+        )
+
+    tables = [Table(
+        title="Stage 1b gate: the replicate floor",
+        purpose=(
+            "The same configuration run at more than one seed, which is the resolution of every "
+            "comparison in the grid. Each seed needs its own whitening directory or it reports zero"
+        ),
+        headers=[ "configuration", "ratio", "seeds", "best", "worst", "spread" ],
+        rows=body,
+        notes=notes,
+    )]
+
+    return GateResult(tables=tables, resolved={})
+
+
+def gate_stage4c_outer_offset(context: GateContext) -> GateResult:
+    """Stage 4c: how hard the outer level is allowed to reweight depth"""
+    axes = ( "outer_offset", )
+    score = resolved_value(context.resolved, "__TOP1_SCORE__")
+    inner = resolved_value(context.resolved, "__BEST_INNER__")
+
+    def select(row: Dict[str, Any]) -> bool:
+        return (
+            is_baseline_heterogeneous(row)
+            and row.get("outer_allocation") != DEFAULT_OUTER_ALLOCATION
+            and ( score is None or row.get("score_metric") == score )
+            and ( inner is None or row.get("inner_allocation") == inner )
+        )
+
+    rows, skipped = gate_rows(context.rows, axes, select)
+    rows, held = hold_dominant(rows, "max_ratio")
+    pivot = build_pivot(rows, axes, context.metric)
+
+    tables = [pivot_table(
+        title="Stage 4c gate: the outer offset ladder",
+        purpose=(
+            "The knob that sets how far Block Influence may move budget between blocks. It is not "
+            "monotone in danger: the default sits near a minimum of the worst block ratio, and the "
+            "largest values converge back onto `param_share`"
+        ),
+        pivot=pivot,
+        axis_headers=[ "outer_offset" ],
+        metric=context.metric,
+        baselines=homogeneous_baselines(context.rows, context.metric),
+        notes=[
+            *skipped_note(skipped),
+            *held,
+            *confound_notes(rows, axes),
+            "check the optimum against `max_block_ratio` from the offline ladder, and check whether it "
+            "is the same at both ratios: if it is not, the knob is budget-dependent",
+        ],
+    )]
+
+    tables += offline_tables(context, "4c")
+
+    return GateResult(tables=tables, resolved={})
+
+
+def gate_stage4d_temperature(context: GateContext) -> GateResult:
+    """Stage 4d: the one live inner-policy knob, under both depth regimes"""
+    axes = ( "group_criterion", "softmax_temp" )
+
+    def select(row: Dict[str, Any]) -> bool:
+        return is_baseline_heterogeneous(row) and row.get("inner_allocation") == "softmax_temp"
+
+    rows, skipped = gate_rows(context.rows, axes, select)
+    rows, held = hold_dominant(rows, "max_ratio")
+
+    # The stage runs one score, so a second one inside the selection belongs to
+    # stage 4 and would price the temperature together with the score
+    rows, score_held = hold_at(rows, "score_metric", resolved_value(context.resolved, "__TOP1_SCORE__"))
+    pivot = build_pivot(rows, axes, context.metric)
+
+    tables = [pivot_table(
+        title="Stage 4d gate: the temperature ladder",
+        purpose=(
+            "`--softmax_temp` under a grouping that flattens depth and one that reweights it. The "
+            "optimum is not expected to agree between the two, because the outer level has already "
+            "spent the depth budget in the second"
+        ),
+        pivot=pivot,
+        axis_headers=[ "group_criterion", "softmax_temp" ],
+        metric=context.metric,
+        baselines=homogeneous_baselines(context.rows, context.metric),
+        notes=[
+            *skipped_note(skipped),
+            *held,
+            *score_held,
+            *confound_notes(rows, axes),
+            "a temperature the offline screen rejected should be absent here; if it is present, it was "
+            "run against the screen and the row is a finding about the policy rather than a candidate",
+        ],
+    )]
+
+    tables += offline_tables(context, "4d")
+
+    return GateResult(tables=tables, resolved={})
+
+
+def gate_stage6b_family_budget(context: GateContext) -> GateResult:
+    """Stage 6b: which matrix families the budget should land on, selection by selection"""
+    axes = ( "matrices", )
+
+    def select(row: Dict[str, Any]) -> bool:
+        return is_compression_run(row) and row.get("scheme") == "hom" and bypasses_nothing(row)
+
+    rows, skipped = gate_rows(context.rows, axes, select)
+    rows, held = hold_dominant(rows, "ratio_scope")
+    pivot = build_pivot(rows, axes, context.metric)
+
+    tables = [pivot_table(
+        title="Stage 6b gate: the family budget",
+        purpose=(
+            "Homogeneous runs whose only difference is which families are compressed, with "
+            "`--ratio_scope all` holding the global removed parameters at the target. The score and the "
+            "policy are absent on purpose, so the family axis moves alone"
+        ),
+        pivot=pivot,
+        axis_headers=[ "matrices" ],
+        metric=context.metric,
+        baselines=homogeneous_baselines(context.rows, context.metric),
+        notes=[
+            *skipped_note(skipped),
+            *held,
+            *confound_notes(rows, axes),
+            "the all-families row is the stage 1 anchor, so a selection beating it means the budget is "
+            "better spent narrowly; `max_block_ratio` is a fraction of the selection here and its "
+            "threshold does not apply",
+        ],
+    )]
+
+    tables += offline_tables(context, "6b")
+
+    return GateResult(tables=tables, resolved={})
+
+
 def gate_stage5_bypass(context: GateContext) -> GateResult:
     """Stage 5 (RQ4): whether exempting outer blocks beats compressing everything"""
     axes = ( "bypass_early_layers", "bypass_late_layers" )
@@ -3147,14 +3377,18 @@ def gate_stage10_lora(context: GateContext) -> GateResult:
 
 GATES: Tuple[Callable[[GateContext], GateResult], ...] = (
     gate_stage1_anchors,
+    gate_stage1b_replicates,
     gate_stage2_score_grouping,
     gate_stage2b_squared,
     gate_stage2c_schatten,
     gate_stage3_cap,
     gate_stage3c_outer,
     gate_stage4_policies,
+    gate_stage4c_outer_offset,
+    gate_stage4d_temperature,
     gate_stage5_bypass,
     gate_stage6_composite,
+    gate_stage6b_family_budget,
     gate_stage7_finalists,
     gate_stage8_curve,
     gate_stage9_roster,

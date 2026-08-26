@@ -476,7 +476,7 @@ The script also reports the Spearman correlation between Block Influence and nor
 Turns a directory of evaluation JSONs into markdown or LaTeX tables. Two reports, selected with `--report`:
 
 - **`benchmarks`** (default) — the result tables, grouped by bypassed layers and compression ratio, with the best value per ratio highlighted and the uncompressed baseline shown as a faded row.
-- **`gates`** — one table per stage gate of `EXPERIMENTS.md`, plus a leading table resolving every `__PLACEHOLDER__` the next stage file waits on. This is the report to read when moving from one stage to the next.
+- **`gates`** — one table per stage gate of `EXPERIMENTS.md`, plus a leading table resolving every `__PLACEHOLDER__` the next stage file waits on. This is the report to read when moving from one stage to the next. Every stage has one, including the stages that resolve nothing: a reporting-only stage still needs its own comparison tabulated, and one of them, the replicate floor, is what every other table's differences have to clear.
 
 ```bash
 python generate_tables.py ./output/eval/Qwen_Qwen2.5_7B -f latex -o tables.tex
