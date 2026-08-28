@@ -395,11 +395,12 @@ The last three read the same policy signatures the sidecar reads, so `--offset` 
 
 The filename is parsed positionally and cannot carry every dimension of a run, so each run also writes `<run_name>.config.json` next to its checkpoint and next to its evaluation JSON:
 
-- `args` — the resolved command line (`--hf_token` is never persisted).
+- `args` — the resolved command line of the run that **compressed** the checkpoint (`--hf_token` is never persisted). An evaluation-only run leaves it alone: it was invoked without the compression flags, and their defaults would read back as a configuration nobody ran.
+- `eval_args` — the resolved command line of the latest evaluation, which is the one that wrote `evaluated_tasks`.
 - `allocation` — target vs **realized** removal, per-matrix `ratio_map`, the bypassed/active matrix counts, and the two policies together with the knobs that actually applied to them. Written by the compression step, so it exists even for runs that never evaluate.
 - `checkpoint_metadata` — the same metadata embedded in the `.pt`.
 
-`generate_tables.py` prefers this sidecar over `parse_filename` and falls back to filename parsing for runs that predate it, so old results keep tabulating unchanged. Sidecars are skipped when the input directory is globbed for results.
+`generate_tables.py` prefers this sidecar over `parse_filename` and falls back to filename parsing for runs that predate it, so old results keep tabulating unchanged. That fallback also covers a sidecar written before `args` was protected, where an evaluation-only run overwrote the compression's flags: `parse_filename` reads the same dimensions back out of the run name. Sidecars are skipped when the input directory is globbed for results.
 
 A run whose realized ratio drifts from its target by more than 0.1% prints a `[BUDGET][WARNING]`; allocation policies are only comparable at equal realized compression, so use `allocation.realized_overall_ratio` rather than the requested `--compression_ratio` when comparing.
 

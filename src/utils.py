@@ -2972,7 +2972,9 @@ def save_run_config(directory: str, run_name: str, config: Dict[str, Any]) -> st
     so it cannot express every dimension of a run. This sidecar is the
     authoritative record instead, and `generate_tables.py` prefers it over
     `parse_filename`. Writers are additive: the compression step records the
-    realized allocation, the entry point records the resolved arguments.
+    realized allocation, the entry point records the resolved arguments. Only
+    keys the caller passes are replaced, which is what lets an evaluation-only
+    run add its results without overwriting the compression that produced them.
     """
     os.makedirs(directory, exist_ok=True)
     path = run_config_path(directory, run_name)

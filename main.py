@@ -1068,20 +1068,35 @@ if __name__ == "__main__":
         with open(results_path, "w") as f:
             json.dump(results, f, default=handle_non_serializable, indent=2)
 
-        # generate_tables.py reads this in preference to parsing the filename.
-        # `args.eval_tasks` only records the latest invocation, so the union of
-        # what the file now holds is recorded beside it
+        # Whatever either side already recorded about this run name, so a second
+        # evaluation adds to the description rather than replacing it
+        recorded: Dict[str, Any] = {}
+        for recorded_path in (
+            run_config_path(os.path.join(args.save_path, "models", sanitize_model_name(args.model)), model_name),
+            run_config_path(model_eval_path, model_name),
+        ):
+            if os.path.exists(recorded_path):
+                with open(recorded_path, "r", encoding="utf-8") as config_file:
+                    recorded = { **recorded, **json.load(config_file) }
+
+        run_args = sanitize_run_args(vars(args))
         eval_config = {
-            "args": sanitize_run_args(vars(args)),
+            **recorded,
+            "eval_args": run_args,
+            # `args.eval_tasks` only records the latest invocation, so the union
+            # of what the file now holds is recorded beside it
             "evaluated_tasks": sorted(results.get("results", {})),
         }
-        compression_config_path = run_config_path(
-            os.path.join(args.save_path, "models", sanitize_model_name(args.model)),
-            model_name,
-        )
-        if os.path.exists(compression_config_path):
-            with open(compression_config_path, "r", encoding="utf-8") as config_file:
-                eval_config = {**json.load(config_file), **eval_config}
+
+        # generate_tables.py reads `args` in preference to parsing the filename,
+        # so a run that only evaluated somebody else's checkpoint must not
+        # overwrite it: it was invoked without the compression flags, and their
+        # defaults would read back as a configuration nobody ran. The update
+        # writes a checkpoint of its own, under a run name of its own
+        wrote_this_checkpoint = not args.compressed_model_path or args.update_taw_only
+
+        if wrote_this_checkpoint or "args" not in recorded:
+            eval_config["args"] = run_args
 
         save_run_config(
             directory=model_eval_path,
