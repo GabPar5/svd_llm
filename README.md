@@ -389,6 +389,8 @@ The `<bypassed>` token is a bare integer when only `--bypass_early_layers` is us
 
 The last three read the same policy signatures the sidecar reads, so `--offset` handed to a policy that ignores it does not fork the name into two entries for what is one run. Without these tokens a sweep over any single knob would leave every other token untouched and collapse the whole sweep onto one checkpoint.
 
+`parse_filename` reads all of this back out as raw flag values — positionally up to `<bypassed>`, then by pattern over the suffix, with a missing token meaning its default. That round trip is what still places a run whose sidecar describes a later evaluation instead of its own compression, so a new token needs its mirror in `GROUPING_FLAG_VALUES`, `INNER_ALLOCATION_TOKENS` / `OUTER_ALLOCATION_TOKENS` or `NAME_TOKEN_DEFAULTS`.
+
 ### Run Configuration Sidecar
 
 The filename is parsed positionally and cannot carry every dimension of a run, so each run also writes `<run_name>.config.json` next to its checkpoint and next to its evaluation JSON:

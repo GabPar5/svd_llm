@@ -112,6 +112,8 @@ SCORING_TOKENS = {
     "full_norm_sq_tail_eff_rank": "full_norm_sq_tail_eff_rank",
 }
 
+COMPOSITE_PREFIX = "composite|"
+
 # Local halves a composite metric can fuse, and what it can fuse them with
 COMPOSITE_LOCAL_TOKENS = (
     "truncation",
@@ -135,7 +137,7 @@ SCORING_TOKENS.update({
     spelling: f"composite_{local}_{end_to_end}"
     for local in COMPOSITE_LOCAL_TOKENS
     for end_to_end in END_TO_END_TOKENS
-    for spelling in ( f"composite|{local}|{end_to_end}", f"composite_{local}_{end_to_end}" )
+    for spelling in ( f"{COMPOSITE_PREFIX}{local}|{end_to_end}", f"composite_{local}_{end_to_end}" )
 })
 
 SCHEME_TOKENS = {
@@ -144,6 +146,41 @@ SCHEME_TOKENS = {
     "hom": "hom",
     "homogeneous": "hom",
 }
+
+# The policy and grouping spellings the gates filter on, as `src.utils` spells
+# them. This script stays import-free, so they are repeated rather than imported
+DEFAULT_INNER_ALLOCATION = "waterfill"
+DEFAULT_OUTER_ALLOCATION = "param_share"
+
+# `--group_criterion`, as the flag takes it. `GROUPING_TOKENS` maps to the table
+# label instead, and the two are a different string for `type`
+GROUPING_FLAG_VALUES = {
+    "global": "global",
+    "decoder": "decoder",
+    "hierarchical": "hierarchical",
+    "matrix_type": "type",
+    "matrix": "type",
+}
+
+# `_<inner>` and `_out<outer>`, the two suffix tokens carrying a name rather than
+# a number. `swift_pool` and the rest span two tokens, so they are matched by
+# joining ahead
+INNER_ALLOCATION_TOKENS = ( "waterfill", "drank_lagrangian", "swift_pool", "softmax_temp" )
+OUTER_ALLOCATION_TOKENS = ( "param_share", "waterfill" )
+POLICY_TOKEN_SPAN = 2
+
+# What a numeric suffix token spells, and the value `build_run_name` leaves the
+# token out at. A dimension with no token is a run that never moved it, which is
+# what makes a name parseable back into flag values
+NAME_TOKEN_DEFAULTS = (
+    ( "max_ratio", "cap", 0.9 ),
+    ( "seed", "seed", 6363 ),
+    ( "bypass_ratio", "bypr", 0.0 ),
+    ( "fusion_alpha", "fa", 0.5 ),
+    ( "offset", "off", 1.5 ),
+    ( "softmax_temp", "temp", 1.0 ),
+    ( "outer_offset", "ooff", 1.5 ),
+)
 
 # Sidecar written next to every result by main.py, see `save_run_config`
 RUN_CONFIG_SUFFIX = ".config.json"
@@ -343,6 +380,149 @@ def find_scoring(tokens: List[str], start_idx: int) -> Tuple[str, Optional[int],
     return "unknown", None, 0
 
 
+# `build_run_name` keeps the bare integer for an early-only bypass, so both
+# spellings have to parse or a `byp0-1` run loses everything past its score
+BYPASS_RANGE_PATTERN = re.compile(r"byp(\d+)-(\d+)")
+
+
+def parse_bypass_token(token: str) -> Optional[Tuple[int, int]]:
+    """The two ends a bypass token names, or None when the token is not one"""
+    match = BYPASS_RANGE_PATTERN.fullmatch(token)
+
+    if match is not None:
+        return int(match.group(1)), int(match.group(2))
+
+    return ( int(token), 0 ) if is_int_token(token) else None
+
+
+def score_metric_from_tokens(joined: str) -> str:
+    """
+    The `--score_metric` value a filename's scoring tokens spell.
+
+    `find_scoring` answers with the table label, which is what a row is displayed
+    under; a gate filters on the flag value instead, and a resolved placeholder
+    is pasted back into a stage file as one
+    """
+    for end_to_end in END_TO_END_TOKENS:
+        prefix, suffix = "composite_", f"_{end_to_end}"
+
+        if joined.startswith(prefix) and joined.endswith(suffix):
+            return f"{COMPOSITE_PREFIX}{joined[len(prefix):-len(suffix)]}|{end_to_end}"
+
+    return "truncation" if joined == "truncation_loss" else joined
+
+
+def numeric_suffix(token: str, prefix: str) -> Optional[float]:
+    """The number a `<prefix><value>` token carries, or None when it is not one"""
+    if not token.startswith(prefix):
+        return None
+
+    try:
+        return float(token[len(prefix):])
+    except ValueError:
+        return None
+
+
+def inner_allocation_at(tokens: List[str], start: int) -> Tuple[Optional[str], int]:
+    """The inner policy the tokens at `start` spell, and how many they took"""
+    for end in range(min(len(tokens), start + POLICY_TOKEN_SPAN), start, -1):
+        candidate = "_".join(tokens[start:end])
+
+        if candidate in INNER_ALLOCATION_TOKENS:
+            return candidate, end - start
+
+    return None, 1
+
+
+def suffix_dimensions(tokens: List[str]) -> Dict[str, Any]:
+    """
+    The policies and knobs `build_run_name` appends after the bypass token.
+
+    They are read by pattern rather than by position: a token is emitted only for
+    a dimension that left its default, so which of them are present, and in what
+    order, differs from run to run
+    """
+    found: Dict[str, Any] = {}
+    index = 0
+
+    while index < len(tokens):
+        token = tokens[index]
+        step = 1
+        outer = next((name for name in OUTER_ALLOCATION_TOKENS if token == f"out{name}"), None)
+        inner, inner_span = inner_allocation_at(tokens, index)
+
+        if outer is not None:
+            found["outer_allocation"] = outer
+        elif inner is not None:
+            found["inner_allocation"] = inner
+            step = inner_span
+        else:
+            for name, prefix, _ in NAME_TOKEN_DEFAULTS:
+                value = numeric_suffix(token, prefix)
+
+                if value is not None:
+                    found[name] = value
+                    break
+
+        index += step
+
+    return found
+
+
+def run_name_dimensions(
+        tokens: List[str],
+        scheme: str,
+        ratio_idx: Optional[int],
+        suffix_start: int,
+        group_criterion: Optional[str],
+        score_metric: Optional[str],
+        bypass: Optional[Tuple[int, int]]
+) -> Dict[str, Any]:
+    """
+    The raw flag values the run name encodes, which is what a gate compares on.
+
+    The sidecar outranks these wherever it speaks, but a run that only evaluated
+    an existing checkpoint was invoked without the flags that produced it: its
+    sidecar records the evaluation, and the name is the only thing left that
+    still describes the compression.
+    """
+    if scheme not in ( "het", "hom" ):
+        return {}
+
+    heterogeneous = scheme == "het"
+    early, late = bypass if bypass is not None else ( 0, 0 )
+
+    dimensions: Dict[str, Any] = {
+        "bypass_early_layers": early,
+        "bypass_late_layers": late,
+    }
+
+    if ratio_idx is not None and ratio_idx > 0 and tokens[ratio_idx - 1] not in MATRIX_TOKEN_MAP:
+        dimensions["ratio_scope"] = tokens[ratio_idx - 1]
+
+    from_suffix = suffix_dimensions(tokens[suffix_start:])
+
+    if heterogeneous:
+        dimensions["inner_allocation"] = from_suffix.get("inner_allocation", DEFAULT_INNER_ALLOCATION)
+        dimensions["outer_allocation"] = from_suffix.get("outer_allocation", DEFAULT_OUTER_ALLOCATION)
+
+        if group_criterion is not None:
+            dimensions["group_criterion"] = group_criterion
+
+        if score_metric is not None:
+            dimensions["score_metric"] = score_metric
+
+    # A homogeneous run allocates nothing, so the knobs a policy reads would
+    # group it under a decision it never took
+    for name, _, default in NAME_TOKEN_DEFAULTS:
+        if name in HET_ONLY_DIMENSIONS and not heterogeneous:
+            continue
+
+        dimensions[name] = from_suffix.get(name, default)
+
+    return dimensions
+
+
 def parse_filename(path: Path) -> Dict[str, Any]:
     """
     Supported filename styles:
@@ -353,10 +533,15 @@ def parse_filename(path: Path) -> Dict[str, Any]:
     Heterogeneous compression:
         Qwen_Qwen2.5_32B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_8_v2.json
         Qwen_Qwen2.5_32B_q_k_v_out_mlp_selected_0.2_het_decoder_truncation_8_v2.json
+        Qwen_Qwen2.5_32B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_byp2-4_softmax_temp_cap0.8_v2.json
 
     Homogeneous compression:
         huggyllama_llama_7b_q_k_v_out_mlp_all_0.2_hom_8_v2.json
         huggyllama_llama_7b_q_k_v_out_mlp_selected_0.2_hom_8_v2.json
+
+    Alongside the display columns the tables are grouped by, the raw flag values
+    the name encodes come back too, so a run whose sidecar describes a later
+    evaluation rather than its own compression is still placed by every gate
     """
 
     tokens = normalize_filename_stem(path)
@@ -427,47 +612,37 @@ def parse_filename(path: Path) -> Dict[str, Any]:
 
     grouping = "--"
     scoring = "--"
-    bypassed_layers = 0
+    group_criterion = None
+    score_metric = None
+    bypass = None
+    suffix_start = len(tokens)
+    scheme_end = scheme_idx + 1 if scheme_idx is not None else len(tokens)
+    names_an_allocation = scheme != "hom" and scheme_end < len(tokens)
 
-    if scheme == "het":
-        if scheme_idx is not None and scheme_idx + 1 < len(tokens):
-            next_tok = tokens[scheme_idx + 1]
-            if next_tok in GROUPING_TOKENS:
-                grouping = GROUPING_TOKENS[next_tok]
-                score_start = scheme_idx + 2
-            else:
-                score_start = scheme_idx + 1
+    # A malformed name is read like a heterogeneous one: the tokens it does carry
+    # still place the grouping and the score
+    if names_an_allocation:
+        score_start = scheme_end
 
-            scoring, scoring_idx, scoring_token_count = find_scoring(tokens, score_start)
-            if scoring_idx is not None:
-                bypass_idx = scoring_idx + scoring_token_count
-                if bypass_idx < len(tokens) and is_int_token(tokens[bypass_idx]):
-                    bypassed_layers = int(tokens[bypass_idx])
+        if tokens[score_start] in GROUPING_TOKENS:
+            grouping = GROUPING_TOKENS[tokens[score_start]]
+            group_criterion = GROUPING_FLAG_VALUES.get(grouping)
+            score_start += 1
+
+        scoring, scoring_idx, scoring_token_count = find_scoring(tokens, score_start)
+
+        if scoring_idx is not None:
+            suffix_start = scoring_idx + scoring_token_count
+            score_metric = score_metric_from_tokens("_".join(tokens[scoring_idx:suffix_start]))
 
     elif scheme == "hom":
-        grouping = "--"
-        scoring = "--"
+        suffix_start = scheme_end
 
-        if scheme_idx is not None:
-            bypass_idx = scheme_idx + 1
-            if bypass_idx < len(tokens) and is_int_token(tokens[bypass_idx]):
-                bypassed_layers = int(tokens[bypass_idx])
+    if suffix_start < len(tokens):
+        bypass = parse_bypass_token(tokens[suffix_start])
 
-    else:
-        # Fallback for malformed names
-        if scheme_idx is not None and scheme_idx + 1 < len(tokens):
-            candidate = tokens[scheme_idx + 1]
-            if candidate in GROUPING_TOKENS:
-                grouping = GROUPING_TOKENS[candidate]
-                score_start = scheme_idx + 2
-            else:
-                score_start = scheme_idx + 1
-
-            scoring, scoring_idx, scoring_token_count = find_scoring(tokens, score_start)
-            if scoring_idx is not None:
-                bypass_idx = scoring_idx + scoring_token_count
-                if bypass_idx < len(tokens) and is_int_token(tokens[bypass_idx]):
-                    bypassed_layers = int(tokens[bypass_idx])
+    if bypass is not None:
+        suffix_start += 1
 
     return {
         "file": path.name,
@@ -481,8 +656,17 @@ def parse_filename(path: Path) -> Dict[str, Any]:
         "scheme": scheme,
         "grouping": grouping,
         "scoring": scoring,
-        "bypassed_layers": bypassed_layers,
+        "bypassed_layers": sum(bypass) if bypass is not None else 0,
         "filename_version": version,
+        **run_name_dimensions(
+            tokens=tokens,
+            scheme=scheme,
+            ratio_idx=ratio_idx,
+            suffix_start=suffix_start,
+            group_criterion=group_criterion,
+            score_metric=score_metric,
+            bypass=bypass,
+        ),
     }
 
 
@@ -1208,12 +1392,6 @@ def collect_rows(
 # to paste into the next stage
 # ---------------------------------------------------------------------------
 
-COMPOSITE_PREFIX = "composite|"
-
-# The policy and grouping spellings the gates filter on, as `src.utils` spells
-# them. This script stays import-free, so they are repeated rather than imported
-DEFAULT_INNER_ALLOCATION = "waterfill"
-DEFAULT_OUTER_ALLOCATION = "param_share"
 BLOCK_GROUPINGS = ( "decoder", "hierarchical" )
 
 # Block Influence is constant inside a decoder block, so a fused score cannot
