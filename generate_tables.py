@@ -1723,6 +1723,26 @@ def build_pivot(rows: List[Dict[str, Any]], axes: Tuple[str, ...], metric: str) 
     return sorted(pivot, key=lambda item: item.mean_rank if item.mean_rank is not None else math.inf)
 
 
+def anchor_matrices(rows: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    The family selection the grid is run at, and so the only `hom` arm anchoring it.
+
+    Stage 6b sweeps that selection on homogeneous runs alone, so its rows answer
+    every filter asking for `hom` and, left in, decide the baseline -- and with it
+    the gain every other gate reports. The heterogeneous runs are what the grid is
+    made of, so the family they share is the one to read the anchors at.
+    """
+    heterogeneous = [row for row in rows if is_compression_run(row) and row.get("scheme") == "het"]
+    compressed = heterogeneous or [row for row in rows if is_compression_run(row)]
+
+    return dominant_value(compressed, "matrices")
+
+
+def is_anchor_family(row: Dict[str, Any], family: Optional[str]) -> bool:
+    """Whether a run compresses the selection the grid is anchored on"""
+    return family is None or axis_text(row.get("matrices")) == family
+
+
 def build_gain_rows(rows: List[Dict[str, Any]], axes: Tuple[str, ...], metric: str) -> List[GainRow]:
     """
     Pair each configuration's heterogeneous arm with its homogeneous one.
@@ -1730,8 +1750,10 @@ def build_gain_rows(rows: List[Dict[str, Any]], axes: Tuple[str, ...], metric: s
     The homogeneous arm is not padding: the gain over it at the same setting is
     the only quantity that separates a stage's mechanism from the budget itself.
     """
+    family = anchor_matrices(rows)
     het = {row.key: row for row in build_pivot([row for row in rows if row.get("scheme") == "het"], axes, metric)}
-    hom = {row.key: row for row in build_pivot([row for row in rows if row.get("scheme") == "hom"], axes, metric)}
+    hom_rows = [row for row in rows if row.get("scheme") == "hom" and is_anchor_family(row, family)]
+    hom = {row.key: row for row in build_pivot(hom_rows, axes, metric)}
 
     ratios = sorted({
         ratio
@@ -1767,12 +1789,14 @@ def build_gain_rows(rows: List[Dict[str, Any]], axes: Tuple[str, ...], metric: s
 
 def homogeneous_baselines(rows: List[Dict[str, Any]], metric: str, bypassed: int = 0) -> Dict[float, Optional[float]]:
     """The homogeneous anchor at each ratio, the floor every heterogeneous stage is read against"""
+    family = anchor_matrices(rows)
     baselines: Dict[float, Optional[float]] = {}
 
     for row in rows:
         is_anchor = (
             is_compression_run(row)
             and row.get("scheme") == "hom"
+            and is_anchor_family(row, family)
             and int(as_float(row.get("bypassed_layers")) or 0) == bypassed
         )
 
@@ -2476,16 +2500,29 @@ def dense_perplexity_notes(row: Dict[str, Any], rows: List[Dict[str, Any]]) -> L
 
 def gate_stage1_anchors(context: GateContext) -> GateResult:
     """Stage 1: the dense floor and the homogeneous anchors every later table is read against"""
+    family = anchor_matrices(context.rows)
+
     def select(row: Dict[str, Any]) -> bool:
         if row.get("is_original"):
             return True
 
-        return is_compression_run(row) and row.get("scheme") == "hom" and bypasses_nothing(row)
+        return (
+            is_compression_run(row)
+            and row.get("scheme") == "hom"
+            and bypasses_nothing(row)
+            and is_anchor_family(row, family)
+        )
 
     rows = sorted((row for row in context.rows if select(row)), key=sort_rows_hierarchical)
     resolved: Dict[str, Resolution] = {}
     notes: List[str] = []
     body: List[List[Cell]] = []
+
+    if family is not None:
+        notes.append(
+            f"held at the `{family}` selection the grid is run at, so stage 6b's narrower families "
+            "cannot stand in for an anchor a heterogeneous run is measured against",
+        )
 
     for row in rows:
         dense = bool(row.get("is_original"))
