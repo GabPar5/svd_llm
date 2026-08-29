@@ -423,7 +423,10 @@ if __name__ == "__main__":
         help=(
             "Score metric used for weight importance during heterogeneous ratio "
             "allocation. Possible values are \"truncation\", \"entropy\" and \"eff_rank\", "
-            "each with a squared-spectrum variant (appending \"_sq\"), the tail "
+            "each with a squared-spectrum variant (appending \"_sq\") and a "
+            "scale-free variant (appending \"_rel\") that divides by what the "
+            "spectrum's own length allows, which is what makes matrices of "
+            "different shape comparable inside one group, the tail "
             "variants \"full_norm_tail_entropy\", \"full_norm_sq_tail_entropy\", "
             "\"full_norm_tail_eff_rank\" and \"full_norm_sq_tail_eff_rank\", plus "
             "\"norm|p\" for the p-Schatten norm of the truncated tail, where p is a "

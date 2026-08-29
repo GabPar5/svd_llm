@@ -209,7 +209,7 @@ At least one target must be selected. `--use_compressed` without `--compressed_m
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--het` | `flag` | `False` | Enable heterogeneous compression ratio allocation. |
-| `--score_metric` | `str` | `truncation` | Weight importance metric: `truncation`, `entropy`, `eff_rank`, each with a squared-spectrum variant (`_sq`); the tail variants `full_norm_tail_entropy`, `full_norm_sq_tail_entropy`, `full_norm_tail_eff_rank`, `full_norm_sq_tail_eff_rank`; or `norm\|p` for the p-Schatten norm of the truncated tail, with `p` a number, `inf` or `-inf`. Any of them can be wrapped as `composite\|<local>\|block_influence`. |
+| `--score_metric` | `str` | `truncation` | Weight importance metric: `truncation`, `entropy`, `eff_rank`, each with a squared-spectrum variant (`_sq`) and a scale-free variant (`_rel`) divided by the ceiling its spectrum length imposes, so that a group mixing shapes compares like with like; the tail variants `full_norm_tail_entropy`, `full_norm_sq_tail_entropy`, `full_norm_tail_eff_rank`, `full_norm_sq_tail_eff_rank`; or `norm\|p` for the p-Schatten norm of the truncated tail, with `p` a number, `inf` or `-inf`. Any of them can be wrapped as `composite\|<local>\|block_influence`. |
 | `--fusion_alpha` | `float` | `0.5` | Weight of the end-to-end half of a composite metric, in `[0,1]`. Ignored by non-composite metrics. |
 | `--group_criterion` | `str` | `type` | Grouping used for redistribution: `type`, `global`, `decoder` or `hierarchical`. |
 | `--inner_allocation` | `str` | `waterfill` | Policy that splits a group's budget across the matrices inside it: `waterfill`, `drank_lagrangian`, `swift_pool` or `softmax_temp`. |

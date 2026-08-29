@@ -111,6 +111,17 @@ class ScoreMetric(str, Enum):
     ENTROPY_SQ="entropy_sq"
     EFF_RANK="eff_rank"
     EFF_RANK_SQ="eff_rank_sq"
+    # Scale-free counterparts of the four above, each divided by the ceiling its
+    # own spectrum length imposes. The raw forms are only comparable between two
+    # matrices of the same min(out, in), which holds for every family of an MHA
+    # model and fails under GQA, where k and v carry a spectrum `heads /
+    # kv_heads` times shorter and so score low for a purely dimensional reason
+    TRUNCATION_REL="truncation_rel"
+    TRUNCATION_SQ_REL="truncation_sq_rel"
+    ENTROPY_REL="entropy_rel"
+    ENTROPY_SQ_REL="entropy_sq_rel"
+    EFF_RANK_REL="eff_rank_rel"
+    EFF_RANK_SQ_REL="eff_rank_sq_rel"
     FULL_NORM_TAIL_ENTROPY="full_norm_tail_entropy"
     FULL_NORM_SQ_TAIL_ENTROPY="full_norm_sq_tail_entropy"
     FULL_NORM_TAIL_EFF_RANK="full_norm_tail_eff_rank"
@@ -1331,6 +1342,17 @@ def spectrum_entropy(spectrum: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Shannon entropy of a (possibly truncated) normalized spectrum"""
     return -(spectrum * torch.log(spectrum.clamp_min(eps))).sum()
 
+def entropy_ceiling(length: int) -> float:
+    """
+    Largest entropy a spectrum of this length can carry, `log N`.
+
+    Dividing by it turns entropy into a scale-free flatness in [0, 1], and its
+    exponential turns effective rank into a retained fraction of the spectrum.
+    A length of one carries no ceiling, so the caller reports the degenerate
+    value directly rather than dividing by zero.
+    """
+    return math.log(length) if length > 1 else 0.0
+
 def parse_norm_order(score_metric: str) -> float:
     """Read the p of a "norm|p" score metric, supporting the signed infinity forms"""
     _, _, order = score_metric.partition("|")
@@ -1351,6 +1373,11 @@ def compute_spectrum_score(
     while entropy and effective-rank metrics measure how flat the spectrum is.
     The `full_norm_*` variants normalize over the full spectrum but score the
     tail only. A high score means an important, less redundant matrix.
+
+    The `*_rel` variants divide by what the spectrum's own length allows, which
+    is what makes two matrices of different shape comparable: every allocation
+    group that mixes shapes reads these scores against each other, and the raw
+    forms carry `min(out, in)` in their units.
     """
     tail = singular_values[rank:]
 
@@ -1384,6 +1411,28 @@ def compute_spectrum_score(
         case ScoreMetric.EFF_RANK_SQ:
             # Same of effective rank but with squared singular values (like D-Rank paper)
             return torch.exp(spectrum_entropy(normalized_spectrum(singular_values, squared=True), eps)).item()
+        case ScoreMetric.TRUNCATION_REL:
+            # Tail energy as a fraction of the whole, so the scale of ||W||_F drops out
+            return (torch.linalg.norm(tail, ord=2) / torch.linalg.norm(singular_values, ord=2)).item()
+        case ScoreMetric.TRUNCATION_SQ_REL:
+            return (torch.sum(tail.pow(2)) / torch.sum(singular_values.pow(2))).item()
+        case ScoreMetric.ENTROPY_REL:
+            ceiling = entropy_ceiling(len(singular_values))
+            if ceiling == 0.0:
+                return 0.0
+            return spectrum_entropy(normalized_spectrum(singular_values), eps).item() / ceiling
+        case ScoreMetric.ENTROPY_SQ_REL:
+            ceiling = entropy_ceiling(len(singular_values))
+            if ceiling == 0.0:
+                return 0.0
+            return spectrum_entropy(normalized_spectrum(singular_values, squared=True), eps).item() / ceiling
+        case ScoreMetric.EFF_RANK_REL:
+            # Effective rank as a fraction of the full rank, in (0, 1]
+            entropy = spectrum_entropy(normalized_spectrum(singular_values), eps)
+            return torch.exp(entropy).item() / len(singular_values)
+        case ScoreMetric.EFF_RANK_SQ_REL:
+            entropy = spectrum_entropy(normalized_spectrum(singular_values, squared=True), eps)
+            return torch.exp(entropy).item() / len(singular_values)
         case metric if metric.startswith("norm"):
             # After whitening, norm loss equals to the Lp norm of truncated singular values = p-schatten norm
             # WARNING: with p=2 this is the same of the truncation metric

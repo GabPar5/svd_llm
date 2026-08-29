@@ -1283,7 +1283,7 @@ def compress_svd_llm(
         compress_att_k: bool = False,
         compress_att_v: bool = False,
         compress_att_out: bool = False,
-        score_metric: Union[ScoreMetric, Literal["truncation", "truncation_sq", "entropy", "entropy_sq", "eff_rank", "eff_rank_sq", "norm|p"]] = "truncation",
+        score_metric: Union[ScoreMetric, Literal["truncation", "truncation_sq", "entropy", "entropy_sq", "eff_rank", "eff_rank_sq", "truncation_rel", "truncation_sq_rel", "entropy_rel", "entropy_sq_rel", "eff_rank_rel", "eff_rank_sq_rel", "norm|p"]] = "truncation",
         heterogeneous: bool = False,
         group_criterion: Union[GroupBy, Literal["global", "decoder", "type", "hierarchical"]] = "type",
         inner_allocation: Union[InnerAllocation, str] = InnerAllocation.WATERFILL,
