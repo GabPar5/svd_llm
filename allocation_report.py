@@ -43,6 +43,7 @@ SWEEPABLE: Dict[str, Any] = {
     "score_metric": str,
     "offset": float,
     "max_ratio": float,
+    "min_rank_fraction": float,
     "bypass_early_layers": int,
     "bypass_late_layers": int,
     "bypass_ratio": float,
@@ -83,6 +84,12 @@ MAX_REPORTED_DUPLICATES = 10
 # grouping and the outer policy are safe, not the score and the inner policy
 BLOCK_RATIO_DANGER = 0.60
 
+# The companion screen for a grouped-query model, on the fraction of its full
+# rank a key or value projection keeps. Fitted to eight Qwen2.5-7B runs at two
+# budgets, where everything at or below 0.141 measured at least three times the
+# homogeneous perplexity and everything at or above 0.289 stayed within 12%
+KV_RANK_FRACTION_DANGER = 0.20
+
 MATRIX_TYPES = (
     "self_attn.q_proj",
     "self_attn.k_proj",
@@ -105,6 +112,8 @@ class Inputs(NamedTuple):
     num_layers: int
     selected_params: int
     target_total_params: int
+    head_partition: Dict[str, int]
+    kv_sharing: int
 
 
 class Variant(NamedTuple):
@@ -201,6 +210,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--outer_offset', type=float, default=1.5, help='Same offset, applied to Block Influence by the waterfill outer policy')
     parser.add_argument('--softmax_temp', type=float, default=1.0, help='Temperature of the softmax_temp policy, over min-max normalized scores')
     parser.add_argument('--max_ratio', type=float, default=0.9, help='Per-matrix upper bound on the ratio')
+    parser.add_argument(
+        '--min_rank_fraction',
+        type=float,
+        default=DEFAULT_MIN_RANK_FRACTION,
+        help='Fraction of full rank every matrix must retain, which tightens --max_ratio per shape',
+    )
     parser.add_argument('--bypass_early_layers', type=int, default=-1, help='Starting layers excluded from redistribution')
     parser.add_argument('--bypass_late_layers', type=int, default=-1, help='Ending layers excluded from redistribution')
     parser.add_argument('--bypass_ratio', type=float, default=0.0, help='Ratio pinned on the bypassed layers')
@@ -410,6 +425,8 @@ def load_inputs(args: argparse.Namespace) -> Inputs:
         num_layers=num_layers,
         selected_params=selected_params,
         target_total_params=target_total_params,
+        head_partition=head_partition_map(layers_str, config),
+        kv_sharing=kv_sharing_from_config(config),
     )
 
 
@@ -833,6 +850,7 @@ def allocate(inputs: Inputs, config: Dict[str, Any], group_patterns: Dict[str, L
             bypass_early_layers=config["bypass_early_layers"],
             bypass_ratio=config["bypass_ratio"],
             max_ratio=config["max_ratio"],
+            min_rank_fraction=config["min_rank_fraction"],
             target_total_params=inputs.target_total_params,
             bypass_late_layers=config["bypass_late_layers"],
             num_layers=inputs.num_layers,
@@ -872,12 +890,20 @@ def check_variant(
     if drift > BUDGET_TOLERANCE:
         problems.append(f"budget drift {drift:.4%} (target {target_removed:,.0f}, actual {removed:,.0f})")
 
+    cap_map = build_cap_map(
+        inputs.layers_str,
+        config["max_ratio"],
+        inputs.shapes,
+        config["min_rank_fraction"],
+    )
     out_of_bounds = [
         key for key, ratio in ratio_map.items()
-        if ratio < -RATIO_TOLERANCE or ratio > config["max_ratio"] + RATIO_TOLERANCE
+        if ratio < -RATIO_TOLERANCE or ratio > cap_map.get(key, config["max_ratio"]) + RATIO_TOLERANCE
     ]
     if out_of_bounds:
-        problems.append(f"{len(out_of_bounds)} ratios outside [0, {config['max_ratio']}], e.g. {out_of_bounds[0]}")
+        problems.append(
+            f"{len(out_of_bounds)} ratios outside their per-matrix ceiling, e.g. {out_of_bounds[0]}",
+        )
 
     grouping = build_allocation_groups(
         group_criterion=GroupBy(config["group_criterion"]),
@@ -887,6 +913,11 @@ def check_variant(
     )
 
     is_ratio_space = InnerAllocation(config["inner_allocation"]) in RATIO_SPACE_POLICIES
+    # A rank floor gives each shape its own ceiling, and a matrix pinned at a
+    # tighter one can end up below a less important matrix that had room left.
+    # That inverts the score ordering for the same reason a rank-space policy
+    # does: a second, shape-derived term now competes with the score
+    uniform_ceilings = len(set(round(cap, 9) for cap in cap_map.values())) <= 1
     correlations = []
 
     for group_name, keys in grouping.groups.items():
@@ -901,7 +932,7 @@ def check_variant(
         # matrix must never be compressed harder. A rank-space one also prices a
         # rank at out + in, and that can outweigh the score ordering on a group
         # of mixed shapes, which is the family's bias rather than a defect
-        if is_ratio_space and rho > RATIO_TOLERANCE:
+        if is_ratio_space and uniform_ceilings and rho > RATIO_TOLERANCE:
             problems.append(f"group {group_name} allocates more removal to higher scores (rho={rho:+.3f})")
 
     mean_rho = sum(correlations) / len(correlations) if correlations else float("nan")
@@ -919,12 +950,14 @@ def check_variant(
         problems.append(f"the value of a constant score changes the allocation (by {drift:.2e})")
 
     # A ratio-space policy has to collapse onto the flat ratio once its scores
-    # carry nothing. Two cases are exempt: rank-space policies still favour
-    # matrices that cost fewer parameters per rank, and a non-neutral outer
-    # policy is still allocating by Block Influence, which this does not flatten
+    # carry nothing. Three cases are exempt: rank-space policies still favour
+    # matrices that cost fewer parameters per rank, a non-neutral outer policy is
+    # still allocating by Block Influence, which this does not flatten, and a
+    # rank floor clips whichever shapes the flat ratio would overrun and spreads
+    # what they cannot take onto the rest
     is_neutral_outer = OuterAllocation(config["outer_allocation"]) is OuterAllocation.PARAM_SHARE
 
-    if is_ratio_space and is_neutral_outer:
+    if is_ratio_space and is_neutral_outer and uniform_ceilings:
         flat_active = [low_map[key] for key in budget.active_keys if key in low_map]
 
         if flat_active:
@@ -952,6 +985,12 @@ def evaluate_variant(
         target_total_params=inputs.target_total_params,
         bypass_late_layers=config["bypass_late_layers"],
         num_layers=inputs.num_layers,
+        cap_map=build_cap_map(
+            inputs.layers_str,
+            config["max_ratio"],
+            inputs.shapes,
+            config["min_rank_fraction"],
+        ),
     )
 
     score_map = build_score_map(
@@ -1600,12 +1639,18 @@ def figure_cap_binding(fig_dir: str, inputs: Inputs, variants: List[Variant], re
 
     for variant in variants:
         ratio_map = results[variant.name].ratio_map
-        cap = variant.config["max_ratio"]
-        assigned = [ratio_map[key] for key in inputs.layers_str if key in ratio_map]
-        pinned = sum(1 for ratio in assigned if ratio >= cap - RATIO_TOLERANCE)
+        cap_map = build_cap_map(
+            inputs.layers_str,
+            variant.config["max_ratio"],
+            inputs.shapes,
+            variant.config["min_rank_fraction"],
+        )
+        keys = [key for key in inputs.layers_str if key in ratio_map]
+        assigned = [ratio_map[key] for key in keys]
+        pinned = sum(1 for key in keys if ratio_map[key] >= cap_map[key] - RATIO_TOLERANCE)
         rows.append([
             variant.name,
-            f"{cap:.4f}",
+            f"{variant.config['max_ratio']:.4f}",
             len(assigned),
             pinned,
             f"{pinned / len(assigned):.6f}" if assigned else "",
@@ -1705,6 +1750,121 @@ def figure_ratio_tail(
     print(
         "  every allocation measured past this point cost at least 3 perplexity against homogeneous;\n"
         "  staying under it rules out the depth failure only, not a bad split inside a block"
+    )
+
+
+def retained_rank_fraction(shape: Tuple[int, int], ratio: float) -> float:
+    """
+    Share of its full rank a matrix keeps at this ratio.
+
+    A ratio is a share of parameters, and `rank = out * in * (1 - ratio) /
+    (out + in)`, so the rank it leaves is `(1 - ratio) * max(out, in) /
+    (out + in)` of `min(out, in)`. That conversion runs from 0.5 on a square
+    matrix to nearly 1 on a very flat one, which is why the same ratio is a
+    different amount of truncation depending on the shape.
+    """
+    out_features, in_features = shape
+    return (1.0 - ratio) * max(out_features, in_features) / (out_features + in_features)
+
+
+def figure_family_tail(
+        fig_dir: str,
+        inputs: Inputs,
+        variants: List[Variant],
+        results: Dict[str, VariantResult]
+) -> None:
+    """
+    What each matrix family is asked to give up, and what rank that leaves it.
+
+    The companion to `ratio_tail`, and the screen that replaces it wherever the
+    block one goes blind. Under grouped-query attention the MLP carries most of
+    a block -- 87% on Qwen2.5-7B against 67% on LLaMA-7B -- so the outer level
+    fixes the block budget and every variant lands on the same depth profile:
+    four Qwen runs spanning 12.0 to 48.0 perplexity share a `max_block_ratio` of
+    0.2831 to the last digit. All of the freedom, and so all of the damage, has
+    moved onto the family axis.
+
+    The column that carries it is the retained rank fraction rather than the
+    ratio, because `--max_ratio` is not shape invariant: a cap of 0.9 leaves a
+    square matrix 5.0% of its rank, a 512x3584 projection 8.75% and an 18944x3584
+    one 8.4%. Comparing families on ratio alone compares three different amounts
+    of truncation.
+    """
+    families = sorted({matrix_type_of(key) for key in inputs.layers_str})
+    rows: List[List[Any]] = []
+    doomed: List[Tuple[str, str, float]] = []
+    gqa = inputs.kv_sharing > 1
+
+    for variant in variants:
+        ratio_map = results[variant.name].ratio_map
+
+        if not ratio_map:
+            continue
+
+        target = variant.config["compression_ratio"]
+
+        for family in families:
+            keys = [key for key in inputs.layers_str if matrix_type_of(key) == family and key in ratio_map]
+
+            if not keys:
+                continue
+
+            ratios = [ratio_map[key] for key in keys]
+            fractions = [retained_rank_fraction(inputs.shapes[key], ratio_map[key]) for key in keys]
+            params = sum(inputs.param_count_map[key] for key in keys)
+            weighted = sum(inputs.param_count_map[key] * ratio_map[key] for key in keys) / max(1, params)
+
+            rows.append([
+                variant.name,
+                family,
+                len(keys),
+                inputs.head_partition.get(keys[0], ""),
+                f"{weighted:.6f}",
+                f"{max(ratios):.6f}",
+                f"{weighted / target:.4f}" if target > 0 else "",
+                f"{min(fractions):.6f}",
+                f"{sum(fractions) / len(fractions):.6f}",
+            ])
+
+            is_screened_family = gqa and family in ( "self_attn.k_proj", "self_attn.v_proj" )
+
+            if is_screened_family and min(fractions) < KV_RANK_FRACTION_DANGER:
+                doomed.append(( variant.label, family, min(fractions) ))
+
+    write_figure_csv(
+        fig_dir,
+        "family_tail",
+        [
+            "variant", "matrix_type", "matrices", "heads", "mean_ratio", "max_ratio",
+            "ratio_over_target", "min_rank_fraction", "mean_rank_fraction",
+        ],
+        rows,
+    )
+
+    if not gqa:
+        print(
+            "\n[REPORT] Every query head owns its key and value, so the KV rank screen does "
+            "not apply. On LLaMA-7B it would reject the best run at ratio 0.5, whose k_proj "
+            "keeps 5% of its rank and still measures 18.89: under MHA that damage stays local "
+            "to one head"
+        )
+        return
+
+    if not doomed:
+        return
+
+    print(
+        f"\n[REPORT][WARNING] {len(doomed)} variant/family pair(s) leave a key or value "
+        f"projection under {KV_RANK_FRACTION_DANGER:.2f} of its rank, with "
+        f"{inputs.kv_sharing} query heads reading each one:"
+    )
+
+    for label, family, fraction in sorted(doomed, key=lambda item: item[2]):
+        print(f"  {label}   {family} keeps {fraction:.4f}")
+
+    print(
+        "  fitted to eight Qwen2.5-7B runs: every one at or below 0.141 measured at least\n"
+        "  three times the homogeneous perplexity. Re-derive it per model, as with the block screen"
     )
 
 
@@ -1959,6 +2119,7 @@ def write_figures(
     figure_cap_binding(fig_dir, inputs, variants, results, plt)
 
     figure_ratio_tail(fig_dir, inputs, variants, results)
+    figure_family_tail(fig_dir, inputs, variants, results)
     figure_map_distance(fig_dir, variants, results)
     figure_objectives(fig_dir, variants, results, ranks, plt)
     figure_oracle_gap(fig_dir, variants, results, oracles, plt)
