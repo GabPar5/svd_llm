@@ -7,15 +7,16 @@ the placeholders of the next stage. The grid is deliberately not a cross product
 a single model at a single ratio is already 4 groupings x 6 scores x 4 inner policies = 96 runs.
 
 Stages 1 to 8 evaluate **wikitext perplexity only**. At roughly 15 minutes per run including that
-evaluation, the 204 compression runs below cost about 51 GPU hours, so the binding constraint on this
-grid is not time but whether each run answers a distinct question.
+evaluation, the 221 compression runs below cost about 55 GPU hours on the 7B models, so the binding
+constraint on this grid is not time but whether each run answers a distinct question. Stage 7d is the
+exception: its seven runs are on a 32B model and are rationed accordingly.
 
 Whitening is assumed to be already cached under `output/whitening_matrices/<model>/v2/`, together
 with its `spectra/` cache and `layer_importance.pt`. Every stage below reads that cache and never
 recomputes it — the one exception is stage 1b, which exists precisely to build a second one.
 
 **Execution order**, which is also the section order:
-`0, 1, 1b, 2, 2b, 2c, 3, 3c, 4, 4c, 4d, 5, 5b, 6, 6b, 7, 7b, 7c, 8, 9, 10`.
+`0, 1, 1b, 2, 2b, 2c, 3, 3c, 4, 4c, 4d, 5, 5b, 6, 6b, 7, 7b, 7c, 7d, 8, 9, 10`.
 
 ## The pilot, and why every number below is being re-measured
 
@@ -298,6 +299,14 @@ spanning **12.0 to 48.0** wikitext share a `max_block_ratio` of **0.2831 and a b
 the last digit**. The screen has exactly zero discriminative power there, and the companion below is
 what replaces it.
 
+**Stage 7b showed it is worse than blind: on a grouped-query model it is inverted.** Three of its runs
+at ratio 0.2 share a block profile to the last digit — peak 0.283 at layer 16, block 0 at 0.041 — and
+span **8.93 to 11.99**. Two at ratio 0.5 share a peak of 0.708 and span **37.00 to 151.15**. Worse,
+`BLOCK_RATIO_DANGER = 0.60` flags the best run in the entire Qwen grid, the 37.00 sitting at 0.708,
+and clears the homogeneous 67.16 it beats by 45%. On a grouped-query model the block screen must be
+**replaced** by the KV rank screen, not read alongside it; on a multi-head model it stands as
+described above.
+
 ### The KV rank screen: the companion for a grouped-query model
 
 `figures/family_tail.csv` gives, per variant and per family, the parameter-weighted mean ratio, the
@@ -325,6 +334,14 @@ orders the field exactly (Spearman -1.000 on the five at ratio 0.2):
 Everything at or below 0.141 measured at least three times the homogeneous perplexity; everything at
 or above 0.289 stayed within 12% of it. Five points at one budget is thin evidence and stage 7c adds
 sixteen more, so read the threshold as provisional.
+
+**Stage 7b's seven runs sharpen it and bound what it can be used for.** As a one-sided *damage* bound
+it survives: the two new runs below the band, 0.088 at ratio 0.5, measured 151.15 against a
+homogeneous 67.16, and every run at or above 0.35 stayed within 12% of its anchor or beat it. As a
+*ranking* it does not. At ratio 0.5 the ordering inverts outright — `--max_ratio 0.6` keeps 0.350 and
+measures 51.65 while homogeneous keeps 0.4375 and measures 67.16 — because once k and v are restrained
+the heterogeneous signal is worth more than the rank it costs them. Use the screen to reject a
+configuration, never to rank two that both pass it.
 
 **Why it is restricted to grouped-query attention, and this is the finding rather than a caveat.**
 On LLaMA-7B the same screen at the same threshold fires on **61 of 83 runs at ratio 0.5, including the
@@ -444,14 +461,15 @@ Changing any of these invalidates comparability with everything already collecte
 
 | Setting | Value | Why frozen |
 |---|---|---|
-| Model | `huggyllama/llama-7b` | single model until stage 7 |
+| Model | `huggyllama/llama-7b` | single model until stage 7; Qwen2.5-7B from 7 to 7c, Qwen2.5-32B at 7d |
 | Version | `--run_v2` | documented as a limitation in thesis 5.2.1 |
-| Precision | `float16` weights and factors | what the whole grid is being run at, so it is the comparable choice |
+| Precision | **per model**: `float16` for LLaMA-7B, `bfloat16` for both Qwen2.5 models | the precision each model was trained at. This is the one setting frozen per model rather than globally, so stages 7 to 7d are read as within-model gains and never as perplexities compared across the boundary. `base_args.json` holds `float16`, and every Qwen stage file overrides both `--model_dtype` and `--compressed_dtype` |
 | Calibration | wikitext-2 train, `--max_length 2048` | |
 | `--max_whitening_samples` | `256` | truncation and `norm\|p` scores scale with the token count, so this cannot move between runs (thesis 5.2) |
 | `--seed` | `6363` | fixes the calibration sample; stage 1b is the only stage that varies it |
 | Targets | all seven matrices, `--ratio_scope all` | stage 6b is the only stage that varies the selection, and `all` is what holds its budget comparable |
-| `--max_ratio` | `0.9` | a guard rail, per the finding above; stage 3 sweeps it where it binds |
+| `--max_ratio` | `0.9` | a guard rail, per the finding above; stage 3 sweeps it where it binds, and stage 7b sweeps it again on a grouped-query model where it is the dominant lever |
+| `--outer_offset` | `1.05` | the incumbent arm; stage 4c sweeps it and `__BEST_OUTER_OFFSET__` carries the answer into `base_args.json` |
 | Screening ratios | `0.2`, `0.5` | stage 8 extends the curve |
 | Screening evaluation | `wikitext\|0`, `--eval_max_length 2048` | c4 and the suite arrive at stage 9. LLaMA-7B's context is 2048 |
 
@@ -486,9 +504,12 @@ Stage files carry literal placeholders until their gate resolves them.
 | `__BEST_FLAT_GROUPING__` | stage 2 | better of `type` / `global`, never `decoder` | confirms both flat groupings actually spread their ratios |
 | `__TOP1_SCORE__`, `__TOP2_SCORE__` | stage 2, promotable by 2b or 2c | the two best score metrics | drops a candidate whose ratio map matches an incumbent's, since it cannot win a promotion |
 | `__BEST_INNER__` | stage 4, **under `__BEST_GROUPING__`** | best inner allocation policy | the block screen per policy, since they differ in aggressiveness by construction |
+| `__BEST_OUTER_OFFSET__` | stage 4c | how hard Block Influence may reweight depth | `max_block_ratio` against the ladder, which is not monotone |
 | `__BEST_BYPASS_EARLY__`, `__BEST_BYPASS_LATE__` | stage 5 | the bypass setting with the best gain over homogeneous | catches settings whose budget is infeasible once the exempt blocks are charged |
 | `__CKPT_<ROLE>__` | stages 1 to 8 | a path under `output/models/huggyllama_llama_7b/` | nothing, these are outputs of runs |
 | `__FINALIST{1,2,3}_*` | stages 2 to 8 | the three configurations worth another model, with the outer policy each needs | rerun stage 0 per model: the Spearman sign and the score-versus-depth shape are model properties |
+| `__FINALIST1_SCORE_REL__` | stage 7, **derived** | the shape-invariant sibling of `__FINALIST1_SCORE__` | nothing, it is a spelling rather than a ranking |
+| `__GQA_WINNER{1,2}_*` | stage 7c | the two repaired configurations worth a second grouped-query model | the KV rank screen re-derived for that model |
 
 `run_experiments.py` refuses to start while any remain, so an unfilled gate cannot silently run the
 wrong configuration.
@@ -505,7 +526,20 @@ into stage 4 would freeze the decision those two stages exist to revisit. The sa
 composite halves of stage 6, spelled `composite|__TOP1_SCORE__|block_influence`.
 
 **Stage 4's arms are literal on purpose.** `hierarchical`, `decoder` and `type` are the ablation
-itself, not a configuration inherited from a gate, so they are written out rather than placeheld.
+itself, not a configuration inherited from a gate, so they are written out rather than placeheld. The
+same rule keeps `type` and `decoder` literal in stage 7b, and `entropy_rel` and `truncation_rel`
+literal in stage 7c: each is the axis its stage sweeps.
+
+**`__FINALIST1_SCORE_REL__` is derived, not ranked.** Stage 7c pairs the score fix with the other two,
+and pairing it with any score but the finalist's own would move two things at once. The stage 7 gate
+therefore emits it by appending `_rel` to whatever won, and leaves it unresolved when the winner has
+no shape-invariant spelling — a `norm|p` or a composite. If that happens, stage 7c's fix-1 rows have
+no meaning as written and the stage needs rethinking rather than a substitution.
+
+**`__BEST_OUTER_OFFSET__` follows `--max_ratio`.** Both are knobs a stage sweeps and every later stage
+inherits, so the gate report resolves them and step 2 below writes them into `args/base_args.json`.
+Stages 4c, 7b, 7c and 7d name the placeholder because they run before that file is updated; every
+other stage reads the value from `base_args.json` and never mentions it.
 
 **A `provisional` row is not an answer.** The gate report says how many candidates a placeholder was
 chosen from, and a value decided by a table holding one entrant reads `provisional (1 candidate)`:
@@ -600,6 +634,9 @@ Four cases end at step 2, with no GPU time at all:
 | 6 | `stage6` | `figures/dispersion.csv`, plus the stage 0 rho | the offset for the fused score, and that the three alphas allocate distinctly |
 | 6b | `stage6b`, `_mlp`, `_attention` | the exit code | which selections can absorb the budget at all; the screen stands down here |
 | 7 | `stage0` again, per model | the rho sign, `figures/scores_by_depth.csv` | whether the finalists transfer |
+| 7b | `stage7b`, `stage7b_ratio0.5` | `figures/family_tail.csv`, `max_block_ratio` | which cap arms are feasible, and which cause the runs separate |
+| 7c | `stage7c` | `figures/family_tail.csv` per score | whether a shape-invariant score lifts the KV rank off the danger band |
+| 7d | `stage0` and `stage7c` for the second model | the KV screen re-derived at that sharing factor | whether the repair is expected to hold at a different `G` |
 | 8 | `stage8` | the `<objective>_oracle_ratio` columns | the shape claim, made offline and never costing a run |
 | 9, 10 | none | | both load existing checkpoints and allocate nothing |
 
@@ -610,6 +647,10 @@ Re-run stage 0 whenever the whitening cache changes.
 ## Stage 0: the offline pass
 
 **Purpose.** Everything knowable without a GPU, plus the gate on stage 6. Costs seconds.
+
+**Runs.** None. This stage *is* the preview.
+
+**Preview.**
 
 ```bash
 python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
@@ -628,6 +669,18 @@ before stage 6 is worth running.
 **Also record** `figures/influence_by_depth.csv`. Layer 0 at 0.4609 and layer 31 at 0.2929 against
 0.15 or less for everything else is the premise of the whole outer level, and it is a model property.
 
+**Read the gate.** Stage 0 runs nothing, so it has no results table of its own. What it does have is
+the offline preview every later gate attaches, so the command below is worth running once here to
+confirm the stage directory is discovered before any GPU time is spent:
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage0.md
+```
+
+The **Offline preview of stage 0** section it prints is the same rho table as above, read back through
+`--allocation_dir`. If it is missing, `--out_dir` did not match the name the gate looks for.
+
 ---
 
 ## Stage 1: anchors
@@ -637,8 +690,18 @@ before stage 6 is worth running.
 Every gain figure in the grid is measured against these two, and every checkpoint role that names a
 homogeneous arm points at them, so they are kept on disk permanently.
 
-**Preview.** None. A homogeneous run assigns the target ratio to every matrix, so there is no
-allocation to inspect and `allocation_report.py` has nothing to add.
+**Preview.** A homogeneous run assigns the target ratio to every matrix, so this settles nothing
+about the allocation. It is still the cheapest confirmation that the whitening cache the whole grid
+depends on is readable and complete, which is worth having before the first GPU run:
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --sweep "compression_ratio=0.2,0.5" \
+    --out_dir ./output/allocation_reports/stage1 --plots
+```
+
+Expect `ratio_std` at exactly 0 and `min_assigned_ratio` equal to `max_assigned_ratio`. Anything else
+means a cached spectrum is missing and the run would silently allocate around the gap.
 
 **Read the gate.**
 
@@ -672,8 +735,22 @@ are the expensive part of this stage.
 number is the resolution of the whole grid: any later difference smaller than it is not a result, and
 the gate report's low-spread note should be read against it rather than against a guess.
 
-**Preview.** None. Both arms are already covered by the stage 1 and stage 2 previews, and a change
-of seed changes the calibration draw rather than the allocator.
+**Preview.** A change of seed changes the calibration draw rather than the allocator, so the
+allocation is already covered by the stage 1 and stage 2 previews. What is worth previewing is the
+*second cache*, since this stage is the only one that builds one and a half-written cache would show
+up here as a changed allocation rather than as an error:
+
+```bash
+for seed in 7777 8888; do
+    python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+        --whitening_mat_path "./output/whitening_matrices_seed${seed}" \
+        --group_criterion decoder --score_metric eff_rank \
+        --sweep "compression_ratio=0.2,0.5" \
+        --out_dir "./output/allocation_reports/stage1b_seed${seed}"
+done
+```
+
+Run it after each extra whitening pass and before the compression runs that consume it.
 
 **Read the gate.**
 
@@ -1162,11 +1239,42 @@ python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
 
 **Gate.** `__BEST_BYPASS_EARLY__`, `__BEST_BYPASS_LATE__`, `__CKPT_BEST_BYPASS_0.2__`.
 
-**Stage 5b, the grouping probe.** 2 runs, `args/experiments_stage5b_bypass_grouping.json`: the winning
-setting under `__BEST_FLAT_GROUPING__`. Bypassing means different things to the two groupings — under
-`decoder` it deletes whole groups and `param_share` redistributes their budget between the survivors,
-under a flat grouping it thins one pool — so a conclusion drawn at one may not transfer. The
-homogeneous arm allocates nothing and is grouping-independent, which is why the probe is 2 runs.
+---
+
+## Stage 5b: does the bypass conclusion depend on the grouping
+
+**Purpose.** Bypassing means different things to the two groupings — under `decoder` it deletes whole
+groups and `param_share` redistributes their budget between the survivors, under a flat grouping it
+thins one pool — so a conclusion drawn at one may not transfer.
+
+**Runs.** 2, `args/experiments_stage5b_bypass_grouping.json`: the winning bypass setting from stage 5,
+re-run under `__BEST_FLAT_GROUPING__` at both ratios. The homogeneous arm allocates nothing and is
+grouping-independent, which is why the probe is 2 runs rather than 4.
+
+**What to check in it.** Whether the sign of the bypass gain survives the change of grouping. If it
+does, stage 5's answer is a property of bypassing; if it flips, it is a property of `decoder` and the
+thesis has to say so.
+
+**Preview.** The same one stage 5 runs — the exit code and `checks` are what matter, because a
+bypassed budget pushed onto a thinner pool is where infeasibility appears:
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion __BEST_FLAT_GROUPING__ --score_metric __TOP1_SCORE__ \
+    --inner_allocation __BEST_INNER__ \
+    --bypass_early_layers __BEST_BYPASS_EARLY__ --bypass_late_layers __BEST_BYPASS_LATE__ \
+    --sweep "compression_ratio=0.2,0.5" \
+    --out_dir ./output/allocation_reports/stage5b --plots
+```
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage5b.md
+```
+
+**Gate.** Reporting, and it bounds how stage 5's answer may be phrased.
 
 ---
 
@@ -1296,40 +1404,52 @@ run.
 **Purpose.** Whether the finalists transfer, which is the difference between a result and a property
 of one checkpoint.
 
-**Runs.** 18, `args/experiments_stage7_crossmodel.json`: per model, a dense reference, two homogeneous
-anchors, and the three finalists at both ratios, for Qwen2.5-7B and Qwen2.5-32B.
+**Runs.** 9, `args/experiments_stage7_crossmodel.json`: on Qwen2.5-7B, a dense reference, two
+homogeneous anchors, and the three finalists at both ratios.
+
+**Qwen2.5-32B has moved to stage 7d.** This stage used to carry both models, 18 runs. Its answer is
+negative, so the nine 32B runs would have spent the most expensive GPU time in the grid confirming
+that configurations already known to lose also lose at a second scale. Stage 7d carries onto 32B only
+what stage 7c repairs, which is both cheaper and a better question.
 
 **The per-model anchors are not optional.** Without them the gain column has nothing to subtract and
 the transfer claim reduces to comparing a Qwen perplexity against a LLaMA one. The pilot's stage file
 omitted them.
 
-**Blocked on whitening.** Each model needs its own `get_whitening_matrices` pass and its own stage 0,
-and 32B needs the JAX GPU eigendecomposition path.
+**Precision is pinned per model, in the stage file.** Every entry sets `--model_dtype bfloat16` and
+`--compressed_dtype bfloat16`, because that is the precision Qwen2.5 was trained at, while
+`args/base_args.json` holds `float16` for LLaMA. Without the override the stage would inherit
+`float16` and silently confound the transfer comparison with a precision change. This is the one
+setting frozen per model rather than globally, and it is why the thesis reads this section as two
+within-model gains rather than as one comparison of perplexities.
+
+**Blocked on whitening.** The model needs its own `get_whitening_matrices` pass and its own stage 0.
 
 **What to check in it.** Re-run stage 0 per model first and compare three things against LLaMA-7B: the
 Spearman sign, the Block Influence profile across depth, and the score-versus-depth shape. The
 finalists are only expected to transfer where those agree, and where they disagree the interesting
 result is *which* of the three degrades.
 
-**Preview.** Stage 0 again, once per model, which is the gate on whether the finalists are even
+**Preview.** Stage 0 again for the second model, which is the gate on whether the finalists are even
 expected to transfer:
 
 ```bash
-for model in "Qwen/Qwen2.5-7B" "Qwen/Qwen2.5-32B"; do
-    python allocation_report.py --model "$model" --run_v2 \
-        --sweep "compression_ratio=0.2,0.5" \
-        --out_dir "./output/allocation_reports/stage0_$(basename "$model")" --plots
-done
+python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
+    --sweep "compression_ratio=0.2,0.5" \
+    --out_dir ./output/allocation_reports/stage0_Qwen2.5-7B --plots
 ```
 
-**Read the gate.**
+**Read the gate.** Against the second model's own directory, since the anchors it subtracts are that
+model's:
 
 ```bash
-python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
-    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage7.md
+python generate_tables.py output/eval/Qwen_Qwen2.5_7B --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/Qwen_Qwen2.5_7B/gates_stage7.md
 ```
 
-**Gate.** Reporting. Nothing downstream depends on it.
+**Gate.** `__FINALIST{1,2,3}_*` are resolved on the *LLaMA* directory, by stages 2 to 6; this stage
+spends them rather than setting them. What it does resolve is `__FINALIST1_SCORE_REL__`, the spelling
+stage 7c needs, and whether stage 7b has to exist at all: it does only if the transfer fails.
 
 ---
 
@@ -1378,7 +1498,7 @@ of its rank and still measures 18.89.
 `family_tail.csv` rather than `ratio_tail.csv`.
 
 **Runs.** 7, `args/experiments_stage7b_gqa_diagnostics.json`, all on Qwen2.5-7B against the recorded
-stage 7 anchors:
+stage 7 anchors, every entry pinned to `bfloat16` for the reason stage 7 gives:
 
 | # | run | isolates | prediction |
 |---|---|---|---|
@@ -1396,6 +1516,72 @@ under `decoder` the same score drives k to 0.433 and v to 0.413.
 **What the preview already settled.** `--max_ratio 0.35` at a 0.5 target is infeasible (30% budget
 drift) and was raised to 0.6; `--max_ratio 0.5` at a 0.5 target collapses to exactly homogeneous and
 was dropped. Neither cost a GPU minute.
+
+### Collected
+
+All seven landed. `KV rank` below is the smaller of the two retained rank fractions on `k_proj` and
+`v_proj`, `peak block` the parameter-weighted worst block.
+
+At ratio 0.2, against homogeneous **10.72** and dense 6.85:
+
+| # | run | wikitext | vs hom | k mean | v mean | KV rank | peak block |
+|---|---|---|---|---|---|---|---|
+| 3 | **k and v excluded** | **8.93** | **-16.7%** | -- | -- | 1.000 | 0.283 |
+| 4 | `--max_ratio 0.35` | 10.93 | +2.0% | 0.326 | 0.324 | 0.569 | 0.283 |
+| 1 | `type` | 11.60 | +8.2% | 0.200 | 0.200 | 0.521 | 0.355 |
+| 5 | `--max_ratio 0.5` | 11.66 | +8.8% | 0.418 | 0.406 | 0.438 | 0.283 |
+| -- | stage 7 finalist | 11.99 | +11.9% | 0.440 | 0.419 | 0.306 | 0.283 |
+| 2 | `decoder` | 12.88 | +20.1% | 0.433 | 0.413 | 0.446 | 0.200 |
+
+At ratio 0.5, against homogeneous **67.16**:
+
+| # | run | wikitext | vs hom | k mean | v mean | KV rank | peak block |
+|---|---|---|---|---|---|---|---|
+| 6 | **k and v excluded** | **37.00** | **-44.9%** | -- | -- | 1.000 | 0.708 |
+| 7 | `--max_ratio 0.6` | 51.65 | -23.1% | 0.578 | 0.578 | 0.350 | 0.600 |
+| -- | stage 7 finalist | 151.15 | +125.1% | 0.836 | 0.828 | 0.088 | 0.708 |
+
+**Causes 2 and 3 dominate, and by more than the stage predicted.** Run 3 was written to "recover most
+of the loss". It does not recover a loss, it produces the **first heterogeneous win on Qwen at either
+budget**, and a large one. Both k/v-excluded runs are budget-exact against their anchors — sidecar
+`actual_removed_params` equals `target_removed_params` to the last digit and `realized_overall_ratio`
+reads 0.2000 and 0.5000 — so this is the same parameter removal pushed onto q, o and the MLP, not a
+cheaper model. At 0.5 it does that while taking q to a mean of 0.805 and o to 0.746, ratios Qwen
+absorbs without complaint. It is specifically k and v that are fragile, and `--ratio_scope all` is
+what makes the comparison legitimate.
+
+**Cause 1 is confirmed, and is not the whole story.** Runs 1 and 2 separate in the predicted direction
+and by a wide margin: `decoder`, where a group compares matrices of different shape, loses 20.1%;
+`type`, where by construction it never does, loses 8.2%. But run 1 was predicted to land *near*
+homogeneous and it does not. Its block profile says why — L0 at 0.333 and L1 at 0.355 against a 0.200
+target. Neutralizing the shape defect moved the failure onto the depth axis rather than removing it.
+On Qwen at 0.2 heterogeneity costs along both axes, 2.4x more along the family one.
+
+**The cap responds monotonically, which is cause 2's signature.** 11.99 -> 11.66 -> 10.93 as the cap
+tightens from 0.9 through 0.5 to 0.35, and 151.15 -> 51.65 at the aggressive budget from that one
+knob.
+
+**Restraint alone recovers the gain at 0.5.** Run 7 beats homogeneous by 23%, which is the first sign
+that the LLaMA result is reachable here: the heterogeneous signal was never the problem, the freedom
+to act on it in the wrong place was.
+
+**Gate.** Which cause dominates, which sets what stage 7c has to fix. Cause 1 is confirmed if run 1
+lands near homogeneous while run 2 does not.
+
+**What it answered.** Cause 1 confirmed in direction but not in size, causes 2 and 3 dominant. Stage
+7c's fix 1 attacks cause 1 and is therefore necessary but, on these numbers, not sufficient on its
+own; the offline preview in that stage says the same thing at 0.5.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/Qwen_Qwen2.5_7B --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/Qwen_Qwen2.5_7B/gates_stage7b.md
+```
+
+Read the **Stage 7 gate: finalists** table in it, not a 7b-specific one: these runs are ranked beside
+the finalists they diagnose, which is the comparison that matters. The `--max_ratio` rows are held out
+of that table by design and reported in the note beneath it.
 
 **Preview.**
 
@@ -1416,9 +1602,6 @@ python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
     --compression_ratio 0.5 --sweep "max_ratio=0.9,0.6" \
     --out_dir ./output/allocation_reports/stage7b_ratio0.5 --plots
 ```
-
-**Gate.** Which cause dominates, which sets what stage 7c has to fix. Cause 1 is confirmed if run 1
-lands near homogeneous while run 2 does not.
 
 ---
 
@@ -1468,7 +1651,40 @@ KV heads carry substantially independent row spaces, which is the regime where t
 
 **Runs.** 16, `args/experiments_stage7c_gqa_fixes.json`. Six at ratio 0.2 (each `*_rel` score, fix 3
 alone, fix 1+3, and homogeneous + fix 3) and ten at 0.5 (the same plus the `--min_rank_fraction`
-sweep). Every one was checked feasible offline before the stage was written.
+sweep). Every one was checked feasible offline before the stage was written. `entropy_rel` and
+`truncation_rel` are written literally because they are the score ablation itself; every other
+allocation dimension is placeheld on the stage 7 finalist, and fix 1's own score is spelled
+`__FINALIST1_SCORE_REL__` so it can never name a different family of score from the run it repairs.
+
+### What the preview predicts, before the stage runs
+
+At **ratio 0.2** the fix works, and works by reproducing the configuration stage 7b found by hand.
+`eff_rank_rel` moves the allocation to within 3% relative of run 3 on every family run 3 compresses:
+
+| family | `eff_rank` (measured 11.99) | `eff_rank_rel` (offline) | 7b run 3, k/v excluded (measured **8.93**) |
+|---|---|---|---|
+| q_proj | 0.281 | **0.373** | 0.385 |
+| o_proj | 0.249 | **0.307** | 0.316 |
+| gate_proj | 0.215 | **0.226** | 0.230 |
+| up_proj | 0.178 | **0.169** | 0.170 |
+| down_proj | 0.170 | **0.152** | 0.154 |
+| k_proj | 0.440 | 0.278 | 0 (dense) |
+| v_proj | 0.419 | **0.153** | 0 (dense) |
+
+The KV rank fraction rises from 0.306 to 0.472, clear of the screen. A score derived from an argument
+about units, with nothing fitted, lands on the allocation a hand-built probe had to be told to find.
+
+At **ratio 0.5 the fix is expected to be insufficient on its own, and the stage as written cannot show
+why.** `eff_rank_rel` protects `v_proj` (0.828 -> 0.393) and leaves `k_proj` saturating the 0.900 cap,
+so the KV rank fraction stays at **0.0875**, inside the danger band the screen was fitted on. Neither
+of the other two fixes rescues it: `--min_rank_fraction` binds `q_proj` first, dropping it 0.797 ->
+0.691 -> 0.568 while lifting KV rank only to 0.125 and then 0.200. What does work offline is the plain
+cap — `eff_rank_rel` with `--max_ratio 0.6` gives KV rank 0.350 with q at 0.573, and stage 7b measured
+the *unrepaired* score at that cap at 51.65 against a homogeneous 67.16.
+
+**So read a negative at 0.5 as a statement about the arm list, not about fix 1.** The stage has no
+`__FINALIST1_SCORE_REL__` x `--max_ratio` cell; adding one is the obvious follow-up if the 0.5 rows
+disappoint, and it costs two runs.
 
 **Homogeneous + `--head_block_svd` is the cleanest probe of fix 3**: one variable against a recorded
 anchor, with no allocation involved at all.
@@ -1480,11 +1696,15 @@ is invisible to the offline report and its rows coincide with the plain ones:
 python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
     --group_criterion hierarchical --inner_allocation softmax_temp \
     --outer_allocation waterfill --outer_offset 1.05 \
+    --outer_offset __BEST_OUTER_OFFSET__ \
     --sweep "compression_ratio=0.2,0.5" \
-    --sweep "score_metric=eff_rank,eff_rank_rel,entropy_rel,truncation_rel" \
+    --sweep "score_metric=__FINALIST1_SCORE__,__FINALIST1_SCORE_REL__,entropy_rel,truncation_rel" \
     --sweep "min_rank_fraction=0.0,0.125,0.2" \
     --out_dir ./output/allocation_reports/stage7c --plots
 ```
+
+Read `figures/family_tail.csv` per score: it is the KV rank screen, and on a grouped-query model it
+replaces the block screen rather than supplementing it.
 
 **Read the gate.**
 
@@ -1495,7 +1715,80 @@ python generate_tables.py output/eval/Qwen_Qwen2.5_7B --report gates \
 
 **Gate.** Whether heterogeneous allocation beats homogeneous on a grouped-query model once the score
 is scale free, and which of the three fixes the thesis keeps. A fix that does not beat its own control
-is reported as a negative result and left at its default.
+is reported as a negative result and left at its default. The gate ranks every run carrying a fix and
+resolves `__GQA_WINNER{1,2}_*` from the top two, which is what stage 7d spends.
+
+The gate selects rows by the fix they carry — a `_rel` score, a non-zero `--min_rank_fraction`, or
+`--head_block_svd` — rather than by the model, so it stays empty on the LLaMA directory instead of
+answering stage 7d out of runs that never had the defect. The placeholders name the *allocation*
+only: if a winning row also sets `--min_rank_fraction` or `--head_block_svd`, carry that flag into
+stage 7d by hand when substituting, and the gate prints a note saying so.
+
+---
+
+## Stage 7d: does the repair hold at a second sharing factor
+
+**Purpose.** Stage 7c repairs one grouped-query model. Whether that is a result about grouped-query
+attention or about Qwen2.5-7B is decided here, and it is the question stage 7 was originally carrying
+32B for.
+
+**Why a second model settles something the first cannot.** The argument behind the shape-invariant
+scores is written in terms of `G`, the number of query heads served by one key and value head, and it
+predicts an effect that grows with `G`. Qwen2.5-7B has 28 query heads over 4 KV heads, `G = 7`.
+Qwen2.5-32B has 40 over 8, **`G = 5`**. Two intermediate values turn the dependence on `G` from
+derived into measured, which is exactly the gap the thesis limitation on GQA currently records.
+
+**Runs.** 7, `args/experiments_stage7d_gqa_scale.json`, all Qwen2.5-32B and all pinned to `bfloat16`:
+a dense reference, homogeneous anchors at both ratios, and the two configurations stage 7c elects at
+both ratios.
+
+**The anchors are the point, not overhead.** 32B's homogeneous perplexity is not predictable from
+7B's, so without them there is no gain to report and the stage says nothing.
+
+**Blocked on whitening.** 32B needs its own `get_whitening_matrices` pass, and it is the one model in
+the grid that routes through the in-process JAX GPU `eigh` — `SOLVER_GPU_MAX_DIM = 32000` sends its
+larger V2 eigendecompositions there. Build it in chunks with `--whitening_start_layer` /
+`--whitening_end_layer` and `--whitening_only`; that pass, not the seven runs, is this stage's cost.
+
+**What to check in it.** Three things, in order:
+
+- **The sign.** Whether each elected configuration beats 32B's own homogeneous anchor at each ratio.
+  That alone answers whether the repair transfers.
+- **The size against `G`.** The gain at `G = 5` against the gain at `G = 7`. The argument predicts the
+  *unrepaired* damage grows with `G`, so the repair should be worth less at 32B, not more. A gain that
+  grows instead means the mechanism is not the one the thesis describes.
+- **The KV rank screen, re-derived.** The 0.141 danger threshold was fitted on eight Qwen2.5-7B runs
+  and is a model property, exactly like `BLOCK_RATIO_DANGER`. Re-fit it here rather than inheriting it,
+  and say in the thesis which of the two numbers any claim rests on.
+
+**Preview.** Stage 0 for the new model, then the elected allocation on it:
+
+```bash
+python allocation_report.py --model "Qwen/Qwen2.5-32B" --run_v2 \
+    --sweep "compression_ratio=0.2,0.5" \
+    --out_dir ./output/allocation_reports/stage0_Qwen2.5-32B --plots
+
+python allocation_report.py --model "Qwen/Qwen2.5-32B" --run_v2 \
+    --group_criterion __GQA_WINNER1_GROUPING__ --score_metric __GQA_WINNER1_SCORE__ \
+    --inner_allocation __GQA_WINNER1_INNER__ --outer_allocation __GQA_WINNER1_OUTER__ \
+    --outer_offset __BEST_OUTER_OFFSET__ \
+    --sweep "compression_ratio=0.2,0.5" \
+    --out_dir ./output/allocation_reports/stage7d --plots
+```
+
+The second one is the cheap gate: if `figures/family_tail.csv` shows the elected configuration landing
+`k_proj` or `v_proj` back inside the danger band at `G = 5`, the repair is 7B-specific and that is
+worth knowing before the whitening pass, not after.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/Qwen_Qwen2.5_32B --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/Qwen_Qwen2.5_32B/gates_stage7d.md
+```
+
+**Gate.** Reporting, and it decides whether the thesis claims a result about grouped-query attention
+or about one checkpoint.
 
 ---
 
@@ -1510,6 +1803,22 @@ showed the gain is not monotone in any simple way — the aggressive scores win 
 
 This replaces the pilot's two-point onset probe. At fifteen minutes a run the full curve costs less
 than four hours and answers a question the thesis asks in its first chapter.
+
+**The curve is traced at the default knobs, and the gate now holds it there.** The stage file names no
+`--outer_offset` and no `--softmax_temp`, so its six ratios run at 1.5 and 1.0. Stages 3c and 4c swept
+both around the same allocation, but only at 0.2 and 0.5 — so those two budgets have a dozen runs
+sharing a grouping, a score and an inner policy where the other six have one. Before this was caught,
+`build_pivot`'s tie-break (first by run name) let `ooff1.05` stand in for ratio 0.5, and the printed
+curve read `+1.72, +7.26, +8.45` across 0.4, 0.5, 0.6 — a kink at exactly the budget the rest of the
+grid is measured on, produced by nothing but alphabetical order. Held at one arm it reads `+1.72,
++4.02, +8.45`.
+
+The gate therefore holds `max_ratio`, `outer_offset` and `softmax_temp` at their dominant values and
+carries `outer_allocation`, `outer_offset` and `softmax_temp` in the configuration column, so the arm
+is named in the table rather than inferred. **Read the `held at` notes**: they say how many runs of the
+sweeps were set aside, and the curve is a statement about the default-knob arm, not about the best
+configuration reachable at each budget. The one switch that survives is real — `swift_pool` wins at
+0.2 where `softmax_temp` wins everywhere else — and that is what the note beneath the table is for.
 
 **What to check in it.**
 
@@ -1565,7 +1874,15 @@ costs a compression run before this stage can start.
 - `merge_eval_results` means adding a task later cannot delete an earlier one, so a partial suite can
   be topped up rather than re-run.
 
-**Preview.** None. These runs load an existing checkpoint and allocate nothing.
+**Preview.** These runs load an existing checkpoint and allocate nothing, so there is no allocation
+to preview. The roster is the thing to check instead, and it comes from the gate rather than from
+`allocation_report.py`:
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage9.md \
+    && grep -n "on disk" output/gates/huggyllama_llama_7b/gates_stage9.md
+```
 
 **Read the gate.**
 
@@ -1591,7 +1908,18 @@ more of the homogeneous gap than the heterogeneous one, the two techniques compe
 equally, they compose, and the thesis can claim the allocation and the update are independent
 contributions.
 
-**Preview.** None. The update reuses the allocation its checkpoint was built with.
+**Preview.** The update reuses the allocation its checkpoint was built with, so there is nothing new
+to allocate. To read the allocation each arm inherits, point the report at the configuration the
+checkpoint was compressed under rather than re-deriving it:
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --group_criterion __BEST_GROUPING__ --score_metric __TOP1_SCORE__ \
+    --inner_allocation __BEST_INNER__ --outer_allocation __BEST_OUTER__ \
+    --outer_offset __BEST_OUTER_OFFSET__ \
+    --sweep "compression_ratio=0.2,0.5" \
+    --out_dir ./output/allocation_reports/stage10
+```
 
 **Read the gate.**
 
@@ -1625,14 +1953,18 @@ In execution order.
 | 5b bypass x grouping | 2 | wikitext | same preview as 5 |
 | 6 composite | 12 | wikitext | **gated** on the Spearman sign, sets the offset |
 | 6b family budget | 5 | wikitext | feasibility only; the screen stands down |
-| 7 cross-model | 18 | wikitext, blocked on whitening | rerun stage 0 per model |
+| 7 cross-model | 9 | wikitext, blocked on whitening | rerun stage 0 for the model |
+| 7b GQA diagnostics | 7 | wikitext | `family_tail`, and which caps are feasible |
+| 7c GQA fixes | 16 | wikitext | `family_tail` per score |
+| 7d second sharing factor | 7 | wikitext, blocked on whitening | stage 0 and the elected allocation, on 32B |
 | 8 ratio curve | 12 | wikitext | the shape claim, made offline |
 | 9 benchmarks | 9 eval-only | full suite **and c4** | none |
 | 10 LoRA | 4 update-only | wikitext | none |
 
-**204 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
-stage 1b and one per model for stage 7. At roughly 15 minutes a run that is about **51 GPU hours** for
-the compressions.
+**221 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
+stage 1b, one for Qwen2.5-7B and one for Qwen2.5-32B. At roughly 15 minutes a run that is about **55
+GPU hours** for the compressions on the two smaller models; stage 7d's seven runs are on a 32B model
+and cost several times that each, which is why they are the only ones the grid rations.
 
 GPU time is not the binding constraint, so these counts describe the grid rather than budget it: spend
 runs wherever they resolve something. What the offline pass buys is not saved hours but the guarantee

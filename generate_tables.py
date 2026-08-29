@@ -1466,6 +1466,7 @@ PLACEHOLDER_SOURCES: Dict[str, str] = {
     "__CKPT_BEST_POLICY_0.2__": "stage 4",
     "__CKPT_BEST_POLICY_0.5__": "stage 4",
     "--max_ratio": "stage 3, into args/base_args.json",
+    "__BEST_OUTER_OFFSET__": "stage 4c, into args/base_args.json",
     "__BEST_BYPASS_EARLY__": "stage 5",
     "__BEST_BYPASS_LATE__": "stage 5",
     "__CKPT_BEST_BYPASS_0.2__": "stage 5",
@@ -1479,6 +1480,33 @@ PLACEHOLDER_SOURCES.update({
     for index in ( 1, 2, 3 )
     for role in ( "GROUPING", "SCORE", "INNER", "OUTER" )
 })
+
+# The shape-invariant sibling of the finalist score, which stage 7c substitutes
+# wherever it pairs the score fix with another one. Derived rather than ranked:
+# it is whatever `__FINALIST1_SCORE__` becomes once its spectrum-length ceiling
+# is divided out, so the two can never name different families of score
+PLACEHOLDER_SOURCES["__FINALIST1_SCORE_REL__"] = "stage 7, from __FINALIST1_SCORE__"
+
+# Stage 7d carries onto a second grouped-query model only what stage 7c elects,
+# so these are answered by the fix runs rather than by the LLaMA grid
+PLACEHOLDER_SOURCES.update({
+    f"__GQA_WINNER{index}_{role}__": "stage 7c"
+    for index in ( 1, 2 )
+    for role in ( "GROUPING", "SCORE", "INNER", "OUTER" )
+})
+
+# Suffix that turns a spectral score into its shape-invariant counterpart, and
+# the scores that have one. A `norm|p` or a composite has no `_rel` spelling, so
+# a finalist naming one leaves `__FINALIST1_SCORE_REL__` unresolved on purpose
+RELATIVE_SCORE_SUFFIX = "_rel"
+RELATIVE_SCORE_BASES = (
+    "truncation",
+    "truncation_sq",
+    "entropy",
+    "entropy_sq",
+    "eff_rank",
+    "eff_rank_sq",
+)
 
 # In rank order, because stages 2b and 2c re-resolve both of them together: a
 # squared score or a Schatten norm may take either place, which is why no stage
@@ -3175,9 +3203,14 @@ def gate_stage4c_outer_offset(context: GateContext) -> GateResult:
         ],
     )]
 
+    resolved: Dict[str, Resolution] = {}
+
+    if pivot:
+        resolved["__BEST_OUTER_OFFSET__"] = Resolution(value=pivot[0].key[0], candidates=len(pivot))
+
     tables += offline_tables(context, "4c")
 
-    return GateResult(tables=tables, resolved={})
+    return GateResult(tables=tables, resolved=resolved)
 
 
 def gate_stage4d_temperature(context: GateContext) -> GateResult:
@@ -3427,6 +3460,17 @@ def gate_stage7_finalists(context: GateContext) -> GateResult:
             if path and placeholder in PLACEHOLDER_SOURCES:
                 resolved[placeholder] = Resolution(value=path, candidates=len(pivot))
 
+        # Derived, not ranked: stage 7c pairs the score fix with the other two,
+        # and pairing it with anything but the finalist's own score would change
+        # two things at once
+        winner = str(finalists[0].key[1])
+
+        if winner in RELATIVE_SCORE_BASES:
+            resolved["__FINALIST1_SCORE_REL__"] = Resolution(
+                value=f"{winner}{RELATIVE_SCORE_SUFFIX}",
+                candidates=len(pivot),
+            )
+
     tables = [pivot_table(
         title="Stage 7 gate: finalists",
         purpose=(
@@ -3449,12 +3493,113 @@ def gate_stage7_finalists(context: GateContext) -> GateResult:
     return GateResult(tables=tables, resolved=resolved)
 
 
+def carries_gqa_fix(row: Dict[str, Any]) -> bool:
+    """
+    Whether a run uses one of the three grouped-query repairs.
+
+    Self-selecting on the fix rather than on the model, so the gate stays empty
+    on a multi-head grid instead of answering stage 7d out of runs that never
+    had the defect to repair
+    """
+    score = str(row.get("score_metric") or "")
+    floor = row.get("min_rank_fraction")
+
+    return (
+        score.endswith(RELATIVE_SCORE_SUFFIX)
+        or bool(row.get("head_block_svd"))
+        or ( floor is not None and float(floor) > 0.0 )
+    )
+
+
+def gate_stage7c_gqa_fixes(context: GateContext) -> GateResult:
+    """Stage 7c: which of the three grouped-query repairs earns its place"""
+    # The fixes are the axes; the allocation around them is held, because stage
+    # 7c varies what repairs a configuration rather than which configuration it is
+    axes = ( "score_metric", "min_rank_fraction", "head_block_svd" )
+    rows, skipped = gate_rows(context.rows, axes, carries_gqa_fix)
+    notes = list(skipped_note(skipped))
+
+    for dimension in ( "group_criterion", "inner_allocation", "outer_allocation", "max_ratio" ):
+        rows, held = hold_dominant(rows, dimension)
+        notes += held
+
+    pivot = build_pivot(rows, axes, context.metric)
+    winners = pivot[:2]
+    resolved: Dict[str, Resolution] = {}
+    notes += confound_notes(rows, axes)
+
+    for index, row in enumerate(winners, start=1):
+        sample = next(iter(row.runs.values()), {})
+        resolved[f"__GQA_WINNER{index}_SCORE__"] = Resolution(
+            value=row.key[0],
+            candidates=len({other.key[0] for other in pivot}),
+        )
+
+        # Held rather than ranked, so they are read off the winning run instead
+        # of a pivot key that does not carry them
+        for role, dimension in (
+            ( "GROUPING", "group_criterion" ),
+            ( "INNER", "inner_allocation" ),
+            ( "OUTER", "outer_allocation" ),
+        ):
+            value = sample.get(dimension)
+
+            if value is not None:
+                resolved[f"__GQA_WINNER{index}_{role}__"] = Resolution(value=str(value), candidates=1)
+
+    if pivot:
+        notes.append(
+            "a repair that does not beat the homogeneous anchor of its own model is a negative result and "
+            "stays off. `--head_block_svd` and `--min_rank_fraction` are off by default, so reporting one "
+            "as unhelpful costs nothing downstream",
+        )
+        notes.append(
+            "the `__GQA_WINNER*__` placeholders name the allocation only. If a winning row sets "
+            "`min_rank_fraction` or `head_block_svd`, add that flag to stage 7d by hand when resolving",
+        )
+
+    tables = [pivot_table(
+        title="Stage 7c gate: the grouped-query repairs",
+        purpose=(
+            "Every run carrying a shape-invariant score, a shape-aware rank floor or a head-block "
+            "factorization, ranked against the homogeneous anchors of the same model. The top two fill "
+            "the `__GQA_WINNER*__` placeholders that stage 7d carries onto a second sharing factor"
+        ),
+        pivot=pivot,
+        axis_headers=[ "score_metric", "min_rank_fraction", "head_block_svd" ],
+        metric=context.metric,
+        baselines=homogeneous_baselines(context.rows, context.metric),
+        notes=notes,
+    )]
+
+    tables += offline_tables(context, "7c")
+
+    return GateResult(tables=tables, resolved=resolved)
+
+
 def gate_stage8_curve(context: GateContext) -> GateResult:
     """Stage 8 (RQ1): how the heterogeneous gain depends on the target ratio"""
     axes = ( "group_criterion", "score_metric", "inner_allocation" )
     rows, _ = gate_rows(context.rows, axes, is_baseline_heterogeneous)
-    rows, held = hold_dominant(rows, "max_ratio")
-    pivot = build_pivot(rows, axes, context.metric)
+    notes: List[str] = []
+
+    # Stages 3c and 4c swept these around the same allocation, and the sweeps
+    # only exist at the two screening budgets. Without holding them, a ratio the
+    # sweep happened to cover is represented by whichever arm's name sorts first
+    # rather than by the arm its neighbours are traced at, which puts a kink in
+    # the curve at exactly the budgets the rest of the grid is measured on
+    for dimension in ( "max_ratio", "outer_offset", "softmax_temp" ):
+        rows, held = hold_dominant(rows, dimension)
+        notes += held
+
+    # Carried in the key so the table names the arm it is traced at, and so a
+    # value that escapes the hold above appears as its own row instead of
+    # silently standing in for the held one
+    # `outer_allocation` belongs here for the reason stage 7 gives: `hierarchical`
+    # with `param_share` is `decoder` under another name, so a row naming the
+    # grouping without it does not identify a configuration
+    labelled = axes + ( "outer_allocation", "outer_offset", "softmax_temp" )
+    pivot = build_pivot(rows, labelled, context.metric)
     baselines = homogeneous_baselines(context.rows, context.metric)
     ratios = sorted(set(baselines) | {ratio for row in pivot for ratio in row.runs})
 
@@ -3479,10 +3624,10 @@ def gate_stage8_curve(context: GateContext) -> GateResult:
             Cell(text=" / ".join(best.key) if best is not None else "--"),
         ])
 
-    notes = [
-        *held,
+    notes += [
         "the best heterogeneous configuration is picked per ratio, so the column may change configuration "
         "between rows, which is itself the answer if it does",
+        *confound_notes(rows, labelled),
     ]
 
     if len(gains) > 1:
@@ -3495,7 +3640,13 @@ def gate_stage8_curve(context: GateContext) -> GateResult:
     tables = [Table(
         title="Stage 8 gate: the ratio curve",
         purpose="Both arms across every collected budget, which is the shape RQ1 asks about rather than a slope",
-        headers=[ "ratio", f"hom {context.metric}", f"best het {context.metric}", "gain", "configuration" ],
+        headers=[
+            "ratio",
+            f"hom {context.metric}",
+            f"best het {context.metric}",
+            "gain",
+            "grouping / score / inner / outer / outer_offset / softmax_temp",
+        ],
         rows=body,
         notes=notes,
     )]
@@ -3631,6 +3782,7 @@ GATES: Tuple[Callable[[GateContext], GateResult], ...] = (
     gate_stage6_composite,
     gate_stage6b_family_budget,
     gate_stage7_finalists,
+    gate_stage7c_gqa_fixes,
     gate_stage8_curve,
     gate_stage9_roster,
     gate_stage10_lora,
