@@ -54,6 +54,11 @@ KNOB_FILENAME_TOKENS = (
 # "emit only when non-default" reads from one place
 DEFAULT_FUSION_ALPHA = 0.5
 DEFAULT_BYPASS_RATIO = 0.0
+DEFAULT_MIN_RANK_FRACTION = 0.0
+
+# Marks a `rank_map` entry as block diagonal in head space rather than a plain
+# joint rank, which is what keeps checkpoints written before it readable
+HEAD_BLOCK_KIND = "head_block"
 DEFAULT_SEED = 6363
 
 # Never persisted to disk, the sidecar is committed alongside results
@@ -636,6 +641,61 @@ def matrix_shapes_from_config(config: Any) -> Dict[str, Tuple[int, int]]:
         "mlp.up_proj": ( intermediate, hidden ),
         "mlp.down_proj": ( hidden, intermediate ),
     }
+
+def head_partition_from_config(config: Any) -> Dict[str, int]:
+    """
+    Number of attention heads the output of each head-partitioned matrix holds.
+
+    Only the key and value projections are listed: they are the ones a grouped
+    query attention shares between query heads, so a rank collapse in one of
+    their heads reaches `num_attention_heads / num_key_value_heads` of them.
+    `generate_paths` names the same matrices, and `head_partition_map` turns
+    this into the fully qualified keys everything downstream is keyed by.
+    """
+    heads = int(config.num_attention_heads)
+    kv_heads = int(getattr(config, "num_key_value_heads", None) or heads)
+
+    return {
+        "self_attn.k_proj": kv_heads,
+        "self_attn.v_proj": kv_heads,
+    }
+
+def kv_sharing_from_config(config: Any) -> int:
+    """
+    How many query heads read each key/value head, 1 under multi-head attention.
+
+    This is the amplifier that makes a rank cut on `k_proj` or `v_proj` cost
+    more under grouped-query attention than under MHA, where each head owns its
+    own key and value and the damage stays local to it.
+    """
+    heads = int(config.num_attention_heads)
+    kv_heads = int(getattr(config, "num_key_value_heads", None) or heads)
+
+    return max(1, heads // max(1, kv_heads))
+
+def head_partition_map(layers_str: List[str], config: Any) -> Dict[str, int]:
+    """Head count per target key, empty for the targets that are not partitioned"""
+    by_type = head_partition_from_config(config)
+
+    return {
+        key: heads
+        for key in layers_str
+        for suffix, heads in by_type.items()
+        if key.endswith(suffix)
+    }
+
+def head_block_rank(out_features: int, in_features: int, heads: int, ratio: float) -> int:
+    """
+    Per-head rank realizing `ratio` under a block-diagonal factorization.
+
+    `heads * rank * (in + head_dim)` parameters must equal `(1 - ratio)` of the
+    dense `heads * head_dim * in`, so the head count cancels and the rank is
+    the same one a single head-sized matrix would get.
+    """
+    head_dim = out_features // heads
+    rank = int((1.0 - ratio) * head_dim * in_features / (head_dim + in_features))
+
+    return max(1, min(rank, head_dim))
 
 def get_layer_parents(model: nn.Module, layers_str: List[str]) -> Tuple[List[nn.Module], List[str]]:
     """
@@ -1223,6 +1283,54 @@ def rank_cost(shape_map: Dict[str, Tuple[int, int]], keys: List[str]) -> torch.T
         dtype=torch.float64,
     )
 
+def matrix_ratio_cap(
+        shape: Tuple[int, int],
+        max_ratio: float,
+        min_rank_fraction: float
+) -> float:
+    """
+    Tightest removal ratio that still leaves `min_rank_fraction` of full rank.
+
+    A ratio is a share of parameters, and the rank it buys depends on the
+    shape: `rank = out * in * (1 - ratio) / (out + in)`, so demanding
+    `rank >= f * min(out, in)` reads
+
+        ratio <= 1 - f * (out + in) / max(out, in)
+
+    which is `1 - 2f` on a square matrix. A scalar `--max_ratio` therefore
+    means different things to different shapes -- 0.9 leaves a square matrix
+    5% of its rank and a 512x3584 projection 8.75% -- and this is what makes
+    the guard rail say the same thing everywhere. `min_rank_fraction` of 0.0
+    leaves `max_ratio` alone.
+    """
+    out_features, in_features = shape
+    ceiling = 1.0
+
+    if min_rank_fraction > 0.0:
+        ceiling = 1.0 - min_rank_fraction * (out_features + in_features) / max(out_features, in_features)
+
+    return max(0.0, min(max_ratio, ceiling))
+
+def build_cap_map(
+        keys: List[str],
+        max_ratio: float,
+        shape_map: Optional[Dict[str, Tuple[int, int]]] = None,
+        min_rank_fraction: float = 0.0
+) -> Dict[str, float]:
+    """
+    Per-matrix ratio ceiling, the single source every policy clamps against.
+
+    Without shapes, or without a rank floor, this is `max_ratio` everywhere and
+    the allocation is exactly what a scalar cap produced.
+    """
+    if shape_map is None or min_rank_fraction <= 0.0:
+        return {key: max_ratio for key in keys}
+
+    return {
+        key: matrix_ratio_cap(shape_map[key], max_ratio, min_rank_fraction)
+        for key in keys
+    }
+
 class ActiveBudget(NamedTuple):
     """Removal budget left to the matrices that are not bypassed"""
     selected_params: int
@@ -1244,7 +1352,8 @@ def compute_active_budget(
         max_ratio: float = 0.9,
         target_total_params: Optional[int] = None,
         bypass_late_layers: int = -1,
-        num_layers: Optional[int] = None
+        num_layers: Optional[int] = None,
+        cap_map: Optional[Dict[str, float]] = None
 ) -> ActiveBudget:
     """
     Split the global removal target between bypassed and active matrices.
@@ -1273,7 +1382,9 @@ def compute_active_budget(
     active_params = sum(param_count_map[k] for k in active_keys)
 
     active_budget = target_removed - bypassed_removed
-    active_capacity = active_params * max_ratio
+    active_capacity = sum(
+        param_count_map[k] * (cap_map or {}).get(k, max_ratio) for k in active_keys
+    )
 
     if active_budget < 0:
         print(
@@ -1548,7 +1659,23 @@ def group_params_tensor(param_count_map: Dict[str, int], keys: List[str]) -> tor
 def group_scores_tensor(score_map: Dict[str, float], keys: List[str]) -> torch.Tensor:
     return torch.tensor([score_map[key] for key in keys], dtype=torch.float64)
 
-def clamp_group_budget(params: torch.Tensor, group_budget: float, max_ratio: float) -> float:
+def group_caps_tensor(
+        cap_map: Optional[Dict[str, float]],
+        keys: List[str],
+        max_ratio: float
+) -> torch.Tensor:
+    """
+    Ratio ceiling per matrix of one group, falling back to the scalar cap.
+
+    Policies take `cap_map` as optional so that calling one directly, as the
+    offline tooling and the tests do, still works with `max_ratio` alone.
+    """
+    if cap_map is None:
+        return torch.full((len(keys),), float(max_ratio), dtype=torch.float64)
+
+    return torch.tensor([cap_map.get(key, max_ratio) for key in keys], dtype=torch.float64)
+
+def clamp_group_budget(params: torch.Tensor, group_budget: float, caps: torch.Tensor) -> float:
     """
     What a group can actually be asked to give up.
 
@@ -1556,24 +1683,24 @@ def clamp_group_budget(params: torch.Tensor, group_budget: float, max_ratio: flo
     bound each group individually once an outer policy has divided it, so every
     policy re-clamps to its own capacity before allocating.
     """
-    capacity = float((params * max_ratio).sum().item())
+    capacity = float((params * caps).sum().item())
     return max(0.0, min(float(group_budget), capacity))
 
 def waterfill_ratios(
         params: torch.Tensor,
         weights: torch.Tensor,
         group_budget: float,
-        max_ratio: float
+        caps: torch.Tensor
 ) -> torch.Tensor:
     """
     Spread a removal budget over matrices in proportion to `weights`.
 
     Ratio-space allocation: what is divided is the removed parameters, so
     `sum_i param_i * ratio_i = group_budget` holds by construction. Matrices
-    that reach `max_ratio` are frozen and their unspent share flows to the rest,
-    which is what makes this a water-fill rather than a single division.
+    that reach their own ceiling are frozen and their unspent share flows to the
+    rest, which is what makes this a water-fill rather than a single division.
     """
-    remaining_budget = clamp_group_budget(params, group_budget, max_ratio)
+    remaining_budget = clamp_group_budget(params, group_budget, caps)
 
     ratios = torch.zeros_like(params)
     active = torch.ones_like(params, dtype=torch.bool)
@@ -1592,7 +1719,7 @@ def waterfill_ratios(
             denom = (p * w).sum()
 
         proposed = remaining_budget * w / denom
-        cap_left = max_ratio - ratios[idx]
+        cap_left = caps[idx] - ratios[idx]
 
         clipped = proposed >= cap_left
 
@@ -1604,7 +1731,7 @@ def waterfill_ratios(
         clipped_idx = idx[clipped]
         spend = float((params[clipped_idx] * cap_left[clipped]).sum().item())
 
-        ratios[clipped_idx] = max_ratio
+        ratios[clipped_idx] = caps[clipped_idx]
         remaining_budget -= spend
         active[clipped_idx] = False
 
@@ -1675,6 +1802,7 @@ def allocate_param_weighted_group(
         param_count_map: Dict[str, int],
         group_budget: float,
         max_ratio: float = 0.9,
+        cap_map: Optional[Dict[str, float]] = None,
         offset: float = 1.5
 ) -> Dict[str, float]:
     """
@@ -1696,7 +1824,7 @@ def allocate_param_weighted_group(
 
     params = group_params_tensor(param_count_map, keys)
     weights = redundancy_from_scores(group_scores_tensor(score_map, keys), offset)
-    ratios = waterfill_ratios(params, weights, group_budget, max_ratio)
+    ratios = waterfill_ratios(params, weights, group_budget, group_caps_tensor(cap_map, keys, max_ratio))
 
     return {k: float(r) for k, r in zip(keys, ratios.tolist())}
 
@@ -1706,6 +1834,7 @@ def allocate_softmax_temp(
         param_count_map: Dict[str, int],
         group_budget: float,
         max_ratio: float = 0.9,
+        cap_map: Optional[Dict[str, float]] = None,
         softmax_temp: float = 1.0
 ) -> Dict[str, float]:
     """
@@ -1740,7 +1869,7 @@ def allocate_softmax_temp(
 
     weights = torch.softmax(-normalized / softmax_temp, dim=0)
     params = group_params_tensor(param_count_map, keys)
-    ratios = waterfill_ratios(params, weights, group_budget, max_ratio)
+    ratios = waterfill_ratios(params, weights, group_budget, group_caps_tensor(cap_map, keys, max_ratio))
 
     return {k: float(r) for k, r in zip(keys, ratios.tolist())}
 
@@ -1749,7 +1878,8 @@ def allocate_swift_pool(
         score_map: Dict[str, float],
         param_count_map: Dict[str, int],
         group_budget: float,
-        max_ratio: float = 0.9
+        max_ratio: float = 0.9,
+        cap_map: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """
     Swift-SVD's floor-plus-pool allocation (Alg. 2), the `swift_pool` policy.
@@ -1783,9 +1913,10 @@ def allocate_swift_pool(
     scores = torch.nan_to_num(group_scores_tensor(score_map, keys), nan=0.0, posinf=0.0, neginf=0.0)
     scores = torch.clamp(scores, min=0.0)
 
-    budget = clamp_group_budget(params, group_budget, max_ratio)
+    caps = group_caps_tensor(cap_map, keys, max_ratio)
+    budget = clamp_group_budget(params, group_budget, caps)
 
-    ratios = torch.full_like(params, max_ratio)
+    ratios = caps.clone()
     active = torch.ones_like(params, dtype=torch.bool)
 
     # Matrices whose score would buy back more than the whole ratio are pinned
@@ -1800,7 +1931,7 @@ def allocate_swift_pool(
         s = scores[idx]
 
         # What the active matrices could give up beyond the target, i.e. the pool
-        pool = float((p * max_ratio).sum().item()) - budget
+        pool = float((p * caps[idx]).sum().item()) - budget
         denom = float((p * s).sum().item())
 
         if pool <= 0.0 or denom <= 0.0:
@@ -1809,10 +1940,10 @@ def allocate_swift_pool(
             # the capacity to cover the budget, and the shell reports the drift
             active_params = float(p.sum().item())
             flat = budget / active_params if active_params > 0 else 0.0
-            ratios[idx] = min(flat, max_ratio)
+            ratios[idx] = torch.clamp(torch.full_like(p, flat), max=caps[idx])
             break
 
-        proposed = max_ratio - pool * s / denom
+        proposed = caps[idx] - pool * s / denom
         dense = proposed < 0.0
 
         if not bool(dense.any()):
@@ -1831,6 +1962,7 @@ def allocate_drank_lagrangian(
         param_count_map: Dict[str, int],
         group_budget: float,
         max_ratio: float = 0.9,
+        cap_map: Optional[Dict[str, float]] = None,
         shape_map: Optional[Dict[str, Tuple[int, int]]] = None
 ) -> Dict[str, float]:
     """
@@ -1867,7 +1999,8 @@ def allocate_drank_lagrangian(
     scores = torch.nan_to_num(group_scores_tensor(score_map, keys), nan=0.0, posinf=0.0, neginf=0.0)
     scores = torch.clamp(scores, min=0.0)
 
-    budget = clamp_group_budget(params, group_budget, max_ratio)
+    caps = group_caps_tensor(cap_map, keys, max_ratio)
+    budget = clamp_group_budget(params, group_budget, caps)
     retained_total = float(params.sum().item()) - budget
 
     share = torch.sqrt(scores * omega)
@@ -1880,7 +2013,7 @@ def allocate_drank_lagrangian(
 
     retained = bounded_proportional_split(
         share=share,
-        lower=params * (1.0 - max_ratio),
+        lower=params * (1.0 - caps),
         upper=params.clone(),
         total=retained_total,
     )
@@ -1916,6 +2049,7 @@ def allocate_group_budgets_waterfill(
         param_count_map: Dict[str, int],
         remaining_budget: float,
         max_ratio: float = 0.9,
+        cap_map: Optional[Dict[str, float]] = None,
         group_scores: Optional[Dict[str, float]] = None,
         outer_offset: float = 1.5
 ) -> Dict[str, float]:
@@ -1953,7 +2087,17 @@ def allocate_group_budgets_waterfill(
         torch.tensor([group_scores[name] for name in names], dtype=torch.float64),
         outer_offset,
     )
-    ratios = waterfill_ratios(params, weights, remaining_budget, max_ratio)
+    # A block can give up no more than its own matrices can, which is their
+    # ceilings weighted by what each one contributes to the block
+    caps = torch.tensor(
+        [
+            sum(param_count_map[key] * (cap_map or {}).get(key, max_ratio) for key in groups[name])
+            / max(1, sum(param_count_map[key] for key in groups[name]))
+            for name in names
+        ],
+        dtype=torch.float64,
+    )
+    ratios = waterfill_ratios(params, weights, remaining_budget, caps)
 
     budgets = {name: 0.0 for name in groups}
     budgets.update({
@@ -1971,8 +2115,8 @@ AllocationPolicy = Callable[..., Dict[str, float]]
 # signature is a knob, which is how a run records which flags actually applied.
 # A policy only ever receives what it names, so none has to carry a parameter it
 # does not use
-INNER_POLICY_ARGS = ( "keys", "score_map", "param_count_map", "group_budget", "max_ratio", "shape_map" )
-OUTER_POLICY_ARGS = ( "groups", "param_count_map", "remaining_budget", "max_ratio", "group_scores" )
+INNER_POLICY_ARGS = ( "keys", "score_map", "param_count_map", "group_budget", "max_ratio", "cap_map", "shape_map" )
+OUTER_POLICY_ARGS = ( "groups", "param_count_map", "remaining_budget", "max_ratio", "cap_map", "group_scores" )
 
 # Only wired policies live here, so the CLI can advertise exactly what runs
 INNER_POLICIES: Dict[InnerAllocation, AllocationPolicy] = {
@@ -2280,7 +2424,8 @@ def allocate_ratios(
         shape_map: Optional[Dict[str, Tuple[int, int]]] = None,
         importance_map: Optional[Dict[int, float]] = None,
         softmax_temp: float = 1.0,
-        outer_offset: float = 1.5
+        outer_offset: float = 1.5,
+        min_rank_fraction: float = 0.0
 ) -> Dict[str, float]:
     """
     Redistributes compression budget within each weight group.
@@ -2327,7 +2472,16 @@ def allocate_ratios(
         f"[BUDGET] Bypassing first {bypass_early_layers} and last "
         f"{bypass_late_layers} layers with ratio {bypass_ratio:.6f}",
     )
+    cap_map = build_cap_map(layers_str, max_ratio, shape_map, min_rank_fraction)
+    distinct_caps = sorted(set(round(cap, 6) for cap in cap_map.values()))
+
     print(f"[BUDGET] Per-matrix max ratio: {max_ratio:.6f}")
+    if min_rank_fraction > 0.0:
+        print(
+            f"[BUDGET] Min retained rank fraction: {min_rank_fraction:.6f} "
+            f"-> {len(distinct_caps)} distinct ceiling(s) in "
+            f"[{distinct_caps[0]:.6f}, {distinct_caps[-1]:.6f}]",
+        )
     print(f"[BUDGET] Outer policy: {policies.outer_allocation.value} | knobs: {outer_knobs}")
     print(f"[BUDGET] Inner policy: {policies.inner_allocation.value} | knobs: {inner_knobs}")
 
@@ -2341,6 +2495,7 @@ def allocate_ratios(
         target_total_params=target_total_params,
         bypass_late_layers=bypass_late_layers,
         num_layers=num_layers,
+        cap_map=cap_map,
     )
 
     selected_total_params = budget.selected_params
@@ -2406,6 +2561,7 @@ def allocate_ratios(
                 "param_count_map": param_count_map,
                 "remaining_budget": remaining_budget,
                 "max_ratio": max_ratio,
+                "cap_map": cap_map,
                 "group_scores": group_scores,
                 **outer_knobs,
             },
@@ -2429,6 +2585,7 @@ def allocate_ratios(
                     "param_count_map": param_count_map,
                     "group_budget": group_budget,
                     "max_ratio": max_ratio,
+                    "cap_map": cap_map,
                     "shape_map": shape_map,
                     **inner_knobs,
                 },
@@ -2593,13 +2750,10 @@ def factor_range_report(name: str, W_u: torch.Tensor, W_v: torch.Tensor) -> None
 def check_weights_relative_difference(
         layer_name: str,
         layer_attr: nn.Linear,
-        van: LowRank,
+        van: Union[LowRank, HeadBlockLowRank],
         device: str = "cuda"
 ) -> None:
-    W_hat = (
-        van.W_u.weight.to(device).float()
-        @ van.W_v.weight.to(device).float()
-    )
+    W_hat = van.to(device).dense_weight().float()
     W_orig = layer_attr.weight.to(device).float()
 
     rel_w = (W_orig - W_hat).norm() / W_orig.norm().clamp_min(1e-12)
@@ -2611,11 +2765,11 @@ def check_weights_relative_difference(
 def check_lowrank_equivalence(
         layer_name: str,
         layer_attr: nn.Linear,
-        van: LowRank,
+        van: Union[LowRank, HeadBlockLowRank],
         device: str = "cuda"
 ) -> None:
     input_dtype = layer_attr.weight.dtype
-    factor_dtype = van.W_v.weight.dtype
+    factor_dtype = van.factor_dtype
 
     x = torch.randn(
         2, 8, layer_attr.in_features,
@@ -2628,8 +2782,8 @@ def check_lowrank_equivalence(
     # Match LowRank.forward(): input is cast to factor dtype internally
     x_factor = x.to(factor_dtype)
 
-    W_hat = van.W_u.weight @ van.W_v.weight
-    b = van.W_u.bias
+    W_hat = van.dense_weight()
+    b = van.bias if isinstance(van, HeadBlockLowRank) else van.W_u.bias
 
     y_dense_hat = F.linear(x_factor, W_hat, b).to(input_dtype)
     y_lowrank = van(x)
@@ -2646,7 +2800,7 @@ def check_lowrank_equivalence(
 def check_layer_activation_error(
         name: str,
         old_linear: nn.Linear,
-        van: LowRank,
+        van: Union[LowRank, HeadBlockLowRank],
         device: str = "cuda"
 ) -> None:
     x = torch.randn(
@@ -2698,10 +2852,19 @@ def dtype_summary(model: nn.Module, only_lowrank: bool = False) -> Dict[str, int
         counts[str(p.dtype)] = counts.get(str(p.dtype), 0) + p.numel()
     return counts
 
+def is_lowrank_parameter(name: str) -> bool:
+    """
+    Whether a state-dict key belongs to a low-rank factor.
+
+    `HeadBlockLowRank` holds `W_u` as a bare parameter rather than a linear, so
+    the key ends there and a trailing-dot test would miss it
+    """
+    return ".W_u" in name or ".W_v" in name
+
 def infer_lowrank_dtype(state_dict: Dict[str, torch.Tensor]) -> Optional[torch.dtype]:
-    """Read the dtype the LowRank factors were saved with"""
+    """Read the dtype the low-rank factors were saved with"""
     for name, tensor in state_dict.items():
-        if ".W_u." in name or ".W_v." in name:
+        if is_lowrank_parameter(name):
             return tensor.dtype
     return None
 
@@ -2714,7 +2877,7 @@ def assert_mixed_dtype(
     non_lowrank_dtypes = set()
 
     for name, p in model.named_parameters():
-        if ".W_u." in name or ".W_v." in name:
+        if is_lowrank_parameter(name):
             lowrank_dtypes.add(p.dtype)
         else:
             non_lowrank_dtypes.add(p.dtype)
@@ -2828,19 +2991,33 @@ def restore_non_persistent_buffers(
         print("[LOAD][WARNING]", msg)
 
 # TODO - define transformers model and (possibly) save to huggingface. This would reduce exposure to bugs during compressed model loading
+def head_block_entry(heads: int, rank: int) -> Dict[str, int]:
+    """
+    A `rank_map` value describing a block-diagonal factorization.
+
+    Plain integers stay the joint `LowRank` form, so every checkpoint written
+    before head-block truncation existed reads back unchanged.
+    """
+    return {"kind": HEAD_BLOCK_KIND, "heads": int(heads), "rank": int(rank)}
+
+def is_head_block_entry(entry: Any) -> bool:
+    return isinstance(entry, dict) and entry.get("kind") == HEAD_BLOCK_KIND
+
 def apply_lowrank(
         model: nn.Module,
-        rank_map: Dict[str, int],
+        rank_map: Dict[str, Any],
         state_dict: Optional[Dict[str, torch.Tensor]] = None
 ) -> None:
     """
-    Replace the linear layers listed in `rank_map` with LowRank modules.
+    Replace the linear layers listed in `rank_map` with low-rank modules.
 
     rank_map keys are full module paths, e.g. 'model.layers.0.mlp.down_proj'.
-    When a state dict is given, the factor dtype is taken from it so mixed
-    precision checkpoints keep their compressed dtype.
+    A plain integer value installs a `LowRank`; a `head_block_entry` installs a
+    `HeadBlockLowRank` at that per-head rank. When a state dict is given, the
+    factor dtype is taken from it so mixed precision checkpoints keep their
+    compressed dtype.
     """
-    for layer_name, rank in rank_map.items():
+    for layer_name, entry in rank_map.items():
         parent, attr_name = get_parent_module(model, layer_name)
         old = getattr(parent, attr_name)
 
@@ -2849,12 +3026,21 @@ def apply_lowrank(
         else:
             factor_dtype = old.weight.dtype
 
-        lowrank = LowRank(
-            in_features=old.in_features,
-            out_features=old.out_features,
-            rank=rank,
-            bias=old.bias is not None,
-        ).to(device=old.weight.device, dtype=factor_dtype)
+        if is_head_block_entry(entry):
+            lowrank = HeadBlockLowRank(
+                in_features=old.in_features,
+                out_features=old.out_features,
+                heads=entry["heads"],
+                rank=entry["rank"],
+                bias=old.bias is not None,
+            ).to(device=old.weight.device, dtype=factor_dtype)
+        else:
+            lowrank = LowRank(
+                in_features=old.in_features,
+                out_features=old.out_features,
+                rank=entry,
+                bias=old.bias is not None,
+            ).to(device=old.weight.device, dtype=factor_dtype)
 
         lowrank.requires_grad_(False)
         setattr(parent, attr_name, lowrank)
@@ -2891,7 +3077,9 @@ def build_run_name(
         seed: Optional[int] = DEFAULT_SEED,
         offset: float = 1.5,
         softmax_temp: float = 1.0,
-        outer_offset: float = 1.5
+        outer_offset: float = 1.5,
+        min_rank_fraction: float = DEFAULT_MIN_RANK_FRACTION,
+        head_block_svd: bool = False
 ) -> str:
     """
     Encode a whole compression configuration into one filename token.
@@ -2940,6 +3128,12 @@ def build_run_name(
         bypass_str = f"_{bypass_early_layers}"
 
     max_ratio_str = "" if max_ratio == 0.9 else f"_cap{round(max_ratio, 2)}"
+
+    min_rank_str = ""
+    if min_rank_fraction != DEFAULT_MIN_RANK_FRACTION:
+        min_rank_str = f"_mrf{round(min_rank_fraction, 3)}"
+
+    head_block_str = "_hb" if head_block_svd else ""
 
     # A knob earns a token only when it leaves its default *and* the run actually
     # reads it, so passing --offset to a policy that ignores it cannot fork the
@@ -2999,6 +3193,8 @@ def build_run_name(
         policy_str,
         outer_policy_str,
         max_ratio_str,
+        min_rank_str,
+        head_block_str,
         knob_str,
         f"_upd_{sequential_update_method}" if sequential_update else "",
         "_v2" if is_v2 else "",

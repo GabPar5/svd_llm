@@ -384,6 +384,31 @@ if __name__ == "__main__":
         help='Upper bound on the compression ratio any single matrix may receive, shared by every allocation policy',
     )
     parser.add_argument(
+        '--min_rank_fraction',
+        type=float,
+        default=DEFAULT_MIN_RANK_FRACTION,
+        help=(
+            "Fraction of its full rank every matrix must retain, which tightens "
+            "--max_ratio per shape. A ratio is a share of parameters and the rank "
+            "it buys depends on the shape, so a scalar cap of 0.9 leaves a square "
+            "matrix 5%% of its rank and a 512x3584 projection 8.75%%; this makes the "
+            "guard rail mean the same thing everywhere. 0.05 reproduces the 0.9 "
+            "default on a square matrix, and 0.0 leaves --max_ratio alone"
+        ),
+    )
+    parser.add_argument(
+        '--head_block_svd',
+        action='store_true',
+        help=(
+            "Factor the key and value projections one attention head at a time "
+            "instead of jointly, so a head's rank cannot be spent on another "
+            "head's subspace. Under grouped query attention each KV head is read "
+            "by several query heads, which is what makes a shared rank budget "
+            "across them costly. Requires --run_v2 and is incompatible with "
+            "--sequential_update"
+        ),
+    )
+    parser.add_argument(
         '--group_criterion',
         type=str,
         default="type",
@@ -612,6 +637,8 @@ if __name__ == "__main__":
             is_v2=args.run_v2,
             bypass_late_layers=args.bypass_late_layers,
             max_ratio=args.max_ratio,
+            min_rank_fraction=args.min_rank_fraction,
+            head_block_svd=args.head_block_svd,
             inner_allocation=args.inner_allocation,
             outer_allocation=args.outer_allocation,
             bypass_ratio=args.bypass_ratio,
@@ -675,6 +702,8 @@ if __name__ == "__main__":
             bypass_late_layers = args.bypass_late_layers,
             bypass_ratio = args.bypass_ratio,
             max_ratio = args.max_ratio,
+            min_rank_fraction = args.min_rank_fraction,
+            head_block_svd = args.head_block_svd,
             ratio_scope=args.ratio_scope,
             offset=args.offset,
             softmax_temp=args.softmax_temp,

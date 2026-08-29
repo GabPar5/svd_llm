@@ -1263,6 +1263,105 @@ def run_local_u_update(
     return model, updated_rank_map
 
 # Compress model with SVD-LLM
+@torch.no_grad()
+def truncate_head_blocks(
+        key: str,
+        layer: nn.Module,
+        attr: str,
+        W: torch.Tensor,
+        heads: int,
+        layer_ratio: float,
+        whitening_matrices: Dict[str, str],
+        rank_map: Dict[str, Any],
+        device: str,
+        compressed_dtype: str,
+        eps: float
+) -> None:
+    """
+    Factor one head-partitioned projection as `heads` independent truncations.
+
+    Every head reads the same input, so they share one whitening factor and the
+    per-head SVDs differ only in which rows of `W` they see. The rank is solved
+    per head from the parameter ratio, which is what keeps the budget the
+    allocator handed out exact.
+
+    Whitening follows the V2 path: `D_h = W_h U_s sqrt(L_s)` is truncated, and
+    `sqrt(L_s)^-1 U_s^T` maps the right factor back out of the whitened basis.
+    """
+    out_features, in_features = W.shape
+    head_dim = out_features // heads
+    rank = head_block_rank(out_features, in_features, heads, layer_ratio)
+
+    U_s, L_s = load_whitening_data(whitening_matrices, key, device, keep=False)
+    L_s_clean = L_s.clamp_min(eps)
+    L_s_sqrt = torch.sqrt(L_s_clean)
+    L_s_sqrt_inv = torch.rsqrt(L_s_clean)
+
+    C_sqrt = U_s * L_s_sqrt.unsqueeze(0)
+    U_s_t = U_s.transpose(0, 1)
+
+    factor_dtype = DtypeMap.get_dtype(compressed_dtype)
+    # Zeros rather than empty: a head whose whitened matrix carries fewer
+    # singular values than the target rank leaves the tail columns untouched,
+    # and a zero column is the truncation those ranks stand for
+    W_u = torch.zeros(heads, head_dim, rank, dtype=factor_dtype)
+    W_v = torch.zeros(heads * rank, in_features, dtype=factor_dtype)
+
+    for head in range(heads):
+        rows = slice(head * head_dim, (head + 1) * head_dim)
+        D = torch.matmul(W[rows, :], C_sqrt)
+
+        U_ws, L_ws, V_wsT = torch.linalg.svd(D, full_matrices=False)
+        D = None
+        del D
+
+        head_rank = max(1, min(rank, L_ws.shape[0]))
+        L_ws_r_sqrt = torch.sqrt(L_ws[:head_rank])
+
+        W_u[head, :, :head_rank] = (U_ws[:, :head_rank] * L_ws_r_sqrt.unsqueeze(0)).cpu().to(factor_dtype)
+        W_v[head * rank:head * rank + head_rank, :] = (
+            L_ws_r_sqrt.unsqueeze(1)
+            * torch.matmul(V_wsT[:head_rank, :] * L_s_sqrt_inv.unsqueeze(0), U_s_t)
+        ).cpu().to(factor_dtype)
+
+        U_ws = L_ws = V_wsT = L_ws_r_sqrt = None
+        del U_ws, L_ws, V_wsT, L_ws_r_sqrt
+
+    U_s = L_s = L_s_sqrt = L_s_sqrt_inv = C_sqrt = U_s_t = None
+    del U_s, L_s, L_s_sqrt, L_s_sqrt_inv, C_sqrt, U_s_t
+    cuda_cleanup()
+
+    layer_attr = getattr(layer, attr)
+
+    van = HeadBlockLowRank(
+        layer_attr.in_features,
+        layer_attr.out_features,
+        heads,
+        rank,
+        layer_attr.bias is not None,
+    ).to(device="cpu", dtype=factor_dtype)
+    van.requires_grad_(False)
+
+    van.W_u.copy_(W_u)
+    van.W_v.weight.copy_(W_v)
+    if layer_attr.bias is not None:
+        van.bias.copy_(layer_attr.bias.detach().to(factor_dtype))
+
+    if compressed_dtype == "float16" or compressed_dtype == "fp16":
+        factor_range_report(key, W_u, W_v)
+
+    rank_map[key] = head_block_entry(heads, rank)
+
+    check_weights_relative_difference(key, layer_attr, van, device=device)
+    check_lowrank_equivalence(key, layer_attr, van, device=device)
+    check_layer_activation_error(key, layer_attr, van, device=device)
+
+    setattr(layer, attr, van)
+
+    W_u = W_v = None
+    del W_u, W_v
+    cuda_cleanup()
+
 def compress_svd_llm(
         model_name: str,
         ratio: float,
@@ -1297,6 +1396,8 @@ def compress_svd_llm(
         bypass_late_layers: int = -1,
         bypass_ratio: float = 0.0,
         max_ratio: float = 0.9,
+        min_rank_fraction: float = DEFAULT_MIN_RANK_FRACTION,
+        head_block_svd: bool = False,
         ratio_scope: Literal["selected", "all"] = "selected",
         offset: float = 1.5,
         softmax_temp: float = 1.0,
@@ -1412,6 +1513,29 @@ def compress_svd_llm(
         layers_list=layers_list,
         attributes=attributes,
     )
+
+    # Empty unless head-block truncation is on, so the loop below takes the
+    # joint path for every target exactly as it did before
+    head_partitions: Dict[str, int] = {}
+    if head_block_svd:
+        if not is_v2:
+            raise ValueError(
+                "--head_block_svd factors each head against the V2 whitening "
+                "eigendecomposition, so it requires --run_v2",
+            )
+
+        if sequential_update:
+            raise ValueError(
+                "--head_block_svd is not supported alongside --sequential_update: "
+                "both update methods address W_u and W_v as inner linears, and "
+                "HeadBlockLowRank holds W_u as a per-head parameter instead",
+            )
+
+        head_partitions = head_partition_map(layers_str, model.config)
+        print(
+            f"[BUDGET] Head-block truncation on {len(head_partitions)} matrices, "
+            f"{sorted(set(head_partitions.values()))} head(s) each",
+        )
 
     # Overall count of parameters of sublayers that we want to compress
     selected_total_params = sum(param_count_map[k] for k in layers_str)
@@ -1587,6 +1711,7 @@ def compress_svd_llm(
             target_total_params=target_total_params,
             bypass_late_layers=bypass_late_layers,
             num_layers=num_decoder_layers,
+            cap_map=build_cap_map(layers_str, max_ratio, shape_map, min_rank_fraction),
         ).active_ratio
         print(f"[BUDGET] Score probe ratio for active layers: {score_probe_ratio:.6f}")
 
@@ -1691,6 +1816,7 @@ def compress_svd_llm(
             bypass_early_layers=bypass_early_layers,
             bypass_ratio=bypass_ratio,
             max_ratio=max_ratio,
+            min_rank_fraction=min_rank_fraction,
             target_total_params=target_total_params,
             bypass_late_layers=bypass_late_layers,
             num_layers=num_decoder_layers,
@@ -1716,6 +1842,7 @@ def compress_svd_llm(
             target_total_params=target_total_params,
             bypass_late_layers=bypass_late_layers,
             num_layers=num_decoder_layers,
+            cap_map=build_cap_map(layers_str, max_ratio, shape_map, min_rank_fraction),
         )
         active_target_ratio = budget.active_ratio
 
@@ -1745,6 +1872,7 @@ def compress_svd_llm(
         target_total_params=target_total_params,
         bypass_late_layers=bypass_late_layers,
         num_layers=num_decoder_layers,
+        cap_map=build_cap_map(layers_str, max_ratio, shape_map, min_rank_fraction),
     )
     allocation_summary = summarize_allocation(
         ratio_map=ratio_map,
@@ -1792,6 +1920,26 @@ def compress_svd_llm(
             # Get weight matrix
             layer_attr = getattr(layer, attr)
             W = layer_attr.weight.detach().to(device, dtype=torch.float64)
+
+            heads = head_partitions.get(layers_str[i])
+            if heads is not None:
+                truncate_head_blocks(
+                    key=layers_str[i],
+                    layer=layer,
+                    attr=attr,
+                    W=W,
+                    heads=heads,
+                    layer_ratio=layer_ratio,
+                    whitening_matrices=whitening_matrices,
+                    rank_map=rank_map,
+                    device=device,
+                    compressed_dtype=compressed_dtype,
+                    eps=eps,
+                )
+                W = None
+                del W
+                cuda_cleanup()
+                continue
 
             # Compute rank from compression ratio
             rank = int((W.shape[0] * W.shape[1] * (1 - layer_ratio)) / (W.shape[0] + W.shape[1])) # TODO restore rank compression
@@ -2074,6 +2222,8 @@ def compress_svd_llm(
             is_v2=is_v2,
             bypass_late_layers=bypass_late_layers,
             max_ratio=max_ratio,
+            min_rank_fraction=min_rank_fraction,
+            head_block_svd=head_block_svd,
             inner_allocation=inner_allocation,
             outer_allocation=outer_allocation,
             bypass_ratio=bypass_ratio,

@@ -222,8 +222,10 @@ At least one target must be selected. `--use_compressed` without `--compressed_m
 | `--bypass_late_layers` | `int` | `-1` | Number of final decoder layers exempted from redistribution (`-1` disables the exemption). Can be combined with `--bypass_early_layers` to protect both ends in the same run. |
 | `--bypass_ratio` | `float` | `0.0` | Ratio assigned to the bypassed layers at either end; `0.0` leaves them uncompressed. |
 | `--max_ratio` | `float` | `0.9` | Upper bound on the ratio any single matrix may receive, shared by every allocation policy. |
+| `--min_rank_fraction` | `float` | `0.0` | Fraction of its full rank every matrix must retain, which tightens `--max_ratio` per shape: `ratio <= 1 - f·(out + in)/max(out, in)`. A ratio is a share of *parameters* and the rank it buys depends on the shape, so a scalar `0.9` leaves a square matrix 5% of its rank and a 512x3584 projection 8.75%. `0.05` reproduces the `0.9` default on a square matrix; `0.0` leaves `--max_ratio` alone. |
+| `--head_block_svd` | `flag` | off | Factor `k_proj` and `v_proj` one attention head at a time instead of jointly, so a head's rank cannot be spent on another head's subspace. Requires `--run_v2`, and is rejected together with `--sequential_update`. |
 
-The removal budget is preserved in parameters, not in average ratio: bypassed layers are charged at `--bypass_ratio` and the remaining budget is redistributed over the active matrices, capped at `--max_ratio` per matrix.
+The removal budget is preserved in parameters, not in average ratio: bypassed layers are charged at `--bypass_ratio` and the remaining budget is redistributed over the active matrices, capped per matrix at `--max_ratio` and, when it is set, at whatever `--min_rank_fraction` allows that shape.
 
 Allocation is split into a shell and two pluggable policies. `allocate_ratios` owns grouping, the budget split and every `[BUDGET]` line; an **outer** policy then divides the budget across groups and an **inner** policy divides each group's share across its matrices. A policy declares what it needs — data and knobs alike — as ordinary named parameters, and the shell hands each one only what it declares, which is also how the run configuration sidecar records the knobs that actually shaped an allocation. Adding a policy therefore means writing the function and registering it in `INNER_POLICIES` / `OUTER_POLICIES`; the CLI advertises the registry, so no unimplemented choice is ever offered.
 
@@ -369,12 +371,12 @@ python main.py --model "Qwen/Qwen2.5-7B" \
 Checkpoint, log and result filenames encode the whole configuration:
 
 ```
-<model>[_q][_k][_v][_out][_mlp]_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_<inner_allocation>][_out<outer_allocation>][_cap<max_ratio>][_<knobs>][_upd_<method>][_v2]
+<model>[_q][_k][_v][_out][_mlp]_<ratio_scope>_<ratio>_<het|hom>[_<grouping>][_<score>][_<bypassed>][_<inner_allocation>][_out<outer_allocation>][_cap<max_ratio>][_mrf<min_rank_fraction>][_hb][_<knobs>][_upd_<method>][_v2]
 ```
 
 For example `Qwen_Qwen2.5_7B_q_k_v_out_mlp_all_0.2_het_decoder_truncation_2_v2`. `generate_tables.py` parses this convention back into table columns, so keep the two in sync when changing it.
 
-The `<bypassed>` token is a bare integer when only `--bypass_early_layers` is used, and becomes `byp<early>-<late>` once `--bypass_late_layers` is set. `_<inner_allocation>` and `_out<outer_allocation>` appear only for a heterogeneous run that leaves the `waterfill` / `param_share` defaults, and both sit after `<bypassed>` so that token stays where `parse_filename` looks for it. `_cap<max_ratio>` appears only when `--max_ratio` leaves its `0.9` default. Every one of these rules exists so that run names predating the option stay byte-identical.
+The `<bypassed>` token is a bare integer when only `--bypass_early_layers` is used, and becomes `byp<early>-<late>` once `--bypass_late_layers` is set. `_<inner_allocation>` and `_out<outer_allocation>` appear only for a heterogeneous run that leaves the `waterfill` / `param_share` defaults, and both sit after `<bypassed>` so that token stays where `parse_filename` looks for it. `_cap<max_ratio>` appears only when `--max_ratio` leaves its `0.9` default, `_mrf<f>` only when `--min_rank_fraction` leaves `0.0`, and `_hb` only under `--head_block_svd`. Every one of these rules exists so that run names predating the option stay byte-identical.
 
 `<knobs>` is the remaining set of swept tunables, each emitted only when it leaves its default **and** the run actually reads it:
 
@@ -431,7 +433,7 @@ python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
 | `--out_dir` | `str` | under `--save_path` | Where the CSV report is written. |
 | `--plots` | `flag` | `False` | Also render a PNG of every figure, when matplotlib happens to be installed. The figure CSVs are written either way. |
 
-Every allocation flag of `main.py` is accepted as the base configuration, and `--compression_ratio`, `--group_criterion`, `--inner_allocation`, `--outer_allocation`, `--score_metric`, `--offset`, `--outer_offset`, `--softmax_temp`, `--fusion_alpha`, `--max_ratio`, `--bypass_early_layers`, `--bypass_late_layers` and `--bypass_ratio` can be swept.
+Every allocation flag of `main.py` is accepted as the base configuration, and `--compression_ratio`, `--group_criterion`, `--inner_allocation`, `--outer_allocation`, `--score_metric`, `--offset`, `--outer_offset`, `--softmax_temp`, `--fusion_alpha`, `--max_ratio`, `--min_rank_fraction`, `--bypass_early_layers`, `--bypass_late_layers` and `--bypass_ratio` can be swept.
 
 Output is CSV rather than figures, so `pgfplots` consumes it directly in the thesis: `summary.csv` (one row per variant), `matrices.csv` (per matrix: score, ratio, rank, truncation loss), `layers.csv` (per decoder layer, with its Block Influence), `budget/<variant>.log` (the captured `[BUDGET]` instrumentation) and `figures/*.csv` (one tidy table per figure).
 

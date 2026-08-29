@@ -186,12 +186,19 @@ POLICY_TOKEN_SPAN = 2
 # what makes a name parseable back into flag values
 NAME_TOKEN_DEFAULTS = (
     ( "max_ratio", "cap", 0.9 ),
+    ( "min_rank_fraction", "mrf", 0.0 ),
     ( "seed", "seed", 6363 ),
     ( "bypass_ratio", "bypr", 0.0 ),
     ( "fusion_alpha", "fa", 0.5 ),
     ( "offset", "off", 1.5 ),
     ( "softmax_temp", "temp", 1.0 ),
     ( "outer_offset", "ooff", 1.5 ),
+)
+
+# Dimensions whose token is the bare flag rather than a value, so they are
+# matched exactly instead of by numeric suffix
+NAME_FLAG_TOKENS = (
+    ( "head_block_svd", "hb" ),
 )
 
 # Sidecar written next to every result by main.py, see `save_run_config`
@@ -463,11 +470,15 @@ def suffix_dimensions(tokens: List[str]) -> Dict[str, Any]:
         outer = next((name for name in OUTER_ALLOCATION_TOKENS if token == f"out{name}"), None)
         inner, inner_span = inner_allocation_at(tokens, index)
 
+        flag = next((name for name, marker in NAME_FLAG_TOKENS if token == marker), None)
+
         if outer is not None:
             found["outer_allocation"] = outer
         elif inner is not None:
             found["inner_allocation"] = inner
             step = inner_span
+        elif flag is not None:
+            found[flag] = True
         else:
             for name, prefix, _ in NAME_TOKEN_DEFAULTS:
                 value = numeric_suffix(token, prefix)
@@ -531,6 +542,9 @@ def run_name_dimensions(
             continue
 
         dimensions[name] = from_suffix.get(name, default)
+
+    for name, _ in NAME_FLAG_TOKENS:
+        dimensions[name] = from_suffix.get(name, False)
 
     return dimensions
 
