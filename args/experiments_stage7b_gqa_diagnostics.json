@@ -1,0 +1,75 @@
+[
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "type",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "softmax_temp"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "decoder",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "softmax_temp"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--compress_att_k": false,
+    "--compress_att_v": false
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--max_ratio": 0.35
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--max_ratio": 0.5
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--compress_att_k": false,
+    "--compress_att_v": false
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--score_metric": "eff_rank",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--max_ratio": 0.6
+  }
+]

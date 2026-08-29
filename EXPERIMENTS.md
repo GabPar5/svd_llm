@@ -15,7 +15,7 @@ with its `spectra/` cache and `layer_importance.pt`. Every stage below reads tha
 recomputes it — the one exception is stage 1b, which exists precisely to build a second one.
 
 **Execution order**, which is also the section order:
-`0, 1, 1b, 2, 2b, 2c, 3, 3c, 4, 4c, 4d, 5, 5b, 6, 6b, 7, 8, 9, 10`.
+`0, 1, 1b, 2, 2b, 2c, 3, 3c, 4, 4c, 4d, 5, 5b, 6, 6b, 7, 7b, 7c, 8, 9, 10`.
 
 ## The pilot, and why every number below is being re-measured
 
@@ -291,6 +291,54 @@ The threshold is one number fitted to 72 runs of one model at two budgets, and n
 enforces it. Re-derive it per model. The one encouraging sign is that the band did **not** scale with
 the budget between 0.2 and 0.5.
 
+**It goes blind on a grouped-query model, and stage 7b is where that was found.** The MLP carries 87%
+of a Qwen2.5-7B block against 67% of a LLaMA-7B one, so once the outer level has fixed each block's
+budget there is almost nothing left for the family split to move at block level. Four Qwen runs
+spanning **12.0 to 48.0** wikitext share a `max_block_ratio` of **0.2831 and a block 0 of 0.0413, to
+the last digit**. The screen has exactly zero discriminative power there, and the companion below is
+what replaces it.
+
+### The KV rank screen: the companion for a grouped-query model
+
+`figures/family_tail.csv` gives, per variant and per family, the parameter-weighted mean ratio, the
+peak, the ratio as a multiple of the target, and the **retained rank fraction** — how much of its full
+rank the family keeps. That last column is the one to read, because `--max_ratio` is not shape
+invariant: a cap of 0.9 leaves a square matrix 5.0% of its rank, a 512x3584 projection 8.75% and an
+18944x3584 one 8.4%, so comparing families on ratio alone compares three different amounts of
+truncation.
+
+The screen fires when a `k_proj` or `v_proj` keeps less than `KV_RANK_FRACTION_DANGER = 0.20` of its
+rank, and **only on a grouped-query model**. Across the eight Qwen2.5-7B runs collected so far it
+orders the field exactly (Spearman -1.000 on the five at ratio 0.2):
+
+| target | wikitext | min rank fraction | on | max k/v ratio |
+|---|---|---|---|---|
+| 0.2 | **10.72** homogeneous | 0.400 | q_proj | 0.200 |
+| 0.2 | **12.00** | 0.289 | q_proj | 0.650 |
+| 0.2 | **34.13** | 0.141 | k_proj | 0.839 |
+| 0.2 | **42.17** | 0.0875 | k_proj | 0.900 |
+| 0.2 | **47.98** | 0.0875 | k_proj | 0.900 |
+| 0.5 | **67.15** homogeneous | 0.250 | q_proj | 0.500 |
+| 0.5 | **151.15** | 0.0500 | q_proj | 0.900 |
+| 0.5 | **157.64** | 0.104 | q_proj | 0.881 |
+
+Everything at or below 0.141 measured at least three times the homogeneous perplexity; everything at
+or above 0.289 stayed within 12% of it. Five points at one budget is thin evidence and stage 7c adds
+sixteen more, so read the threshold as provisional.
+
+**Why it is restricted to grouped-query attention, and this is the finding rather than a caveat.**
+On LLaMA-7B the same screen at the same threshold fires on **61 of 83 runs at ratio 0.5, including the
+best one** — 18.89 perplexity with `k_proj` down to 5% of its rank — while the runs it passes start at
+22.09. Under MHA each query head owns its key and value, so a rank cut on `k_proj` damages one head
+and stops there. Under GQA each KV head is read by `heads / kv_heads` query heads, seven of them on
+Qwen2.5-7B, and the same cut reaches all of them. `kv_sharing_from_config` is what the tool branches
+on, and on an MHA model it prints that the screen does not apply instead of warning.
+
+**The screen and the knob are the same number.** `--min_rank_fraction f` caps every matrix at
+`1 - f * (out + in) / max(out, in)`, which is exactly "keep at least `f` of full rank", so a variant
+the screen names at 0.0875 is silenced by `--min_rank_fraction 0.2` and the offline report confirms it
+before any GPU time is spent.
+
 **The denominator is what the run compresses.** With all seven families targeted, `max_block_ratio` is
 the fraction of the block. With a partial selection it is the fraction of the selection, so the
 threshold does not apply and `selection_is_complete` makes the tool say so instead of warning. This
@@ -358,6 +406,7 @@ parentheses, its rank across the variants. The `checks` column is `ok` or the in
 | `figures/map_distance.csv` | how far apart two variants allocate, with each one's peak: the screen against paying twice for one experiment |
 | `figures/dispersion.csv` | how widely each configuration spreads its ratios, for knob comparison and for spotting a degenerate cell |
 | `figures/ratio_by_type.csv` | mean ratio per matrix family, where rank-space bias shows: thesis 3.3.5 |
+| `figures/family_tail.csv` | **the KV screen**: per family, the weighted mean and peak ratio, the ratio over target, and the retained rank fraction that the screen reads |
 | `figures/influence_vs_effrank_rho.csv` | Spearman rho per matrix family, the gate on stage 6 |
 | `figures/layer_ratios.csv` | the assigned ratio against depth, which is the outer level's whole story |
 | `figures/objectives.csv` | which variants win only the objective their own score optimizes |
@@ -1281,6 +1330,172 @@ python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
 ```
 
 **Gate.** Reporting. Nothing downstream depends on it.
+
+---
+
+## Stage 7b: why the finalists do not transfer to grouped-query attention
+
+**Purpose.** Stage 7 answered its question and the answer was no. Every finalist *loses* to
+homogeneous on Qwen2.5-7B, at both budgets and by a wide margin:
+
+| wikitext | dense | 0.2 hom | 0.2 best het | 0.5 hom | 0.5 best het |
+|---|---|---|---|---|---|
+| LLaMA-7B | 5.68 | 7.79 | **7.47** (-4%) | 24.58 | **17.32** (-30%) |
+| Qwen2.5-7B | 6.85 | 10.72 | **12.00** (+12%) | 67.15 | **151.15** (+125%) |
+
+This stage establishes *why*, which is what turns a failed transfer into a result. Four causes were
+identified offline, and the runs below separate them.
+
+**Cause 1, the score is not scale invariant.** `eff_rank` is bounded by `min(out, in)`, `entropy` by
+its log, `truncation` by the whitened Frobenius norm. All seven LLaMA families share `min(out, in) =
+4096`, so raw scores are comparable there *by accident*. Under GQA `k_proj` and `v_proj` carry a
+spectrum seven times shorter and score low for a purely dimensional reason:
+
+| family | LLaMA eff_rank | ÷ len | Qwen eff_rank | ÷ len |
+|---|---|---|---|---|
+| q_proj | 1796 | 0.439 | 1475 | 0.412 |
+| k_proj | 1692 (#1 most compressed) | 0.413 | **288** (#1) | 0.562 |
+| v_proj | 2526 (#4) | 0.617 | **420** (#2) | **0.820** |
+| o_proj | 2308 | 0.564 | 1819 | 0.508 |
+| down_proj | 3279 (#7) | 0.800 | 2894 | 0.807 |
+
+Length-normalized, Qwen's `v_proj` has the **flattest spectrum in the model** — by the metric's own
+logic the matrix to protect hardest — and the allocator compresses it second hardest. The ordering
+inverts entirely, and it inverts only where a group mixes shapes.
+
+**Cause 2, the budget stops restraining k/v.** `k_proj` is 8.3% of a LLaMA block and **0.79% of a
+Qwen block**. Since the allocation preserves `Σ pᵢ·rᵢ`, a matrix is restrained in proportion to its
+parameter weight, so on Qwen sending k and v to the cap costs 1.5% of the block budget. This is an
+amplifier rather than an independent cause: it is what lets the wrong score act unopposed. At target
+0.2 LLaMA's allocator tops out at k = 0.55-0.63 while Qwen's saturates the 0.900 cap.
+
+**Cause 3, GQA amplifies the damage.** 28 query heads read 4 KV heads. At r = 0.9 `k_proj` keeps rank
+44 across 4 heads, 11 dimensions per head of 128, and every one of the 28 query heads reads that
+space. Under MHA the damage is head-local, which is why LLaMA's *best* run at 0.5 takes `k_proj` to 5%
+of its rank and still measures 18.89.
+
+**Cause 4, the block screen is blind here.** Documented above; it is why this stage reports
+`family_tail.csv` rather than `ratio_tail.csv`.
+
+**Runs.** 7, `args/experiments_stage7b_gqa_diagnostics.json`, all on Qwen2.5-7B against the recorded
+stage 7 anchors:
+
+| # | run | isolates | prediction |
+|---|---|---|---|
+| 1 | `type` + `eff_rank` + `softmax_temp` @0.2 | cause 1 | near homogeneous |
+| 2 | `decoder` + same @0.2 | matched control for 1 | degraded, k 0.433 / v 0.413 |
+| 3 | k/v excluded, hierarchical finalist @0.2 | causes 2+3 | recovers most of the loss |
+| 4, 5 | finalist at `--max_ratio 0.35`, `0.5` @0.2 | cause 2 | monotone recovery |
+| 6, 7 | run 3 and `--max_ratio 0.6` @0.5 | budget dependence | — |
+
+**Runs 1 and 2 are the decisive pair.** Same score, same policy, same budget, differing only in
+whether a group ever compares two matrices of different shape. Under `type` every family mean is
+exactly 0.200 by construction, so no cross-shape comparison happens and cause 1 is fully neutralized;
+under `decoder` the same score drives k to 0.433 and v to 0.413.
+
+**What the preview already settled.** `--max_ratio 0.35` at a 0.5 target is infeasible (30% budget
+drift) and was raised to 0.6; `--max_ratio 0.5` at a 0.5 target collapses to exactly homogeneous and
+was dropped. Neither cost a GPU minute.
+
+**Preview.**
+
+One invocation per budget, because a cap is only meaningful above its target and
+`--sweep` is a cartesian product: 0.35 against a 0.5 target is the infeasible cell this preview
+exists to reject, and a rejection takes the exit code with it.
+
+```bash
+python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
+    --group_criterion hierarchical --inner_allocation softmax_temp \
+    --outer_allocation waterfill --outer_offset 1.05 --score_metric eff_rank \
+    --compression_ratio 0.2 --sweep "max_ratio=0.9,0.5,0.35" \
+    --out_dir ./output/allocation_reports/stage7b --plots
+
+python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
+    --group_criterion hierarchical --inner_allocation softmax_temp \
+    --outer_allocation waterfill --outer_offset 1.05 --score_metric eff_rank \
+    --compression_ratio 0.5 --sweep "max_ratio=0.9,0.6" \
+    --out_dir ./output/allocation_reports/stage7b_ratio0.5 --plots
+```
+
+**Gate.** Which cause dominates, which sets what stage 7c has to fix. Cause 1 is confirmed if run 1
+lands near homogeneous while run 2 does not.
+
+---
+
+## Stage 7c: the three fixes, and whether each one earns its place
+
+**Purpose.** Measure each fix alone and in combination, against the stage 7 anchors. Every one is off
+by default, so a fix that does not pay is simply not used.
+
+**Fix 1, `*_rel` scores (cause 1).** Six new metrics dividing out the ceiling the spectrum length
+imposes. On LLaMA under `softmax_temp`, which min-max normalizes within the group, they are
+**bit-identical to the raw form**: verified at `max_abs_diff = 0.000000` over all 224 matrices, since
+a division by a constant survives min-max normalization and every LLaMA family shares its bound. On
+Qwen the allocation moves to the shape LLaMA's winner has:
+
+| family | `eff_rank` | `eff_rank_rel` |
+|---|---|---|
+| q_proj | 0.281 | 0.373 |
+| k_proj | **0.440** | **0.278** |
+| v_proj | **0.419** | **0.153** |
+| o_proj | 0.249 | 0.307 |
+
+**Fix 2, `--min_rank_fraction` (a fourth defect, found while building fix 1).** A scalar cap is not
+shape invariant, so `--max_ratio 0.9` permits a square matrix down to 5.0% of its rank and a 512x3584
+projection only to 8.75% — a 1.75x spread in what the same guard rail allows. `--min_rank_fraction f`
+replaces it with `ratio <= 1 - f·(out + in)/max(out, in)`, which is one statement everywhere; `f =
+0.05` reproduces `--max_ratio 0.9` on a square matrix exactly, and `0.0` is the old behaviour.
+
+Two things to know before reading its rows. It does **not** address causes 2 or 3 — the ceiling it
+derives is *looser* on k/v than on square matrices, so it is the wrong tool for restraining a KV
+projection, and a per-family cap would be the right one if stage 7b shows the cap is the dominant
+lever. And once fix 1 is applied it binds `q_proj`, not k/v, because q is then the most rank-starved
+matrix in the run: at ratio 0.5 it moves q from 0.797 to 0.691 at `f = 0.125` and to 0.568 at `f =
+0.2` while k and v barely move. It is swept at 0.5 only, because at a 0.2 target the peak allocation
+is 0.58 and no ceiling loose enough to be a guard rail binds at all.
+
+**Fix 3, `--head_block_svd` (cause 3).** `k_proj` and `v_proj` factored one KV head at a time against
+the same whitening factor, so the reconstruction is block diagonal in head space and a head's rank
+cannot be spent on another's. It is the cheaper parametrization — `heads·r·(in + head_dim)` against
+`r_joint·(in + heads·head_dim)`, so 392 total rank against 358 at a 0.2 target — but block diagonality
+is also a constraint, and on synthetic weights it loses 3-4% when heads share their input structure
+and wins up to +35% when they do not and the truncation bites. **Whether it pays is empirical**, which
+is why it is probed alone, with fix 1, and homogeneous.
+
+The offline gate is favourable. A projection whose heads all spanned one row space could not exceed an
+effective rank of `head_dim`; Qwen's `k_proj` reaches **2.25x head_dim** and `v_proj` **3.28x**, so the
+KV heads carry substantially independent row spaces, which is the regime where the block form wins.
+
+**Runs.** 16, `args/experiments_stage7c_gqa_fixes.json`. Six at ratio 0.2 (each `*_rel` score, fix 3
+alone, fix 1+3, and homogeneous + fix 3) and ten at 0.5 (the same plus the `--min_rank_fraction`
+sweep). Every one was checked feasible offline before the stage was written.
+
+**Homogeneous + `--head_block_svd` is the cleanest probe of fix 3**: one variable against a recorded
+anchor, with no allocation involved at all.
+
+**Preview.** The allocation half only — fix 3 changes how a ratio is realized, never the ratio, so it
+is invisible to the offline report and its rows coincide with the plain ones:
+
+```bash
+python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
+    --group_criterion hierarchical --inner_allocation softmax_temp \
+    --outer_allocation waterfill --outer_offset 1.05 \
+    --sweep "compression_ratio=0.2,0.5" \
+    --sweep "score_metric=eff_rank,eff_rank_rel,entropy_rel,truncation_rel" \
+    --sweep "min_rank_fraction=0.0,0.125,0.2" \
+    --out_dir ./output/allocation_reports/stage7c --plots
+```
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/Qwen_Qwen2.5_7B --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/Qwen_Qwen2.5_7B/gates_stage7c.md
+```
+
+**Gate.** Whether heterogeneous allocation beats homogeneous on a grouped-query model once the score
+is scale free, and which of the three fixes the thesis keeps. A fix that does not beat its own control
+is reported as a negative result and left at its default.
 
 ---
 

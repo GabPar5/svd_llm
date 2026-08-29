@@ -1,0 +1,161 @@
+[
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank_rel"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank",
+    "--head_block_svd": true
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank_rel",
+    "--head_block_svd": true
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "entropy_rel"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "truncation_rel"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.2,
+    "--head_block_svd": true
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank_rel"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank",
+    "--min_rank_fraction": 0.125
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank_rel",
+    "--min_rank_fraction": 0.125
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank_rel",
+    "--min_rank_fraction": 0.2
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank",
+    "--head_block_svd": true
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank_rel",
+    "--head_block_svd": true
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "eff_rank_rel",
+    "--min_rank_fraction": 0.125,
+    "--head_block_svd": true
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "entropy_rel"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "hierarchical",
+    "--inner_allocation": "softmax_temp",
+    "--outer_allocation": "waterfill",
+    "--outer_offset": 1.05,
+    "--score_metric": "truncation_rel"
+  },
+  {
+    "--model": "Qwen/Qwen2.5-7B",
+    "--compression_ratio": 0.5,
+    "--head_block_svd": true
+  }
+]
