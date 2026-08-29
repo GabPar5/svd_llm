@@ -1804,6 +1804,22 @@ showed the gain is not monotone in any simple way — the aggressive scores win 
 This replaces the pilot's two-point onset probe. At fifteen minutes a run the full curve costs less
 than four hours and answers a question the thesis asks in its first chapter.
 
+**The curve is traced at the default knobs, and the gate now holds it there.** The stage file names no
+`--outer_offset` and no `--softmax_temp`, so its six ratios run at 1.5 and 1.0. Stages 3c and 4c swept
+both around the same allocation, but only at 0.2 and 0.5 — so those two budgets have a dozen runs
+sharing a grouping, a score and an inner policy where the other six have one. Before this was caught,
+`build_pivot`'s tie-break (first by run name) let `ooff1.05` stand in for ratio 0.5, and the printed
+curve read `+1.72, +7.26, +8.45` across 0.4, 0.5, 0.6 — a kink at exactly the budget the rest of the
+grid is measured on, produced by nothing but alphabetical order. Held at one arm it reads `+1.72,
++4.02, +8.45`.
+
+The gate therefore holds `max_ratio`, `outer_offset` and `softmax_temp` at their dominant values and
+carries `outer_allocation`, `outer_offset` and `softmax_temp` in the configuration column, so the arm
+is named in the table rather than inferred. **Read the `held at` notes**: they say how many runs of the
+sweeps were set aside, and the curve is a statement about the default-knob arm, not about the best
+configuration reachable at each budget. The one switch that survives is real — `swift_pool` wins at
+0.2 where `softmax_temp` wins everywhere else — and that is what the note beneath the table is for.
+
 **What to check in it.**
 
 - Where the gain peaks. The pilot's working hypothesis is that it tracks the headroom between the

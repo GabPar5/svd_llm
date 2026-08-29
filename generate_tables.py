@@ -3581,8 +3581,25 @@ def gate_stage8_curve(context: GateContext) -> GateResult:
     """Stage 8 (RQ1): how the heterogeneous gain depends on the target ratio"""
     axes = ( "group_criterion", "score_metric", "inner_allocation" )
     rows, _ = gate_rows(context.rows, axes, is_baseline_heterogeneous)
-    rows, held = hold_dominant(rows, "max_ratio")
-    pivot = build_pivot(rows, axes, context.metric)
+    notes: List[str] = []
+
+    # Stages 3c and 4c swept these around the same allocation, and the sweeps
+    # only exist at the two screening budgets. Without holding them, a ratio the
+    # sweep happened to cover is represented by whichever arm's name sorts first
+    # rather than by the arm its neighbours are traced at, which puts a kink in
+    # the curve at exactly the budgets the rest of the grid is measured on
+    for dimension in ( "max_ratio", "outer_offset", "softmax_temp" ):
+        rows, held = hold_dominant(rows, dimension)
+        notes += held
+
+    # Carried in the key so the table names the arm it is traced at, and so a
+    # value that escapes the hold above appears as its own row instead of
+    # silently standing in for the held one
+    # `outer_allocation` belongs here for the reason stage 7 gives: `hierarchical`
+    # with `param_share` is `decoder` under another name, so a row naming the
+    # grouping without it does not identify a configuration
+    labelled = axes + ( "outer_allocation", "outer_offset", "softmax_temp" )
+    pivot = build_pivot(rows, labelled, context.metric)
     baselines = homogeneous_baselines(context.rows, context.metric)
     ratios = sorted(set(baselines) | {ratio for row in pivot for ratio in row.runs})
 
@@ -3607,10 +3624,10 @@ def gate_stage8_curve(context: GateContext) -> GateResult:
             Cell(text=" / ".join(best.key) if best is not None else "--"),
         ])
 
-    notes = [
-        *held,
+    notes += [
         "the best heterogeneous configuration is picked per ratio, so the column may change configuration "
         "between rows, which is itself the answer if it does",
+        *confound_notes(rows, labelled),
     ]
 
     if len(gains) > 1:
@@ -3623,7 +3640,13 @@ def gate_stage8_curve(context: GateContext) -> GateResult:
     tables = [Table(
         title="Stage 8 gate: the ratio curve",
         purpose="Both arms across every collected budget, which is the shape RQ1 asks about rather than a slope",
-        headers=[ "ratio", f"hom {context.metric}", f"best het {context.metric}", "gain", "configuration" ],
+        headers=[
+            "ratio",
+            f"hom {context.metric}",
+            f"best het {context.metric}",
+            "gain",
+            "grouping / score / inner / outer / outer_offset / softmax_temp",
+        ],
         rows=body,
         notes=notes,
     )]
