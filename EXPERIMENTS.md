@@ -7,7 +7,7 @@ the placeholders of the next stage. The grid is deliberately not a cross product
 a single model at a single ratio is already 4 groupings x 6 scores x 4 inner policies = 96 runs.
 
 Stages 1 to 8 evaluate **wikitext perplexity only**. At roughly 15 minutes per run including that
-evaluation, the 221 compression runs below cost about 55 GPU hours on the 7B models, so the binding
+evaluation, the 223 compression runs below cost about 56 GPU hours on the 7B models, so the binding
 constraint on this grid is not time but whether each run answers a distinct question. Stage 7d is the
 exception: its seven runs are on a 32B model and are rationed accordingly.
 
@@ -335,6 +335,12 @@ Everything at or below 0.141 measured at least three times the homogeneous perpl
 or above 0.289 stayed within 12% of it. Five points at one budget is thin evidence and stage 7c adds
 sixteen more, so read the threshold as provisional.
 
+**Stage 7c re-fits it, and the fit holds.** Within one score at ratio 0.5 the ordering is exactly
+monotone in retained KV rank: 0.0875 measured 53.60, 0.125 measured 45.46, 0.200 measured 44.63. Every
+run below 0.15 at that budget again measured at least twice its anchor. Across scores it still does
+not rank -- `truncation_rel` sits at 0.0875 and beats `eff_rank_rel` at the same value -- so the screen
+stays a one-sided bound on damage and never a ranking.
+
 **Stage 7b's seven runs sharpen it and bound what it can be used for.** As a one-sided *damage* bound
 it survives: the two new runs below the band, 0.088 at ratio 0.5, measured 151.15 against a
 homogeneous 67.16, and every run at or above 0.35 stayed within 12% of its anchor or beat it. As a
@@ -509,7 +515,7 @@ Stage files carry literal placeholders until their gate resolves them.
 | `__CKPT_<ROLE>__` | stages 1 to 8 | a path under `output/models/huggyllama_llama_7b/` | nothing, these are outputs of runs |
 | `__FINALIST{1,2,3}_*` | stages 2 to 8 | the three configurations worth another model, with the outer policy each needs | rerun stage 0 per model: the Spearman sign and the score-versus-depth shape are model properties |
 | `__FINALIST1_SCORE_REL__` | stage 7, **derived** | the shape-invariant sibling of `__FINALIST1_SCORE__` | nothing, it is a spelling rather than a ranking |
-| `__GQA_WINNER{1,2}_*` | stage 7c | the two repaired configurations worth a second grouped-query model | the KV rank screen re-derived for that model |
+| `__GQA_WINNER1_*` | stage 7c | the repaired configuration worth a second grouped-query model | the KV rank screen re-derived for that model |
 
 `run_experiments.py` refuses to start while any remain, so an unfilled gate cannot silently run the
 wrong configuration.
@@ -1629,13 +1635,15 @@ projection only to 8.75% — a 1.75x spread in what the same guard rail allows. 
 replaces it with `ratio <= 1 - f·(out + in)/max(out, in)`, which is one statement everywhere; `f =
 0.05` reproduces `--max_ratio 0.9` on a square matrix exactly, and `0.0` is the old behaviour.
 
-Two things to know before reading its rows. It does **not** address causes 2 or 3 — the ceiling it
-derives is *looser* on k/v than on square matrices, so it is the wrong tool for restraining a KV
-projection, and a per-family cap would be the right one if stage 7b shows the cap is the dominant
-lever. And once fix 1 is applied it binds `q_proj`, not k/v, because q is then the most rank-starved
-matrix in the run: at ratio 0.5 it moves q from 0.797 to 0.691 at `f = 0.125` and to 0.568 at `f =
-0.2` while k and v barely move. It is swept at 0.5 only, because at a 0.2 target the peak allocation
-is 0.58 and no ceiling loose enough to be a guard rail binds at all.
+Once fix 1 is applied it binds `q_proj`, not k/v, because q is then the most rank-starved matrix in
+the run: at ratio 0.5 it moves q from 0.797 to 0.691 at `f = 0.125` and to 0.568 at `f = 0.2` while k
+and v barely move. It is swept at 0.5 only, because at a 0.2 target the peak allocation is 0.58 and no
+ceiling loose enough to be a guard rail binds at all.
+
+An earlier draft of this section concluded from that binding pattern that the floor was "the wrong
+tool for restraining a KV projection". **The inference does not follow and the runs contradict it.**
+Restraining `q_proj` is worth 16.7% on its own at ratio 0.5, which is the second largest effect in
+this stage. What binds and what pays are different questions.
 
 **Fix 3, `--head_block_svd` (cause 3).** `k_proj` and `v_proj` factored one KV head at a time against
 the same whitening factor, so the reconstruction is block diagonal in head space and a head's rank
@@ -1645,13 +1653,18 @@ is also a constraint, and on synthetic weights it loses 3-4% when heads share th
 and wins up to +35% when they do not and the truncation bites. **Whether it pays is empirical**, which
 is why it is probed alone, with fix 1, and homogeneous.
 
-The offline gate is favourable. A projection whose heads all spanned one row space could not exceed an
-effective rank of `head_dim`; Qwen's `k_proj` reaches **2.25x head_dim** and `v_proj` **3.28x**, so the
-KV heads carry substantially independent row spaces, which is the regime where the block form wins.
+An offline gate was written for it and **it was wrong**, which is worth keeping rather than deleting.
+The argument: a projection whose heads all spanned one row space could not exceed an effective rank of
+`head_dim`, and Qwen's `k_proj` reaches 2.25x `head_dim` and `v_proj` 3.28x, so the heads carry
+substantially independent row spaces and the block form should win. The runs refute it in every
+pairing. Effective rank above `head_dim` says the heads are not collinear; it does not say the joint
+factorization was failing to exploit what they share. The test is not a predictor and no stage should
+be gated on it.
 
-**Runs.** 16, `args/experiments_stage7c_gqa_fixes.json`. Six at ratio 0.2 (each `*_rel` score, fix 3
-alone, fix 1+3, and homogeneous + fix 3) and ten at 0.5 (the same plus the `--min_rank_fraction`
-sweep). Every one was checked feasible offline before the stage was written. `entropy_rel` and
+**Runs.** 18, `args/experiments_stage7c_gqa_fixes.json`. Six at ratio 0.2 (each `*_rel` score, fix 3
+alone, fix 1+3, and homogeneous + fix 3) and twelve at 0.5 (the same, the `--min_rank_fraction` sweep,
+and the two cap arms the first sixteen runs argued for). Every one was checked feasible offline before
+the stage was written. `entropy_rel` and
 `truncation_rel` are written literally because they are the score ablation itself; every other
 allocation dimension is placeheld on the stage 7 finalist, and fix 1's own score is spelled
 `__FINALIST1_SCORE_REL__` so it can never name a different family of score from the run it repairs.
@@ -1706,6 +1719,65 @@ python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
 Read `figures/family_tail.csv` per score: it is the KV rank screen, and on a grouped-query model it
 replaces the block screen rather than supplementing it.
 
+### Collected
+
+Sixteen of the eighteen have landed. The verdict differs for each fix, which is what the stage was
+built to produce.
+
+**Fix 1 wins at both budgets, and flips the sign.** Every shape-invariant score beats the homogeneous
+anchor; every raw one loses to it. This is the first configuration on Qwen where the *allocator* wins
+rather than a hand-built target selection.
+
+| | ratio 0.2 (hom 10.72) | ratio 0.5 (hom 67.16) |
+|---|---|---|
+| `eff_rank` -> `eff_rank_rel` | 12.00 (+11.9%) -> **9.76 (-9.0%)** | 151.15 (+125%) -> **53.60 (-20.2%)** |
+| `entropy` -> `entropy_rel` | 12.19 (+13.7%) -> **9.80 (-8.6%)** | 149.25 (+122%) -> **57.88 (-13.8%)** |
+| `truncation_rel` | **9.93 (-7.4%)** | **49.39 (-26.4%)** |
+
+The measured allocation reproduces the offline preview above to three decimals, as it must — the
+allocator is deterministic given its cache — so the offline report is now a trusted predictor on this
+model rather than a plausibility check.
+
+**Fix 2 pays at ratio 0.5, on top of fix 1.** On `eff_rank_rel`: 53.60 with no floor, **45.46** at
+`f = 0.125`, **44.63** at `f = 0.2`. It also helps the raw score (151.15 -> 110.13) without getting it
+anywhere near the anchor, so it is a second-order repair and not a substitute for fix 1.
+
+**Fix 3 loses in every pairing it was given.** Seven matched pairs, and the ratio maps are identical
+within each one, so this compares the *realization* with the allocation held fixed:
+
+| budget | on top of | without `hb` | with `hb` | change |
+|---|---|---|---|---|
+| 0.2 | homogeneous | 10.72 | 11.17 | +4.1% |
+| 0.2 | `eff_rank` | 12.00 | 13.82 | +15.2% |
+| 0.2 | `eff_rank_rel` | 9.76 | 10.12 | +3.7% |
+| 0.5 | homogeneous | 67.16 | **124.51** | **+85.4%** |
+| 0.5 | `eff_rank` | 151.15 | 226.87 | +50.1% |
+| 0.5 | `eff_rank_rel` | 53.60 | 59.01 | +10.1% |
+| 0.5 | `eff_rank_rel` + `mrf 0.125` | 45.46 | 53.68 | +18.1% |
+
+The damage grows with the budget, which is what a constraint does: block diagonality forbids spending
+rank on directions several heads share, and that forbidding costs most when there is least rank to
+spend. **`--head_block_svd` is a negative result. It stays off, no stage past this one runs it, and
+the thesis keeps it as future work with the offline gate's failure recorded beside it.**
+
+**What the repair does not reach.** Excluding k and v from compression entirely — stage 7b run 3,
+same budget, redistributed onto q, o and the MLP — is still the best configuration on this model:
+
+| budget | homogeneous | best repaired allocation | k and v excluded | repair captures |
+|---|---|---|---|---|
+| 0.2 | 10.72 | 9.76 | **8.93** | 54% |
+| 0.5 | 67.16 | 44.63 | **37.00** | 75% |
+
+So fix 1 and fix 2 together close half to three quarters of the distance to simply not touching the
+KV projections. That is cause 3 measured rather than argued: the metric defect is repaired and the
+architectural amplification is not, which is exactly the bound the thesis limitation on GQA states.
+
+**The two cap arms exist because of these rows.** Within `eff_rank_rel` at 0.5 the ordering is monotone
+in retained KV rank (0.0875 -> 53.60, 0.125 -> 45.46, 0.200 -> 44.63), and `--max_ratio 0.6` reaches
+**KV 0.350 while leaving `q_proj` at 0.573**, which the floor cannot do at any setting: `f = 0.3` buys
+KV 0.300 only by dropping q to 0.390. The cap restrains k and v directly where the floor restrains
+whatever is most rank-starved, so the two are complementary rather than alternatives.
+
 **Read the gate.**
 
 ```bash
@@ -1716,7 +1788,9 @@ python generate_tables.py output/eval/Qwen_Qwen2.5_7B --report gates \
 **Gate.** Whether heterogeneous allocation beats homogeneous on a grouped-query model once the score
 is scale free, and which of the three fixes the thesis keeps. A fix that does not beat its own control
 is reported as a negative result and left at its default. The gate ranks every run carrying a fix and
-resolves `__GQA_WINNER{1,2}_*` from the top two, which is what stage 7d spends.
+resolves `__GQA_WINNER1_*` from the best row that allocates, which is what stage 7d spends. A
+homogeneous run carrying a fix is ranked beside them under the score `none (homogeneous)`: it records
+no score of its own, and dropping it for that would discard the cleanest control the stage has.
 
 The gate selects rows by the fix they carry — a `_rel` score, a non-zero `--min_rank_fraction`, or
 `--head_block_svd` — rather than by the model, so it stays empty on the LLaMA directory instead of
@@ -1739,8 +1813,16 @@ Qwen2.5-32B has 40 over 8, **`G = 5`**. Two intermediate values turn the depende
 derived into measured, which is exactly the gap the thesis limitation on GQA currently records.
 
 **Runs.** 7, `args/experiments_stage7d_gqa_scale.json`, all Qwen2.5-32B and all pinned to `bfloat16`:
-a dense reference, homogeneous anchors at both ratios, and the two configurations stage 7c elects at
-both ratios.
+a dense reference, homogeneous anchors at both ratios, and two arms at both ratios.
+
+**The two arms differ in what they compress, not in how they allocate.** Stage 7c elects one
+allocation, so `__GQA_WINNER1_*` fills both; a second set of allocation placeholders would have
+carried the same configuration twice and spent 32B time on a knob. The second arm is instead the
+target selection that stage 7c could not beat — `--compress_att_k false --compress_att_v false` — which
+is the open question this stage can actually settle: whether an allocator that scores k and v
+correctly still loses to one that refuses to compress them, at a second sharing factor. Every matrix
+left after that exclusion has `min(out, in) = d_model`, so the shape defect cannot act inside it and
+the winner's score is the right one to carry rather than a third configuration.
 
 **The anchors are the point, not overhead.** 32B's homogeneous perplexity is not predictable from
 7B's, so without them there is no gain to report and the stage says nothing.
@@ -1754,6 +1836,9 @@ larger V2 eigendecompositions there. Build it in chunks with `--whitening_start_
 
 - **The sign.** Whether each elected configuration beats 32B's own homogeneous anchor at each ratio.
   That alone answers whether the repair transfers.
+- **Which arm wins.** On Qwen2.5-7B the exclusion arm beats the repaired allocation at both budgets,
+  by 8% at 0.2 and 17% at 0.5. If that ordering reverses at `G = 5` it is evidence the gap is the
+  sharing factor rather than something about k and v in general.
 - **The size against `G`.** The gain at `G = 5` against the gain at `G = 7`. The argument predicts the
   *unrepaired* damage grows with `G`, so the repair should be worth less at 32B, not more. A gain that
   grows instead means the mechanism is not the one the thesis describes.
@@ -1955,13 +2040,13 @@ In execution order.
 | 6b family budget | 5 | wikitext | feasibility only; the screen stands down |
 | 7 cross-model | 9 | wikitext, blocked on whitening | rerun stage 0 for the model |
 | 7b GQA diagnostics | 7 | wikitext | `family_tail`, and which caps are feasible |
-| 7c GQA fixes | 16 | wikitext | `family_tail` per score |
+| 7c GQA fixes | 18 | wikitext | `family_tail` per score |
 | 7d second sharing factor | 7 | wikitext, blocked on whitening | stage 0 and the elected allocation, on 32B |
 | 8 ratio curve | 12 | wikitext | the shape claim, made offline |
 | 9 benchmarks | 9 eval-only | full suite **and c4** | none |
 | 10 LoRA | 4 update-only | wikitext | none |
 
-**221 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
+**223 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
 stage 1b, one for Qwen2.5-7B and one for Qwen2.5-32B. At roughly 15 minutes a run that is about **55
 GPU hours** for the compressions on the two smaller models; stage 7d's seven runs are on a 32B model
 and cost several times that each, which is why they are the only ones the grid rations.

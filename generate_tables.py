@@ -1488,10 +1488,11 @@ PLACEHOLDER_SOURCES.update({
 PLACEHOLDER_SOURCES["__FINALIST1_SCORE_REL__"] = "stage 7, from __FINALIST1_SCORE__"
 
 # Stage 7d carries onto a second grouped-query model only what stage 7c elects,
-# so these are answered by the fix runs rather than by the LLaMA grid
+# so these are answered by the fix runs rather than by the LLaMA grid. One
+# configuration rather than two: 7d's other arm differs by which matrices it
+# compresses, not by how it allocates between them
 PLACEHOLDER_SOURCES.update({
-    f"__GQA_WINNER{index}_{role}__": "stage 7c"
-    for index in ( 1, 2 )
+    f"__GQA_WINNER1_{role}__": "stage 7c"
     for role in ( "GROUPING", "SCORE", "INNER", "OUTER" )
 })
 
@@ -3537,9 +3538,9 @@ def gate_stage7c_gqa_fixes(context: GateContext) -> GateResult:
         notes += held
 
     pivot = build_pivot(rows, axes, context.metric)
-    # A homogeneous row cannot fill an allocation placeholder, so a winner is
-    # taken from the rows that actually allocate
-    winners = [row for row in pivot if row.key[0] != HOMOGENEOUS_SCORE_LABEL][:2]
+    # A homogeneous row cannot fill an allocation placeholder, so the winner is
+    # the best row that actually allocates
+    winners = [row for row in pivot if row.key[0] != HOMOGENEOUS_SCORE_LABEL][:1]
     resolved: Dict[str, Resolution] = {}
     notes += confound_notes(rows, axes)
 
