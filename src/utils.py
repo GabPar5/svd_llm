@@ -25,6 +25,22 @@ from .modules import *
 # Threshold above which cuSOLVER 32-bit indexing overflows
 SOLVER_GPU_MAX_DIM = 32000
 
+# Peak device memory a dense solver holds, as a multiple of the n x n input.
+# `eigh` keeps an input copy and the eigenvector output and asks cuSOLVER for a
+# `syevd` workspace of ~3n^2 on top; `cholesky` writes a second n x n factor and
+# needs next to no workspace. Both are within a few percent on Qwen2.5-32B's
+# 27648-wide down-projection, where 5n^2 in fp64 is 28.5 GiB
+CUDA_EIGH_MEMORY_FACTOR = 5
+CUDA_CHOLESKY_MEMORY_FACTOR = 2
+
+# Free VRAM a solver must leave behind rather than spend
+CUDA_SOLVER_HEADROOM = 1.10
+
+# Rows of X the whitening hook casts to fp64 at a time. Casting a whole
+# calibration batch at once costs seq_len * batch * in_features * 8 bytes, which
+# on a 27648-wide input is 7.25 GiB of pure transient
+XXT_ROW_CHUNK = 4096
+
 # Enough to bracket and then resolve a scale to double precision
 MAX_BISECTION_STEPS = 128
 
@@ -195,13 +211,57 @@ def cuda_cleanup() -> None:
         torch.cuda.empty_cache()
     gc.collect()
 
+def cuda_solver_fits(
+        n: int,
+        itemsize: int,
+        device: str,
+        factor: int
+) -> Tuple[bool, float, float]:
+    """
+    Whether a dense n x n solve fits in the VRAM that is free right now.
+
+    `SOLVER_GPU_MAX_DIM` answers a different question -- cuSOLVER's 32-bit
+    indexing is a correctness bound and does not move -- so a matrix can clear
+    it and still not fit. The budget is read against `mem_get_info` rather than
+    the device total because the whitening loop is not necessarily alone on the
+    GPU, and a matrix that fitted for fifty layers stops fitting the moment
+    something else takes the room.
+
+    Returns (fits, needed_gib, free_gib) so the caller can report the shortfall
+    it is routing around.
+    """
+    needed = factor * n * n * itemsize
+    needed_gib = needed / 1024**3
+
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return False, needed_gib, 0.0
+
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    free_gib = free_bytes / 1024**3
+
+    return free_bytes > needed * CUDA_SOLVER_HEADROOM, needed_gib, free_gib
+
 def vram_usage(msg: str = "") -> None:
     torch.cuda.synchronize()
     alloc = torch.cuda.memory_allocated() / 1024**2
     reserved = torch.cuda.memory_reserved() / 1024**2
     peak = torch.cuda.max_memory_allocated() / 1024**2
     torch.cuda.reset_peak_memory_stats()
-    print(f"[VRAM] {msg} | allocated={alloc:.1f} MiB | reserved={reserved:.1f} MiB | peak={peak:.1f} MiB")
+
+    # The device's own view, which is the one a solver's allocation is judged
+    # against. Anything holding VRAM outside the caching allocator is invisible
+    # to `memory_allocated` -- another process, a second framework's allocator,
+    # or on a coherent-memory host the pages the driver has pulled into HBM --
+    # so `untracked` is what explains a solve that fitted for fifty layers and
+    # then stopped fitting
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    device_used = (total_bytes - free_bytes) / 1024**2
+    untracked = device_used - reserved
+
+    print(
+        f"[VRAM] {msg} | allocated={alloc:.1f} MiB | reserved={reserved:.1f} MiB | peak={peak:.1f} MiB "
+        f"| device_used={device_used:.1f} MiB | untracked={untracked:.1f} MiB",
+    )
 
 def ram_usage(msg: str = "") -> None:
     # Get current Process RAM

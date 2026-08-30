@@ -167,10 +167,20 @@ def get_whitening_matrices(
 
     # Hook definition to accumulate XX^T for the desired sublayers
     def hook(module, input, output):
-        inp = input[0].detach().to(dtype=module.raw_xxt_matrix.dtype)
-        act = torch.einsum("bsi,bsj->ij", inp, inp)
-        module.raw_xxt_matrix.add_(act)
-        del inp, act
+        # Accumulated in row chunks, straight into the fp64 accumulator: casting
+        # the whole batch to fp64 and letting einsum build the n x n product as
+        # a temporary costs two allocations the size of the widest activation
+        # and of XX^T itself, and neither is needed to sum the same outer
+        # products. The arithmetic stays fp64 either way
+        acc = module.raw_xxt_matrix
+        flat = input[0].detach().reshape(-1, acc.shape[0])
+
+        for start in range(0, flat.shape[0], XXT_ROW_CHUNK):
+            chunk = flat[start:start + XXT_ROW_CHUNK].to(dtype=acc.dtype)
+            acc.addmm_(chunk.transpose(0, 1), chunk)
+            del chunk
+
+        del flat
 
     whitening_matrices_paths: Dict[str, str] = {}
 
@@ -281,16 +291,30 @@ def get_whitening_matrices(
 
         vram_usage(f"After layer {idx} forward and CPU offload")
 
-        # Process whitening matrices one at a time
-        for lstr, raw_xxt_cpu in pending_xxt:
+        # Process whitening matrices one at a time, releasing each XXT from the
+        # pending list as it is consumed rather than at the end of the loop
+        while pending_xxt:
+            lstr, raw_xxt_cpu = pending_xxt.pop(0)
+
+            n = raw_xxt_cpu.shape[0]
+            itemsize = raw_xxt_cpu.element_size()
+
             if is_v2:
+                eigh_fits, eigh_gib, free_gib = cuda_solver_fits(n, itemsize, device, CUDA_EIGH_MEMORY_FACTOR)
+
                 # Route to jax if the matrix is too large (pytorch fails due to a cuSolver index error)
-                if raw_xxt_cpu.shape[0] > SOLVER_GPU_MAX_DIM:
+                if n > SOLVER_GPU_MAX_DIM:
                     print(
                         f"[WHITENING] Large matrix detected for {lstr}, "
                         f"routing eigh to in-process JAX GPU...",
                     )
                     L_s, U_s = eigh_jax_gpu_from_cpu(raw_xxt_cpu)
+                elif not eigh_fits:
+                    print(
+                        f"[WHITENING] eigh for {lstr} ({n}x{n}) needs ~{eigh_gib:.1f} GiB "
+                        f"but only {free_gib:.1f} GiB is free on {device}. Routing to CPU...",
+                    )
+                    L_s, U_s = torch.linalg.eigh(raw_xxt_cpu)
                 else:
                     # Move XXT to device
                     raw_xxt_gpu = raw_xxt_cpu.to(device)
@@ -319,11 +343,14 @@ def get_whitening_matrices(
                 del U_s, L_s
 
             else:
-                # Route to scipy on CPU if the matrix is too large (pytorch fails due to a cuSolver index error)
-                if raw_xxt_cpu.shape[0] > SOLVER_GPU_MAX_DIM:
+                chol_fits, chol_gib, free_gib = cuda_solver_fits(n, itemsize, device, CUDA_CHOLESKY_MEMORY_FACTOR)
+
+                # Route to scipy on CPU if the matrix is too large (pytorch fails
+                # due to a cuSolver index error) or simply does not fit in VRAM
+                if n > SOLVER_GPU_MAX_DIM or not chol_fits:
                     print(
-                        f"[WHITENING] Large matrix ({raw_xxt_cpu.shape[0]}x{raw_xxt_cpu.shape[0]}) "
-                        f"detected for {lstr}, routing Cholesky to CPU via scipy...",
+                        f"[WHITENING] Cholesky for {lstr} ({n}x{n}) needs ~{chol_gib:.1f} GiB "
+                        f"against {free_gib:.1f} GiB free on {device}. Routing to CPU via scipy...",
                     )
 
                     raw_xxt_np = raw_xxt_cpu.numpy()
