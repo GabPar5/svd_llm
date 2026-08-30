@@ -1498,6 +1498,10 @@ PLACEHOLDER_SOURCES.update({
 # Suffix that turns a spectral score into its shape-invariant counterpart, and
 # the scores that have one. A `norm|p` or a composite has no `_rel` spelling, so
 # a finalist naming one leaves `__FINALIST1_SCORE_REL__` unresolved on purpose
+# Stands in for the score a homogeneous run does not have, so that a run
+# carrying a fix on top of one still appears beside the allocations it controls
+HOMOGENEOUS_SCORE_LABEL = "none (homogeneous)"
+
 RELATIVE_SCORE_SUFFIX = "_rel"
 RELATIVE_SCORE_BASES = (
     "truncation",
@@ -3516,7 +3520,16 @@ def gate_stage7c_gqa_fixes(context: GateContext) -> GateResult:
     # The fixes are the axes; the allocation around them is held, because stage
     # 7c varies what repairs a configuration rather than which configuration it is
     axes = ( "score_metric", "min_rank_fraction", "head_block_svd" )
-    rows, skipped = gate_rows(context.rows, axes, carries_gqa_fix)
+
+    # A homogeneous run records no score, but a fix applied on top of one is the
+    # cleanest control the stage has: one variable against a recorded anchor,
+    # with no allocation involved at all. Naming its score keeps `gate_rows`
+    # from dropping it for an axis it cannot have
+    selected = [
+        row if "score_metric" in row else { **row, "score_metric": HOMOGENEOUS_SCORE_LABEL }
+        for row in context.rows if carries_gqa_fix(row)
+    ]
+    rows, skipped = gate_rows(selected, axes, carries_gqa_fix)
     notes = list(skipped_note(skipped))
 
     for dimension in ( "group_criterion", "inner_allocation", "outer_allocation", "max_ratio" ):
@@ -3524,7 +3537,9 @@ def gate_stage7c_gqa_fixes(context: GateContext) -> GateResult:
         notes += held
 
     pivot = build_pivot(rows, axes, context.metric)
-    winners = pivot[:2]
+    # A homogeneous row cannot fill an allocation placeholder, so a winner is
+    # taken from the rows that actually allocate
+    winners = [row for row in pivot if row.key[0] != HOMOGENEOUS_SCORE_LABEL][:2]
     resolved: Dict[str, Resolution] = {}
     notes += confound_notes(rows, axes)
 
