@@ -82,7 +82,7 @@ Reuse these instead of re-deriving the logic; each one is the single source of t
 | Head partitioning | `head_partition_from_config`, `head_partition_map`, `head_block_rank`, `head_block_entry` / `is_head_block_entry` |
 | Allocation primitives | `waterfill_ratios` (ratio space), `bounded_proportional_split` (rank space), `clamp_group_budget`, `build_shape_map`, `rank_cost`, `matrix_shapes_from_config` |
 | Sequential update | `validate_lora_batching`, `resolve_grad_accum_steps`, `build_lora_update_metadata`; `prepare_lora_update_data`, `run_local_u_update`, `lora_factor_targets`, `LORA_UPDATE_PHASES` (in `src/svd_llm.py`) |
-| Device plumbing | `pin_memory_enabled`, `synchronize_device`, `cuda_cleanup`, `set_attn_implementation`, `vram_usage`, `ram_usage` |
+| Device plumbing | `pin_memory_enabled`, `synchronize_device`, `cuda_cleanup`, `cuda_solver_fits`, `set_attn_implementation`, `vram_usage`, `ram_usage` |
 
 ### Compression pipeline
 
@@ -98,8 +98,9 @@ These models do not fit in VRAM alongside their decompositions, so the code is w
 
 - Weights live on CPU; individual decoder layers (and the modules before them) are moved to GPU, used, and moved back.
 - Whitening artifacts are written to disk one file per matrix and read back one at a time; `load_whitening_data` **pops** the path by default so an artifact is consumed once (`keep=True` is used for the score pass).
-- `SOLVER_GPU_MAX_DIM = 32000` guards a real cuSOLVER 32-bit indexing failure: larger matrices route to scipy on CPU (V1 Cholesky) or to in-process JAX GPU `eigh` (V2, `eigh_jax_gpu_from_cpu`).
-- Intermediates are explicitly set to `None` + `del`ed as soon as they are consumed, followed by `cuda_cleanup()`; `vram_usage()` / `ram_usage()` probes bracket every phase. The `[TAG]`-prefixed print instrumentation (`[WHITENING]`, `[BUDGET]`, `[SEQ-UPDATE]`, `[VRAM]`, …) is the primary debugging tool for multi-hour runs — extend it rather than removing it.
+- `SOLVER_GPU_MAX_DIM = 32000` guards a real cuSOLVER 32-bit indexing failure: larger matrices route to scipy on CPU (V1 Cholesky) or to in-process JAX GPU `eigh` (V2, `eigh_jax_gpu_from_cpu`). That bound is about correctness and does not move; whether a matrix that clears it actually *fits* is a second, separate test, made per call by `cuda_solver_fits(n, itemsize, device, factor)` against `mem_get_info` — `CUDA_EIGH_MEMORY_FACTOR = 5` (input copy + eigenvectors + a ~3n² `syevd` workspace) and `CUDA_CHOLESKY_MEMORY_FACTOR = 2`. A solve that does not fit falls back to the CPU rather than raising. On Qwen2.5-32B the 27648-wide `down_proj` needs 28.5 GiB in fp64 for one `eigh`, so a GPU shared with anything else fails there and nowhere else.
+- The whitening hook accumulates `XXᵀ` in `XXT_ROW_CHUNK`-row tiles via `addmm_` straight into the fp64 accumulator. Casting a whole calibration batch to fp64 and letting `einsum` build the product as a temporary costs two extra allocations sized by the widest activation and by `XXᵀ` itself — 13 GB of transient on a 27648-wide input, for arithmetic that is fp64 either way.
+- Intermediates are explicitly set to `None` + `del`ed as soon as they are consumed, followed by `cuda_cleanup()`; `vram_usage()` / `ram_usage()` probes bracket every phase. The `[TAG]`-prefixed print instrumentation (`[WHITENING]`, `[BUDGET]`, `[SEQ-UPDATE]`, `[VRAM]`, …) is the primary debugging tool for multi-hour runs — extend it rather than removing it. `vram_usage()` reports PyTorch's `allocated`/`reserved` **and** the device's own `device_used`/`untracked` from `mem_get_info`: a solver's allocation is judged against the device, not against the caching allocator, so a run whose `allocated` never leaves 32 MiB can still OOM once `untracked` has taken the room.
 - fp32 default with TF32 explicitly disabled (`allow_tf32 = False`, `matmul_precision("highest")`) and fp64 accumulation are deliberate: fp32 `XXᵀ` accumulation produced negative eigenvalues.
 
 ### Checkpoint format
