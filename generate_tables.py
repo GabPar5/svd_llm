@@ -3578,8 +3578,10 @@ def gate_stage7c_gqa_fixes(context: GateContext) -> GateResult:
         title="Stage 7c gate: the grouped-query repairs",
         purpose=(
             "Every run carrying a shape-invariant score, a shape-aware rank floor or a head-block "
-            "factorization, ranked against the homogeneous anchors of the same model. The top two fill "
-            "the `__GQA_WINNER*__` placeholders that stage 7d carries onto a second sharing factor"
+            "factorization, ranked against the homogeneous anchors of the same model. The top row that "
+            "allocates fills the `__GQA_WINNER1_*` placeholders that stage 7d carries onto a second "
+            "sharing factor. Only that one: the row below it is usually the same score under another "
+            "bound rather than a second configuration, so a second arm is taken from another gate"
         ),
         pivot=pivot,
         axis_headers=[ "score_metric", "min_rank_fraction", "head_block_svd" ],
