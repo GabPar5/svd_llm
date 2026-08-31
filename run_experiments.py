@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Set
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
 DEFAULT_BASE = Path("args/base_args.json")
 DEFAULT_EXPERIMENTS = Path("args/experiments.json")
@@ -24,6 +24,13 @@ RUN_NAME_ALIASES = {
     "heterogeneous": "het",
     "is_v2": "run_v2",
 }
+
+# Numeric `type=` declarations worth honouring. Resolving a gate value textually,
+# which is what `sed` over a stage file does and what EXPERIMENTS.md prescribes,
+# leaves a quoted JSON placeholder as the string "1.05" rather than the float.
+# argparse casts it on the way into main.py; anything reading a stage file
+# directly has to do the same or it sees a type main.py never sees
+NUMERIC_CASTS: Dict[str, Callable[[Any], Any]] = { "float": float, "int": int }
 
 def load_json(path: Path) -> Any:
     if not path.exists():
@@ -60,9 +67,14 @@ def build_command(base: Dict[str, Any], exp: Dict[str, Any]) -> List[str]:
             cmd.extend([ key, str(value) ])
     return cmd
 
-def argparse_defaults(script: Path = MAIN_SCRIPT) -> Dict[str, Any]:
+class MainArguments(NamedTuple):
+    """What main.py's argparse block declares, read out of its source"""
+    defaults: Dict[str, Any]
+    casts: Dict[str, Callable[[Any], Any]]
+
+def argparse_defaults(script: Path = MAIN_SCRIPT) -> MainArguments:
     """
-    The default of every main.py flag whose default is a literal.
+    The default and the numeric cast of every main.py flag that declares one.
 
     main.py builds its parser under `if __name__ == "__main__"`, so it cannot be
     imported and asked. Reading its source keeps that argparse block the single
@@ -72,9 +84,10 @@ def argparse_defaults(script: Path = MAIN_SCRIPT) -> Dict[str, Any]:
     it when the argument is omitted.
     """
     defaults: Dict[str, Any] = {}
+    casts: Dict[str, Callable[[Any], Any]] = {}
 
     if not script.exists():
-        return defaults
+        return MainArguments(defaults=defaults, casts=casts)
 
     for node in ast.walk(ast.parse(script.read_text(encoding="utf-8"))):
         if not isinstance(node, ast.Call):
@@ -95,6 +108,10 @@ def argparse_defaults(script: Path = MAIN_SCRIPT) -> Dict[str, Any]:
         keywords = { word.arg: word.value for word in node.keywords if word.arg }
         action = keywords.get("action")
 
+        declared = keywords.get("type")
+        if isinstance(declared, ast.Name) and declared.id in NUMERIC_CASTS:
+            casts[flag] = NUMERIC_CASTS[declared.id]
+
         if isinstance(action, ast.Constant) and action.value == "store_true":
             defaults[flag] = False
         elif "default" in keywords:
@@ -103,20 +120,30 @@ def argparse_defaults(script: Path = MAIN_SCRIPT) -> Dict[str, Any]:
             except (ValueError, TypeError, SyntaxError):
                 continue
 
-    return defaults
+    return MainArguments(defaults=defaults, casts=casts)
 
 class Settings(NamedTuple):
     """One run's arguments, read the way main.py will read them"""
     merged: Dict[str, Any]
-    defaults: Dict[str, Any]
+    spec: MainArguments
 
     def get(self, flag: str, fallback: Any = None) -> Any:
         if f"--{flag}" in self.merged:
-            return self.merged[f"--{flag}"]
-        return self.defaults.get(flag, fallback)
+            return self.cast(flag, self.merged[f"--{flag}"])
+        return self.spec.defaults.get(flag, fallback)
 
     def has(self, flag: str) -> bool:
-        return f"--{flag}" in self.merged or flag in self.defaults
+        return f"--{flag}" in self.merged or flag in self.spec.defaults
+
+    def cast(self, flag: str, value: Any) -> Any:
+        """Read a stage file's value as the type argparse would hand main.py"""
+        caster = self.spec.casts.get(flag)
+        if caster is None or value is None or isinstance(value, bool):
+            return value
+        try:
+            return caster(value)
+        except (TypeError, ValueError):
+            return value
 
 def resolved_run_name(settings: Settings) -> Optional[str]:
     """
@@ -151,10 +178,12 @@ def resolved_run_name(settings: Settings) -> Optional[str]:
 
     try:
         return build_run_name(**arguments)
-    except TypeError:
-        # A parameter this build_run_name requires has no value here, so the name
-        # cannot be known and the run has to happen
-        return None
+    except TypeError as error:
+        # Either a parameter this build_run_name requires has no value here, or
+        # one arrived as a type it cannot use. Both mean the name is unknown, so
+        # the run happens -- but the reason is carried out rather than swallowed,
+        # because a value of the wrong type is a bug to fix and not a fact
+        raise UndecidableName(str(error)) from error
 
 def requested_tasks(eval_tasks: Any) -> Set[str]:
     """The task names one entry asks its evaluation for, from `"t1,t2|shots"`"""
@@ -173,25 +202,31 @@ def evaluated_tasks(results_path: Path) -> Set[str]:
     except (json.JSONDecodeError, OSError):
         return set()
 
+class UndecidableName(Exception):
+    """`build_run_name` could not be called with the arguments a stage file gives"""
+
 class Completion(NamedTuple):
-    path: Path
+    path: Optional[Path]
     done: Set[str]
     missing: Set[str]
+    reason: Optional[str] = None
 
     @property
     def complete(self) -> bool:
-        return not self.missing
+        return self.reason is None and not self.missing
 
-def completion_of(base: Dict[str, Any], exp: Dict[str, Any], defaults: Dict[str, Any]) -> Optional[Completion]:
+def completion_of(base: Dict[str, Any], exp: Dict[str, Any], spec: MainArguments) -> Optional[Completion]:
     """
-    What this run has already evaluated, or None when that cannot be established.
+    What this run has already evaluated, or None when there is nothing to compare
+    it against.
 
-    None is the answer for a run that writes no evaluation to compare against and
-    for one whose name does not resolve. Callers read it as "not complete", so an
-    undecidable run is executed rather than silently skipped: a wrong skip loses
-    data, a wrong run only costs time.
+    None means the run writes no evaluation at all. A run whose name cannot be
+    derived comes back as a `Completion` carrying the reason instead, so it is
+    executed like an incomplete one but says why rather than looking like a run
+    that simply evaluates nothing. Either way an undecidable run executes: a
+    wrong skip loses data, a wrong run only costs time.
     """
-    settings = Settings({**base, **exp}, defaults)
+    settings = Settings({**base, **exp}, spec)
 
     writes_no_evaluation = (
         not settings.get("evaluate", False)
@@ -202,11 +237,15 @@ def completion_of(base: Dict[str, Any], exp: Dict[str, Any], defaults: Dict[str,
 
     wanted = requested_tasks(settings.get("eval_tasks"))
     if not wanted:
-        return None
+        return Completion(path=None, done=set(), missing=set(), reason="no task list to compare")
 
-    name = resolved_run_name(settings)
+    try:
+        name = resolved_run_name(settings)
+    except UndecidableName as error:
+        return Completion(path=None, done=set(), missing=set(), reason=f"run name undecidable ({error})")
+
     if name is None:
-        return None
+        return Completion(path=None, done=set(), missing=set(), reason="run name undecidable")
 
     from src.utils import sanitize_model_name
 
@@ -224,6 +263,8 @@ def describe(completion: Optional[Completion]) -> str:
     """The one-line reason a run is being executed or skipped"""
     if completion is None:
         return "no evaluation to compare against"
+    if completion.reason:
+        return completion.reason
     if completion.complete:
         return f"already evaluated: {', '.join(sorted(completion.done))}"
     if completion.done:
@@ -273,8 +314,16 @@ def main() -> None:
         print("\nFill them from the preceding stage's results, see EXPERIMENTS.md")
         sys.exit(1)
 
-    defaults = argparse_defaults()
-    completions = [ completion_of(base_args, exp, defaults) for exp in experiments ]
+    spec = argparse_defaults()
+    completions = [ completion_of(base_args, exp, spec) for exp in experiments ]
+
+    undecidable = [ i for i, found in enumerate(completions, 1) if found is not None and found.reason ]
+    if undecidable:
+        print(
+            f"[WARNING] {len(undecidable)} run(s) could not be matched against a collected "
+            f"evaluation: {', '.join(str(i) for i in undecidable)}. They will run. "
+            f"See the per-run line for why",
+        )
     done = [ i for i, found in enumerate(completions, 1) if found is not None and found.complete ]
 
     total_runs = len(experiments)

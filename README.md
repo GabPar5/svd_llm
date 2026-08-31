@@ -180,7 +180,12 @@ would have skipped.
 
 The run name it matches on comes from `build_run_name`, and the defaults it fills in are read out of
 `main.py`'s own argparse block, so neither is duplicated here and a renamed flag cannot leave the two
-disagreeing silently.
+disagreeing silently. That block also supplies the `type=` of each flag, which matters because
+resolving a gate value with `sed` leaves a quoted JSON placeholder as the string `"1.05"` rather than
+the float: argparse casts it on the way into `main.py`, and the skip check casts it the same way
+before deriving a name. When a name still cannot be derived the run executes and the reason is
+printed rather than swallowed, with a `[WARNING]` naming which runs it applies to -- a value of the
+wrong type is a bug to fix, not a fact about the run.
 
 A stage file may carry placeholders such as `__BEST_GROUPING__` for values that only the preceding stage's results can supply. Any string argument containing `__` aborts the whole stage before the first run, so an unfilled placeholder cannot quietly compress the wrong configuration. `EXPERIMENTS.md` describes the staged grid itself: what each stage answers, what to inspect, and which placeholder its results resolve.
 
