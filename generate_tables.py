@@ -1498,7 +1498,8 @@ PLACEHOLDER_SOURCES.update({
 
 # Suffix that turns a spectral score into its shape-invariant counterpart, and
 # the scores that have one. A `norm|p` or a composite has no `_rel` spelling, so
-# a finalist naming one leaves `__FINALIST1_SCORE_REL__` unresolved on purpose
+# a finalist naming one leaves `__FINALIST1_SCORE_REL__` unresolved on purpose.
+# A finalist that already carries the suffix resolves to itself
 # Stands in for the score a homogeneous run does not have, so that a run
 # carrying a fix on top of one still appears beside the allocations it controls
 HOMOGENEOUS_SCORE_LABEL = "none (homogeneous)"
@@ -3470,7 +3471,16 @@ def gate_stage7_finalists(context: GateContext) -> GateResult:
         # two things at once
         winner = str(finalists[0].key[1])
 
-        if winner in RELATIVE_SCORE_BASES:
+        # Idempotent on purpose. Once the shape-invariant scores win stage 7 the
+        # finalist is itself a `_rel` score, and a derivation that only fired on
+        # a raw base would stop resolving exactly because the fix it names
+        # succeeded, leaving stage 7c unable to be re-run from its own file
+        if winner.endswith(RELATIVE_SCORE_SUFFIX):
+            resolved["__FINALIST1_SCORE_REL__"] = Resolution(
+                value=winner,
+                candidates=len(pivot),
+            )
+        elif winner in RELATIVE_SCORE_BASES:
             resolved["__FINALIST1_SCORE_REL__"] = Resolution(
                 value=f"{winner}{RELATIVE_SCORE_SUFFIX}",
                 candidates=len(pivot),

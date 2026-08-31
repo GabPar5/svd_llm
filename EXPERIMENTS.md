@@ -16,7 +16,7 @@ with its `spectra/` cache and `layer_importance.pt`. Every stage below reads tha
 recomputes it — the one exception is stage 1b, which exists precisely to build a second one.
 
 **Execution order**, which is also the section order:
-`0, 1, 1b, 2, 2b, 2c, 3, 3c, 4, 4c, 4d, 5, 5b, 6, 6b, 7, 7b, 7c, 7d, 8, 9, 10`.
+`0, 1, 1b, 2, 2b, 2c, 3, 3c, 4, 4c, 4d, 5, 5b, 6, 6b, 7, 7b, 7c, 7d, 7e, 8, 9, 10`.
 
 ## The pilot, and why every number below is being re-measured
 
@@ -2032,6 +2032,78 @@ or about one checkpoint.
 
 ---
 
+## Stage 7e: closing the Qwen2.5-7B grid
+
+**Purpose.** Three gaps that an audit of the collected Qwen2.5-7B runs turned up. None of them is a
+new question; each is an axis the grid already argues about but priced at one budget, or on a
+configuration the thesis has since retired.
+
+**The reported rows had no downstream data.** This is the one that would have reached the thesis. Of
+the eleven Qwen2.5-7B runs carrying the full suite, every heterogeneous one is a *pre-repair*
+configuration -- raw `eff_rank`, raw `entropy`, `swift_pool`, `softmax_temp 0.5` -- and all of them
+lose to the homogeneous anchor at both budgets. Every configuration the thesis elects had wikitext
+alone. A downstream table built from that data would have shown heterogeneous allocation losing on
+every task, which is the result stages 7b and 7c exist to correct. Five runs put the seven reported
+tasks on the rows the thesis actually reports.
+
+**The cap ladder existed only at ratio 0.5 on the repaired score.** At 0.2 the caps were swept on raw
+`eff_rank` (0.35, 0.5, 0.9), before the shape-invariant scores existed. `--max_ratio 0.6` and `0.35`
+on the elected score at 0.2 make the bound claim hold at both ends of the curve rather than one, and
+0.6 is also what stage 7d prices on the 32B, so the two models are read on the same bound.
+
+**Grouping and temperature were swept only at ratio 0.2, and on the retired score.** Both are re-run
+on the elected score at both budgets. Four runs for `decoder` and `type`, two for `softmax_temp 0.5`.
+`decoder` and `type` take the default `param_share` outer level and read no offset, because the
+`waterfill` outer level needs a score per block and only `hierarchical` supplies one -- so a grouping
+comparison necessarily moves the outer level too. That is not a confound to fix but a property of the
+design: since `hierarchical` with `param_share` reproduces `decoder` exactly, the comparison is
+precisely "does the outer water-fill earn its place".
+
+**Runs.** 12, `args/experiments_stage7e_qwen7b_closeout.json`, all Qwen2.5-7B and all `bfloat16`. Two
+of them re-run a configuration already collected in order to add the six missing tasks to its JSON;
+`--skip_completed` reports those as incomplete and the rest as new, so the stage can be run as it
+stands.
+
+**It consumes `__GQA_WINNER1_*`, not `__FINALIST1_SCORE_REL__`.** Stage 7c's own placeholders have
+drifted: `__FINALIST1_SCORE_REL__` derives from the stage 7 finalist, and now that the
+shape-invariant scores have won stage 7 that finalist is itself `entropy_rel`, so the placeholder no
+longer resolves to the `eff_rank_rel` the collected 7c runs used. Stage 7e therefore names the
+configuration stage 7c *elected*, which is stable, and the same placeholder stage 7d carries.
+
+**The two exclusion arms change score label without changing the allocation.** The collected k/v
+exclusion runs on 7B used raw `eff_rank` while 32B used `eff_rank_rel`, and stage 7e re-runs them
+under the `_rel` spelling so both models carry the same axis value. This costs nothing in
+information: once k and v are excluded every remaining matrix has `min(d_out, d_in) = d_model`, so the
+`_rel` divisor is constant inside each group and `softmax_temp`'s min-max normalization removes it
+exactly. Checked offline across all 140 matrices at both budgets, the two allocations are identical to
+the last bit, so the re-run should reproduce 8.93 and 37.00 and is worth having as a measured
+confirmation of that argument.
+
+**Preview.** The cap ladder at the low budget, which is the only genuinely new allocation here:
+
+```bash
+python allocation_report.py --model "Qwen/Qwen2.5-7B" --run_v2 \
+    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
+    --compression_ratio 0.2 \
+    --group_criterion __GQA_WINNER1_GROUPING__ --score_metric __GQA_WINNER1_SCORE__ \
+    --inner_allocation __GQA_WINNER1_INNER__ --outer_allocation __GQA_WINNER1_OUTER__ \
+    --outer_offset __BEST_OUTER_OFFSET__ \
+    --sweep "max_ratio=0.35,0.6,0.9" \
+    --out_dir ./output/allocation_reports/stage7e_cap --plots
+```
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/Qwen_Qwen2.5_7B --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/Qwen_Qwen2.5_7B/gates_stage7e.md
+```
+
+**Gate.** Reporting. Nothing downstream waits on it, which is why it runs after stage 7d rather than
+before: it closes the 7B grid rather than deciding anything the 32B needs.
+
+---
+
 ## Stage 8: the ratio curve (RQ1)
 
 **Purpose.** How the heterogeneous gain depends on the target ratio. The pilot's two budgets already
@@ -2100,6 +2172,31 @@ python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
 **Runs.** 9 evaluation-only, `args/experiments_stage9_benchmarks.json`. No compression — each entry
 loads a `__CKPT_*__` checkpoint and evaluates
 `wikitext,c4,arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k,truthfulqa_gen|0`.
+
+**The two generation tasks are collected but not reported, and are not run again.** Stage 7d and any
+later full-suite pass use the seven-task suite without `gsm8k` and `truthfulqa_gen`. They are
+`generate_until` tasks, so they decode autoregressively and dominate the cost of a suite on a 32B
+model, and what they measure here does not survive inspection:
+
+- `gsm8k` **strict-match is 0.0000 in every compressed run of both models**, and 0.0000 for dense
+  LLaMA-7B too. Dense Qwen2.5-7B reaches 0.0083 with a standard error of 0.0025, which is noise. These
+  are base models evaluated zero-shot, so that is the expected result rather than a surprise.
+- `gsm8k` **flexible-extract is non-zero and points the wrong way**: on Qwen2.5-7B at ratio 0.2 the
+  homogeneous run scores 0.0485 against 0.0227 and 0.0053 for the heterogeneous runs that beat it on
+  every other measure. It regex-matches any number in the output, so on a degraded model it rewards
+  producing digits at all. A metric that inverts the ordering is worse than a missing one.
+- `truthfulqa_gen`'s **`bleu_acc` inverts on Qwen**: dense scores 0.0747 and *every* compressed run
+  scores higher, up to 0.3647. It compares BLEU against a true answer with BLEU against a false one,
+  and when both collapse the comparison is close to a coin flip. `bleu_max` does fall monotonically
+  (3.62 to 1.12 to 0.27), but it is a text-overlap score on a base model and the thesis argues nothing
+  about it.
+
+The five multiple-choice tasks behave: `arc_easy`, `hellaswag`, `openbookqa`, `piqa` and `winogrande`
+all fall monotonically with perplexity on both models. Those plus `wikitext` and `c4` are the seven
+the thesis reports, identically for all three models, which is what keeps a downstream table
+comparable across them. The stage 9 file keeps the nine-task string because its LLaMA-7B and
+Qwen2.5-7B runs were collected with it, and a stage file that no longer describes what it produced is
+worse than a wide one.
 
 **Check the roster's `on disk` column first.** These runs cannot recompress, so a missing checkpoint
 costs a compression run before this stage can start.
@@ -2197,11 +2294,12 @@ In execution order.
 | 7b GQA diagnostics | 7 | wikitext | `family_tail`, and which caps are feasible |
 | 7c GQA fixes | 18 | wikitext | `family_tail` per score |
 | 7d second sharing factor | 18 | wikitext; full suite on the dense, anchor and elected-bound rows | stage 0, the elected allocation, and the cap and floor sweeps, on 32B |
+| 7e Qwen2.5-7B closeout | 12 | wikitext; full suite on the five reported rows | the cap ladder at 0.2 and the grouping arms, on 7B |
 | 8 ratio curve | 12 | wikitext | the shape claim, made offline |
 | 9 benchmarks | 9 eval-only | full suite **and c4** | none |
 | 10 LoRA | 4 update-only | wikitext | none |
 
-**234 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
+**246 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
 stage 1b, one for Qwen2.5-7B and one for Qwen2.5-32B. At roughly 15 minutes a run that is about **55
 GPU hours** for the compressions on the two smaller models; stage 7d's eighteen runs are on a 32B model
 and cost several times that each, which is why they are the only ones the grid rations. Nine of those
