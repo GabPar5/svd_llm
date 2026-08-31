@@ -448,12 +448,25 @@ perplexity ordering — it prices the allocation, not the model.
 python run_experiments.py args/experiments_stage1_anchors.json            # run it
 python run_experiments.py args/experiments_stage1_anchors.json --dry_run  # preview the commands
 python run_experiments.py args/experiments_stage4_policies.json --base args/other_base.json
+python run_experiments.py args/experiments_stage8_ratio_curve.json --skip_completed  # resume it
 ```
 
 The runner merges `args/base_args.json` into each entry of the stage file, refuses to start if any
 entry still holds an unresolved gate value, and continues to the next run when one fails rather than
 aborting the queue.
 
+**Resuming a stage.** Every invocation reports how many of its entries are already complete, and
+`--skip_completed` acts on that. Complete means the run's evaluation JSON holds **every task that
+entry asks for**, not merely that the file exists — a run collected on wikitext alone still executes
+for an entry that has since been widened to the full suite, which is what makes it safe to add tasks
+to a stage that has already run. Anything undecidable is executed rather than skipped: a run with no
+evaluation to compare against (`--whitening_only`, or `--evaluate` off) and a run whose name does not
+follow from its arguments both count as incomplete.
+
+The flag is off by default on purpose. A run name encodes the configuration and nothing about the
+code that produced it, so after changing the pipeline every name is unchanged and a whole stage would
+look complete. Re-running a stage to pick up a code change is exactly the case where skipping is
+wrong, and it is the common one in this repository.
 The commands it prints are informational, not copy-paste ready: a score like `norm|1` holds a pipe a
 shell would interpret. `subprocess` passes it as one argument, so runs are unaffected.
 
@@ -591,7 +604,8 @@ hand: this tool takes flags, not stage files. A non-zero exit means an invariant
 `max_block_ratio`, then the degeneracy warning, then `map_distance`, then `dispersion`. Write any
 chosen knob into `args/base_args.json` and delete the dropped cells from the stage file.
 
-**3. Run the stage**, `--dry_run` first.
+**3. Run the stage**, `--dry_run` first. Add `--skip_completed` when resuming one that was
+interrupted, or when entries were added to a stage already partly collected.
 
 **4. Read the gate.**
 
@@ -1812,10 +1826,30 @@ predicts an effect that grows with `G`. Qwen2.5-7B has 28 query heads over 4 KV 
 Qwen2.5-32B has 40 over 8, **`G = 5`**. Two intermediate values turn the dependence on `G` from
 derived into measured, which is exactly the gap the thesis limitation on GQA currently records.
 
-**Runs.** 7, `args/experiments_stage7d_gqa_scale.json`, all Qwen2.5-32B and all pinned to `bfloat16`:
-a dense reference, homogeneous anchors at both ratios, and two arms at both ratios.
+**Runs.** 18, `args/experiments_stage7d_gqa_scale.json`, all Qwen2.5-32B and all pinned to
+`bfloat16`. The first nine are the original transfer probe — a dense reference, homogeneous anchors at
+0.2 and 0.5, and three arms at both ratios. The nine that follow were added once those came back, and
+they answer a second question the first nine raised rather than repeating them: whether the *bounds*
+transfer, and where along the ratio axis the heterogeneous arm stops paying.
 
-**The two arms differ in what they compress, not in how they allocate.** Stage 7c elects one
+**The third arm carries the other gate's score.** Stage 7 and stage 7c both elect a configuration
+from Qwen2.5-7B and they agree on grouping, inner and outer policy but not on the score: 7c ranks the
+repairs and elects `__GQA_WINNER1_SCORE__`, stage 7 ranks the finalists and elects
+`__FINALIST1_SCORE__`. Running both at `G = 5` is what says whether that disagreement survives a
+change of model, and it costs two runs rather than a third configuration. Note that the 7c gate fills
+`__GQA_WINNER1_*` only: the pivot row below its winner is usually the same score under a different
+bound, so a genuine second arm has to come from elsewhere, and stage 7 is where it comes from.
+
+**The bounds are a swept axis here, so they are literal rather than placeheld.** `__GQA_WINNER1_*`
+and `__BEST_OUTER_OFFSET__` still carry the allocation, exactly as before. `--max_ratio` and
+`--min_rank_fraction` are written out as values, on the same principle stages 7b and 7c already
+follow: a stage spells out the axis it sweeps and inherits everything else. This is also the trap
+that cost the first nine runs their headline — the 7c gate resolves an *allocation*, and its own
+note says so, but the elected row on Qwen2.5-7B also carried `--min_rank_fraction 0.2`, and the
+placeholders could not express it. Every one of the first nine therefore ran at `--max_ratio 0.9`
+with no floor, which is the configuration stage 7c had already retired.
+
+**Two of the three arms differ in what they compress, not in how they allocate.** Stage 7c elects one
 allocation, so `__GQA_WINNER1_*` fills both; a second set of allocation placeholders would have
 carried the same configuration twice and spent 32B time on a knob. The second arm is instead the
 target selection that stage 7c could not beat — `--compress_att_k false --compress_att_v false` — which
@@ -1827,13 +1861,84 @@ the winner's score is the right one to carry rather than a third configuration.
 **The anchors are the point, not overhead.** 32B's homogeneous perplexity is not predictable from
 7B's, so without them there is no gain to report and the stage says nothing.
 
+**The nine added runs, and what each is for.** They are ordered in the file by what they decide, so a
+stage stopped early still holds the cells the thesis depends on:
+
+- **The bound ladder at 0.5** (`--max_ratio 0.6`, `--max_ratio 0.7`, `--min_rank_fraction 0.2`). On
+  Qwen2.5-7B, on the repaired score at this budget, the ladder runs 53.60 at `cap 0.9`, 45.46 at
+  `f = 0.125`, 44.63 at `f = 0.2`, 42.89 at `cap 0.7` and **39.21 at `cap 0.6`**. The cap is the
+  stronger of the two bounds there, and neither was ever applied to 32B. Three runs decide whether
+  that ordering is a property of the method or of the 7B checkpoint.
+- **`--max_ratio 0.6` with k and v excluded**, the best-known combination of the two things that
+  worked, which no model has yet been run at.
+- **`--max_ratio 0.6` at ratio 0.2**, so the elected bound is priced at both ends of the curve rather
+  than only where the unbounded arm failed.
+- **Ratios 0.3 and 0.4, both arms.** With the two runs above, these close a four-point curve at one
+  configuration (0.2, 0.3, 0.4, 0.5) against a homogeneous anchor at each. The collected nine put
+  the sign change somewhere between 0.2 and 0.5 and cannot say where; this locates it. It is the only
+  addition that is not a bound, and the reason it is worth 32B time is in the next paragraph.
+
+**Why the crossover is the interesting quantity.** Normalizing each model by its own dense reference
+and working in nats, the share of the compression damage that reallocation recovers orders the three
+models the same way at both collected budgets, and the ordering is by how far the homogeneous anchor
+has already degraded rather than by size or by `G`: at 0.2, LLaMA-7B recovers 12.0% at 1.37x dense,
+32B 15.9% at 1.44x, and 7B 20.9% at 1.56x; at 0.5, 32B *loses* 21.2% at 3.66x, LLaMA recovers 12.2%
+at 4.33x, and 7B 23.6% at 9.80x. If that reading is right the crossover is a property of the anchor,
+not of the model, and it should sit at the budget where 32B's homogeneous arm reaches roughly the
+damage LLaMA carries at 0.4 to 0.5. Ratios 0.3 and 0.4 are where that prediction is falsifiable.
+
+### Collected
+
+The first nine, on wikitext. Gain is the homogeneous anchor of the same model minus the row:
+
+| arm | 0.2 | gain | 0.5 | gain |
+| --- | --- | --- | --- | --- |
+| dense | 5.02 | -- | 5.02 | -- |
+| homogeneous | 7.24 | -- | 18.35 | -- |
+| `eff_rank_rel` | **6.83** | **+0.41** | 24.14 | **-5.79** |
+| `entropy_rel` | 6.83 | +0.40 | 26.15 | -7.80 |
+| `eff_rank_rel`, k and v excluded | **6.69** | **+0.55** | **20.77** | **-2.42** |
+
+**The repair transfers at 0.2 and reverses at 0.5.** Both scores beat the anchor at the low budget
+and lose at the high one, and the exclusion arm is the best of the three at both — the same ordering
+Qwen2.5-7B reports, so that much does carry to `G = 5`. The two scores are 0.01 apart at 0.2, which
+the gate refuses to rank and which stage 1b would have to resolve.
+
+**The reversal is confounded, which is what the nine added runs are for.** Every row above ran at
+`--max_ratio 0.9` with no floor. Offline, at ratio 0.5, that setting leaves `k_proj` **0.0833** of its
+rank against a fitted danger threshold of 0.141, and pins `q_proj`, `k_proj` and `o_proj` to the cap;
+`--max_ratio 0.6` is the only setting of 0.6, 0.7 and 0.9 that clears both the block screen and the KV
+screen, lifting `k_proj` to 0.3333 and `q`/`o` to 0.2000. So the sentence this stage exists to write —
+that the gain reverses at a second sharing factor — is currently indistinguishable from the sentence
+that the repair was never applied.
+
+**One thing the screens do not do is predict the sign.** At ratio 0.5 and `cap 0.9` the KV screen
+fires just as hard on Qwen2.5-7B (`k_proj` 0.0875) as on 32B (0.0833), and 7B still beat its anchor
+while 32B did not. The screens price damage; whether damage loses is decided by how much headroom the
+homogeneous arm had left. Report them that way rather than as a predictor of the outcome.
+
 **Blocked on whitening.** 32B needs its own `get_whitening_matrices` pass, and it is the one model in
 the grid that routes through the in-process JAX GPU `eigh` — `SOLVER_GPU_MAX_DIM = 32000` sends its
 larger V2 eigendecompositions there. Build it in chunks with `--whitening_start_layer` /
-`--whitening_end_layer` and `--whitening_only`; that pass, not the seven runs, is this stage's cost.
+`--whitening_end_layer` and `--whitening_only`; that pass, not the nine runs, is this stage's cost.
 
-**What to check in it.** Three things, in order:
+**What to check in it.** The first three are answered by the collected nine and recorded above; the
+rest are what the nine added runs are read for:
 
+- **Whether the reversal survives the bound.** `--max_ratio 0.6` at ratio 0.5 against the 24.14 the
+  unbounded arm measured, and against the 18.35 anchor. On Qwen2.5-7B the same change was worth 27%.
+  If it clears the anchor the reversal was a configuration, not a scale effect, and the cross-model
+  claim becomes one about bounds. If it does not, the reversal is real and the thesis can say so with
+  the repair applied rather than withheld.
+- **Cap against floor, on a second model.** `--max_ratio 0.6` against `--min_rank_fraction 0.2` at the
+  same budget. Section 3.3.1 of the thesis introduces the floor and promises Section 4.7 reports what
+  it buys; right now that promise rests on one model. Whichever wins, both numbers are needed, because
+  the two bounds are not interchangeable: the floor leaves the depth profile bit-identical (the block
+  peak is 0.7077 on 7B at both `f = 0` and `f = 0.2`) and works only inside blocks, while the cap
+  reshapes depth as well.
+- **Where the curve crosses.** The four-point curve at `cap 0.6` against its four anchors. A crossover
+  that lands where the damage reading predicts is a much stronger result than a sign flip at one
+  budget, and a crossover that does not land there falsifies the reading cleanly.
 - **The sign.** Whether each elected configuration beats 32B's own homogeneous anchor at each ratio.
   That alone answers whether the repair transfers.
 - **Which arm wins.** On Qwen2.5-7B the exclusion arm beats the repaired allocation at both budgets,
@@ -1863,7 +1968,57 @@ python allocation_report.py --model "Qwen/Qwen2.5-32B" --run_v2 \
 
 The second one is the cheap gate: if `figures/family_tail.csv` shows the elected configuration landing
 `k_proj` or `v_proj` back inside the danger band at `G = 5`, the repair is 7B-specific and that is
-worth knowing before the whitening pass, not after.
+worth knowing before the whitening pass, not after. It did: at `--max_ratio 0.9` and no floor the
+elected allocation leaves `k_proj` 0.0833 of its rank.
+
+The two sweeps behind the added runs, which is where the `--max_ratio 0.6` choice comes from:
+
+```bash
+python allocation_report.py --model "Qwen/Qwen2.5-32B" --run_v2 \
+    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
+    --compression_ratio 0.5 \
+    --group_criterion __GQA_WINNER1_GROUPING__ --score_metric __GQA_WINNER1_SCORE__ \
+    --inner_allocation __GQA_WINNER1_INNER__ --outer_allocation __GQA_WINNER1_OUTER__ \
+    --outer_offset __BEST_OUTER_OFFSET__ \
+    --sweep "max_ratio=0.6,0.7,0.9" \
+    --out_dir ./output/allocation_reports/stage7d_cap --plots
+
+python allocation_report.py --model "Qwen/Qwen2.5-32B" --run_v2 \
+    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
+    --compression_ratio 0.5 \
+    --group_criterion __GQA_WINNER1_GROUPING__ --score_metric __GQA_WINNER1_SCORE__ \
+    --inner_allocation __GQA_WINNER1_INNER__ --outer_allocation __GQA_WINNER1_OUTER__ \
+    --outer_offset __BEST_OUTER_OFFSET__ \
+    --sweep "min_rank_fraction=0.0,0.125,0.2" \
+    --out_dir ./output/allocation_reports/stage7d_floor --plots
+```
+
+Only `max_ratio=0.6` comes out of the first with neither screen firing. The second is what makes the
+floor comparable: it moves `k_proj` from 0.0833 to 0.1250 to 0.2000 without touching the depth
+profile, which is the distinction the thesis draws between the two bounds.
+
+**The 32B whitening cache may be missing its version directory.** `allocation_report.py` resolves
+spectra at `whitening_matrices/<model>/<v1|v2>/spectra`, and a cache moved off a scratch drive can
+land at `whitening_matrices/<model>/spectra` with the `v2` level dropped, which reads as "no cached
+spectra". Symlink rather than move, so the compression runs and the offline tool agree:
+
+```bash
+ln -sfnT "$PWD/output/whitening_matrices/Qwen_Qwen2.5_32B" \
+    "$PWD/output/whitening_matrices/Qwen_Qwen2.5_32B/v2"
+```
+
+**Running only the added work.** `--skip_completed` skips a run whose evaluation JSON already holds
+every task it asks for, so the stage can simply be re-run:
+
+```bash
+python run_experiments.py args/experiments_stage7d_gqa_scale.json --dry_run --skip_completed
+python run_experiments.py args/experiments_stage7d_gqa_scale.json --skip_completed
+```
+
+That leaves 12 invocations of the 18. Entries 4 to 9 skip; entries 1 to 3 do **not**, because the
+anchors and the dense reference now ask for the full suite while only wikitext was collected for them,
+and coverage rather than the file existing is what the flag tests. Run it without the flag first if
+you want the same report without acting on it.
 
 **Read the gate.**
 
@@ -2041,15 +2196,18 @@ In execution order.
 | 7 cross-model | 9 | wikitext, blocked on whitening | rerun stage 0 for the model |
 | 7b GQA diagnostics | 7 | wikitext | `family_tail`, and which caps are feasible |
 | 7c GQA fixes | 18 | wikitext | `family_tail` per score |
-| 7d second sharing factor | 7 | wikitext, blocked on whitening | stage 0 and the elected allocation, on 32B |
+| 7d second sharing factor | 18 | wikitext; full suite on the dense, anchor and elected-bound rows | stage 0, the elected allocation, and the cap and floor sweeps, on 32B |
 | 8 ratio curve | 12 | wikitext | the shape claim, made offline |
 | 9 benchmarks | 9 eval-only | full suite **and c4** | none |
 | 10 LoRA | 4 update-only | wikitext | none |
 
-**223 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
+**234 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
 stage 1b, one for Qwen2.5-7B and one for Qwen2.5-32B. At roughly 15 minutes a run that is about **55
-GPU hours** for the compressions on the two smaller models; stage 7d's seven runs are on a 32B model
-and cost several times that each, which is why they are the only ones the grid rations.
+GPU hours** for the compressions on the two smaller models; stage 7d's eighteen runs are on a 32B model
+and cost several times that each, which is why they are the only ones the grid rations. Nine of those
+eighteen were added after the first nine came back, and stage 7d is the one place in the grid where
+the full evaluation suite rides along with the compression rather than following as stage 9: 32B
+checkpoints are not kept, so an eval-only pass over them would mean compressing a second time.
 
 GPU time is not the binding constraint, so these counts describe the grid rather than budget it: spend
 runs wherever they resolve something. What the offline pass buys is not saved hours but the guarantee

@@ -166,7 +166,21 @@ Boolean `true` emits the bare flag, `null` drops the argument, anything else is 
 python run_experiments.py                                          # args/experiments.json
 python run_experiments.py args/experiments_stage2_score_grouping.json
 python run_experiments.py args/experiments_stage4_policies.json --dry_run
+python run_experiments.py args/experiments_stage8_ratio_curve.json --skip_completed
 ```
+
+`--skip_completed` skips a run whose evaluation JSON already holds **every task that run asks for**.
+The test is task coverage rather than the file existing, because `merge_eval_results` lets a second
+evaluation add tasks to an earlier one: a run collected on `wikitext` alone is not complete for an
+entry that now asks for the full suite, and still executes. A run that writes no evaluation to compare
+against — `--whitening_only`, or `--evaluate` left off — and a run whose name cannot be derived from
+its arguments both count as incomplete and always execute, since a wrong skip loses data while a wrong
+run only costs time. The count is reported either way, so leaving the flag off still tells you what it
+would have skipped.
+
+The run name it matches on comes from `build_run_name`, and the defaults it fills in are read out of
+`main.py`'s own argparse block, so neither is duplicated here and a renamed flag cannot leave the two
+disagreeing silently.
 
 A stage file may carry placeholders such as `__BEST_GROUPING__` for values that only the preceding stage's results can supply. Any string argument containing `__` aborts the whole stage before the first run, so an unfilled placeholder cannot quietly compress the wrong configuration. `EXPERIMENTS.md` describes the staged grid itself: what each stage answers, what to inspect, and which placeholder its results resolve.
 
