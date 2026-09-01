@@ -198,6 +198,12 @@ So `--max_ratio` earns its place by stopping a configuration that would run away
 point it takes off one that would not is a small loss. It stays at **0.9** and stage 3 sweeps it where
 it actually binds, which is on the flat groupings.
 
+> This conclusion held, and it is LLaMA-specific. Stage 7f re-measured it under the configuration the
+> grid eventually elected and found the same thing -- `cap 0.6` costs 17% at ratio 0.5 -- while stages
+> 7d and 7e found the opposite on both Qwen models, where the same bound is the single largest effect
+> in the grid. Read this section as a result about multi-head attention rather than about the
+> allocator, and do not carry "it stays at 0.9" onto a grouped-query model.
+
 ### The offline objectives rank backwards
 
 Stage 2 measured the offline ordering against the measured one on all nine cells and **every row
@@ -2255,12 +2261,73 @@ peak across the curve at `cap 0.9`, from the preview below: 0.326 at ratio 0.2, 
 at 0.4, **0.814** at 0.5, then 0.900 at 0.6, 0.7 and 0.8. The 0.4 entry asks for wikitext only; only
 the 0.5 entry carries the suite, because 0.5 is the budget the thesis reports.
 
+**The 0.4 entry did not isolate the cap when it was written, and stage 8 closed that.** It carries
+`--outer_offset 1.05` to match the elected configuration, while the uncapped run collected at ratio 0.4
+belonged to the stage 8 ratio curve and sat at the default 1.5, so the pair moved two variables at
+once. Re-running the curve's six budgets at 1.05 supplied the missing arm, and the 0.4 comparison is
+now single-variable like the 0.5 one.
+
 **What it deliberately does not cover.** Ratios 0.6 to 0.8. There the uncapped allocation is pinned
 against `--max_ratio` itself -- the block peak is exactly 0.900 at all three, at L24, L20 and L16 -- and
 the collected stage 8 gains are correspondingly non-monotone: 29.5% at ratio 0.5, then 14.7% at 0.6 and
 12.7% at 0.7 before 45.6% at 0.8. Three more capped runs would very likely make that curve read
 cleanly, and they are worth having if time appears. They are not in this file because RQ1's shape claim
 is already made and the budgets the thesis reports are 0.2 and 0.5.
+
+### Collected
+
+All three. Ratio 0.5 is the clean test, both arms held at `--outer_offset 1.05`:
+
+| ratio | arm | wikitext | c4 | mean of the five tasks |
+| --- | --- | --- | --- | --- |
+| 0.2 | homogeneous | 7.79 | 15.99 | 0.5837 |
+| 0.2 | elected, `cap 0.9` | **7.56** | **14.62** | **0.5991** |
+| 0.5 | homogeneous | 24.58 | 134.76 | 0.4119 |
+| 0.5 | elected, `cap 0.9` | **17.32** | **65.97** | **0.4523** |
+| 0.5 | `cap 0.6` | 20.32 | 94.38 | 0.4232 |
+
+**The cap does not transfer to multi-head attention. It costs 17% there.** This is the branch the
+questions below were written against, and it fired harder than the wording allowed for: `cap 0.6` does
+not merely gain less on LLaMA, it *loses*, on all three measures at once -- 17.3% on wikitext, 43.1% on
+c4, 2.9 points of accuracy -- against the same allocation left uncapped. Both Qwen models elect the
+bound from their own stage 3 gate and gain 14.39 and 8.86 perplexity from it; LLaMA gives up 3.00. The
+bound is a grouped-query instrument, and §4.7 has to say so in those terms rather than reporting
+`--max_ratio` as a hyperparameter that happened to be tuned per model. That is the stronger claim of
+the two, and it puts the cap and the k/v exclusion arm in one story instead of two: both stop the
+allocator over-spending on attention that is shared, one bluntly and one exactly, which is also why
+exclusion beats the cap on both Qwen models and why neither belongs on LLaMA.
+
+**The allocation-level diagnostics do not explain the sign, and should not be made to.** The cap does
+the same thing to both architectures. It lifts the minimum retained rank fraction of the attention
+projections out of the 0.05 to 0.09 band and into 0.20 to 0.35, and pushes the freed damage onto the
+MLP: `mlp.down_proj` moves from a mean ratio
+of 0.362 to 0.444 on LLaMA and 0.389 to 0.448 on Qwen2.5-7B, while `k_proj` is relieved from 0.748 to
+0.580 and 0.689 to 0.551. Same intervention, opposite outcome. Report the boundary as an empirical
+fact -- grouped-query attention cannot survive being run to the cap and multi-head attention can --
+and note that this is the second time in the grid the screens priced damage correctly without
+predicting whether it loses, the first being the 7B-against-32B comparison recorded under stage 7d.
+
+**The 0.4 point now measures the same thing, and the cost scales with the clip.** Once stage 8 supplied
+the uncapped arm at offset 1.05, ratio 0.4 reads 11.04 uncapped against 11.35 at `cap 0.6`: the cap
+costs 2.8% there against 17.3% at ratio 0.5. That ordering is what the block peak predicts, since the
+peak the cap has to clip is 0.651 at ratio 0.4 and 0.814 at 0.5 -- a 0.05 clip against a 0.21 one. So
+on LLaMA the cap never helps, and how much it hurts is set by how far it has to pull the deepest block
+back. Two budgets, both negative, is a firmer statement than the single point this stage was designed
+around.
+
+**The rest of the stage came out as designed.** The ratio 0.2 row now carries c4 and the five tasks,
+and the c4 gain exceeds the wikitext gain here too, 8.6% against 3.0%, so that pattern holds on all
+three models and on both architectures.
+
+**The elected row is not the wikitext argmax at ratio 0.2, and it is the accuracy argmax.** Nine of the
+74 collected LLaMA runs at that budget beat its 7.5625 on wikitext, mostly the low-temperature and
+bypass arms. Only two of those nine carry the full suite -- `swift_pool` at 7.4967 and `byp0-1` at
+7.5605 -- and the elected row beats both on the five tasks, 0.5991 against 0.5975 and 0.5859. Two pairs
+is thin, so do not build a claim about wikitext disagreeing with accuracy on it. What it does support
+is narrower and useful: a per-budget wikitext argmax is not automatically the accuracy argmax, which is
+an argument for the gate's mean-rank-across-budgets choice over picking a winner at each ratio, and a
+reason the seven remaining wikitext-only rows above it would need the suite before any of them could
+displace the reported configuration.
 
 **Preview.** Where the screen fires across the curve, then the cap ladder at the reported budget:
 
@@ -2289,18 +2356,19 @@ every offline objective except `influence_tail`. The KV rank screen does not app
 query head owns its key and value, so the damage a truncated `k_proj` does stays inside one head. That
 is the whole reason this stage is one bound and not the three fixes of stage 7c.
 
-**What to check in it.**
+**What it answered.**
 
-- **Whether `cap 0.6` clears LLaMA's own anchor at ratio 0.5, and by how much against the 17.32 the
-  uncapped arm measured.** The same change was worth 14.39 perplexity on 7B and 8.86 on 32B. If LLaMA
-  gains comparably, the bound is about *depth* and has nothing to do with attention sharing -- the
-  simpler and stronger claim, and the one the block screen predicts, since the screen is defined on
-  per-block ratios and never mentions heads. If LLaMA gains far less, the bound is a grouped-query
-  instrument that happens to be harmless under MHA, and §4.7 has to say so.
-- **The ratio 0.2 suite row.** Whether the ordering wikitext gave at the low budget survives on c4 and
-  the five tasks for the row the thesis reports, rather than for `swift_pool`.
-- **Whether the c4 gain exceeds the wikitext gain**, as it does in every row on both Qwen models. If it
-  does on the MHA model too, the calibration-artefact objection is answered on all three.
+- **Does `cap 0.6` clear LLaMA's anchor at ratio 0.5?** Yes (20.32 against 24.58), but that is the
+  wrong comparison. Against the uncapped arm it *loses*, 20.32 against 17.32, and it loses at ratio 0.4
+  too once stage 8 supplies a matched arm there, 11.35 against 11.04. The bound is not about depth: the
+  block screen is defined on per-block ratios and never mentions heads, yet the bound it motivates pays
+  only where k and v are shared. Whatever the screen measures, it is not what makes the cap worth
+  applying.
+- **The ratio 0.2 suite row.** Collected. The elected row is the accuracy argmax at that budget
+  without being the wikitext argmax, which is recorded above with the caveat it needs.
+- **Does the c4 gain exceed the wikitext gain?** Yes, 8.6% against 3.0%. The pattern now holds on all
+  three models, so the calibration-artefact objection is answered across both architectures rather
+  than on grouped-query models alone.
 
 **Read the gate.**
 
@@ -2309,9 +2377,10 @@ python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
     --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage7f.md
 ```
 
-**Gate.** Reporting, and it decides one sentence in §4.7: whether the cap is stated as a property of
-the allocator or as a property of grouped-query attention. It also settles stage 10's heterogeneous
-arms, which should start from whatever it elects.
+**Gate.** Reporting, and it decided both things it was asked. §4.7 states the cap as a property of
+grouped-query attention, not of the allocator. And stage 10's heterogeneous arms stay where
+`__CKPT_HET_*__` already points: the uncapped run is LLaMA's best at both budgets, so the repointing
+that stage warns about is not needed on this model.
 
 ---
 
@@ -2321,36 +2390,78 @@ arms, which should start from whatever it elects.
 showed the gain is not monotone in any simple way — the aggressive scores win at 0.2 and collapse at
 0.5 — so the curve is the RQ1 answer rather than a single number.
 
-**Runs.** 12, `args/experiments_stage8_ratio_curve.json`: {0.1, 0.3, 0.4, 0.6, 0.7, 0.8} x
-{homogeneous, the winner}. With 0.2 and 0.5 from stages 1 and 3c this is an eight-point curve.
+**Runs.** 18, `args/experiments_stage8_ratio_curve.json`: {0.1, 0.3, 0.4, 0.6, 0.7, 0.8} x
+{homogeneous, the winner}, then the same six heterogeneous budgets again at `--outer_offset 1.05`. With
+0.2 and 0.5 from stages 1 and 3c this is an eight-point curve traced twice, once per offset.
 
 This replaces the pilot's two-point onset probe. At fifteen minutes a run the full curve costs less
 than four hours and answers a question the thesis asks in its first chapter.
 
-**The curve is traced at the default knobs, and the gate now holds it there.** The stage file names no
-`--outer_offset` and no `--softmax_temp`, so its six ratios run at 1.5 and 1.0. Stages 3c and 4c swept
-both around the same allocation, but only at 0.2 and 0.5 — so those two budgets have a dozen runs
-sharing a grouping, a score and an inner policy where the other six have one. Before this was caught,
-`build_pivot`'s tie-break (first by run name) let `ooff1.05` stand in for ratio 0.5, and the printed
-curve read `+1.72, +7.26, +8.45` across 0.4, 0.5, 0.6 — a kink at exactly the budget the rest of the
-grid is measured on, produced by nothing but alphabetical order. Held at one arm it reads `+1.72,
-+4.02, +8.45`.
+**The curve exists at two offsets, and the thesis reports the elected one.** The first twelve runs name
+no `--outer_offset` and no `--softmax_temp`, so those six ratios ran at 1.5 and 1.0 while stages 3c and
+4c had swept both around the same allocation at 0.2 and 0.5 only -- leaving two budgets with a dozen
+runs sharing a grouping, a score and an inner policy where the other six had one. The six added runs
+close that: every budget now has the arm the rest of the grid is measured on, and the mixed-arm curve
+the gate used to hold at defaults is superseded by a curve that needs no holding at all.
 
-The gate therefore holds `max_ratio`, `outer_offset` and `softmax_temp` at their dominant values and
-carries `outer_allocation`, `outer_offset` and `softmax_temp` in the configuration column, so the arm
-is named in the table rather than inferred. **Read the `held at` notes**: they say how many runs of the
-sweeps were set aside, and the curve is a statement about the default-knob arm, not about the best
-configuration reachable at each budget. The one switch that survives is real — `swift_pool` wins at
-0.2 where `softmax_temp` wins everywhere else — and that is what the note beneath the table is for.
+**The tie-break that made this visible is worth remembering.** Before the arms were separated,
+`build_pivot`'s tie-break (first by run name) let `ooff1.05` stand in for ratio 0.5 alone, and the
+printed curve read `+1.72, +7.26, +8.45` across 0.4, 0.5, 0.6 — a kink at exactly the budget the rest
+of the grid is measured on, produced by nothing but alphabetical order. Held at one arm it read `+1.72,
++4.02, +8.45`. The gate still holds `max_ratio`, `outer_offset` and `softmax_temp` at their dominant
+values and carries `outer_allocation`, `outer_offset` and `softmax_temp` in the configuration column,
+so the arm is named in the table rather than inferred. **Read the `held at` notes**: a curve whose
+configuration changes between rows is a different claim from a curve that does not, and the notes are
+what tell the two apart. The one switch that survives is real — `swift_pool` wins at 0.2 where
+`softmax_temp` wins everywhere else — and that is what the note beneath the table is for.
 
-**What to check in it.**
+### Collected
 
-- Where the gain peaks. The pilot's working hypothesis is that it tracks the headroom between the
-  allocation's worst block and the screen: at 0.1 there is nothing to gain because nothing is near
-  collapse, at 0.8 there is nothing to gain because everything is.
-- `max_block_ratio` at every point, plotted with the gain. If the two curves are mirror images the
-  screen explains RQ1, which is a much stronger claim than a gain table.
-- The `<objective>_oracle_ratio` columns, which make the shape claim offline and cost nothing.
+Eight budgets, both offsets, on wikitext. `peak` is the offline block maximum at `--outer_offset 1.05`,
+which is what the gain turns out to track:
+
+| ratio | peak | homogeneous | het, offset 1.05 | gain | het, offset 1.5 | gain |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.1 | 0.163 | 7.01 | 6.94 | 1.0% | 6.94 | 1.1% |
+| 0.2 | 0.326 | 7.79 | 7.56 | 3.0% | 7.59 | 2.7% |
+| 0.3 | 0.488 | 9.36 | 8.62 | 7.9% | 8.79 | 6.1% |
+| 0.4 | 0.651 | 13.47 | **11.04** | **18.1%** | 11.75 | 12.7% |
+| 0.5 | 0.814 | 24.58 | **17.32** | **29.5%** | 20.55 | 16.4% |
+| 0.6 | 0.900 | 57.35 | **40.03** | **30.2%** | 48.90 | 14.7% |
+| 0.7 | 0.900 | 178.82 | 133.19 | 25.5% | 156.07 | 12.7% |
+| 0.8 | 0.900 | 841.88 | 475.00 | 43.6% | 457.66 | 45.6% |
+
+**The gain rises with the budget, peaks near 0.5 to 0.6, and the shape is the block peak's.** The
+outer water-fill hands the deepest block a constant **1.628x** the target ratio -- 0.163, 0.326, 0.488,
+0.651, 0.814 are exactly `1.628 r` -- until `--max_ratio 0.9` intervenes at ratio 0.55 and pins it.
+Over the free stretch the gain tracks that peak monotonically, 1.0 to 3.0 to 7.9 to 18.1 to 29.5, and
+once the peak is pinned the gain flattens and then falls: 30.2 at 0.6, 25.5 at 0.7. So the screen does
+explain RQ1, but only where it is free to move, and the answer to "are the two curves mirror images" is
+yes up to the point the cap starts clipping and no after it. That is a sharper claim than the gain
+table alone and it is the one §4 should make.
+
+**Ratio 0.8 is not part of the curve.** 841.88 against 475.00 is a comparison between two destroyed
+models -- 148x and 84x dense perplexity -- and the 43.6% that arithmetic produces means nothing about
+allocation. It is also the one budget where offset 1.5 wins. Report the curve over 0.1 to 0.7 and show
+0.8 only to say where the method stops applying.
+
+**The offset is worth more the higher the budget, which is why the old curve understated the method.**
+Moving from 1.5 to 1.05 is worth -0.1% at ratio 0.1, then 0.3%, 1.9%, 6.1%, 15.8%, 18.1%, 14.7%, and
+-3.8% at 0.8. The default-knob curve therefore reported a gain that peaked at 16.4% where the elected
+arm reaches 30.2%. Its dip at 0.6 was the offset and not the allocation -- 14.7% becomes 30.2%, so the
+gain rises there rather than falling -- while the decline at 0.7 survives the change and is real. Any
+figure built from the pre-existing twelve runs alone would have made the method look weakest at exactly
+the budget where it is strongest.
+
+**What it answered.**
+
+- **Where the gain peaks.** Between ratio 0.5 and 0.6, and the pilot's hypothesis was half right: there
+  is nothing to gain at 0.1 because nothing is near collapse, but at 0.8 the gain is large and
+  meaningless rather than small. The correct statement is that the gain grows while the allocation has
+  a block it can still protect and collapses as a *measurement* once both arms are broken.
+- **`max_block_ratio` against the gain.** Mirror images over 0.1 to 0.5, decoupled from 0.6 up, with
+  `--max_ratio 0.9` as the exact point of decoupling. The screen explains RQ1 on the free stretch.
+- **The `<objective>_oracle_ratio` columns**, which make the shape claim offline and cost nothing.
 
 **Preview.**
 
@@ -2459,12 +2570,19 @@ would mean four recompressions of a 32B model before the first update starts.
 **Check the two heterogeneous paths before launching.** `__CKPT_HET_*__` is resolved by the stage 7
 gate, which is deliberately held at `--max_ratio 0.9` so its rows stay comparable, so the placeholder
 names an *unbounded* checkpoint: on Qwen2.5-7B `entropy_rel`, which the bound ladder has since beaten by
-32%, and on 32B `--min_rank_fraction 0.2`, beaten by 9%. On LLaMA it names the uncapped `eff_rank` run,
-which **is** the current best there -- and stays correct only until stage 7f measures the capped one.
-Repoint both entries by hand at whatever 7f elects. RQ5 asks whether the update erases the allocation's
-advantage; an update applied to an allocation the thesis does not report answers that about the wrong
-object, and the answer would look artificially favourable to the update, because there is more damage
-left in a worse checkpoint for it to recover.
+32%, and on 32B `--min_rank_fraction 0.2`, beaten by 9%. **On LLaMA no repointing is needed**, and
+stage 7f is what settles that rather than luck: the cap loses on this model, so the uncapped `eff_rank`
+run the placeholder names is the best checkpoint at both budgets and the file runs as it stands. Should
+this stage ever move to a Qwen model, repoint both entries first. RQ5 asks whether the update erases
+the allocation's advantage; an update applied to an allocation the thesis does not report answers that
+about the wrong object, and the answer would look artificially favourable to the update, because there
+is more damage left in a worse checkpoint for it to recover.
+
+**Normalize the gap before concluding anything.** At ratio 0.5 on LLaMA the homogeneous arm carries
+31% more excess NLL than the heterogeneous one -- `ln(24.58 / 5.68)` against `ln(17.32 / 5.68)` -- so it
+has more damage available to recover and will close more *absolute* perplexity for arithmetic reasons
+alone. Read the closed gap against `ln(dense)`, the normalization §4 already uses for the cross-model
+recovery share, rather than comparing the two arms' raw improvements.
 
 **What to check in it.** The gap closed on each arm, not the final perplexity. If the update closes
 more of the homogeneous gap than the heterogeneous one, the two techniques compete; if it closes both
@@ -2522,11 +2640,11 @@ In execution order.
 | 7d second sharing factor | 18 | wikitext; full suite on the dense, anchor and elected-bound rows | stage 0, the elected allocation, and the cap and floor sweeps, on 32B |
 | 7e Qwen2.5-7B closeout | 12 | wikitext; full suite on the five reported rows | the cap ladder at 0.2 and the grouping arms, on 7B |
 | 7f LLaMA-7B closeout | 2 (+1 eval-only) | wikitext; full suite on the elected 0.2 row and the capped 0.5 row | the block screen across the curve, and the cap ladder under the elected outer level, on LLaMA |
-| 8 ratio curve | 12 | wikitext | the shape claim, made offline |
+| 8 ratio curve | 18 | wikitext | the shape claim, made offline |
 | 9 benchmarks | 9 eval-only | full suite **and c4** | none |
 | 10 LoRA | 4 update-only | wikitext | none |
 
-**248 compression runs**, plus 14 evaluation-only or update-only, plus two extra whitening passes for
+**254 compression runs**, plus 14 evaluation-only or update-only, plus two extra whitening passes for
 stage 1b, one for Qwen2.5-7B and one for Qwen2.5-32B. At roughly 15 minutes a run that is about **55
 GPU hours** for the compressions on the two smaller models; stage 7d's eighteen runs are on a 32B model
 and cost several times that each, which is why they are the only ones the grid rations. Nine of those
