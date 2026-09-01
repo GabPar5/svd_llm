@@ -16,7 +16,7 @@ with its `spectra/` cache and `layer_importance.pt`. Every stage below reads tha
 recomputes it — the one exception is stage 1b, which exists precisely to build a second one.
 
 **Execution order**, which is also the section order:
-`0, 1, 1b, 2, 2b, 2c, 3, 3c, 4, 4c, 4d, 5, 5b, 6, 6b, 7, 7b, 7c, 7d, 7e, 8, 9, 10`.
+`0, 1, 1b, 2, 2b, 2c, 3, 3c, 4, 4c, 4d, 5, 5b, 6, 6b, 7, 7b, 7c, 7d, 7e, 7f, 8, 9, 10`.
 
 ## The pilot, and why every number below is being re-measured
 
@@ -1889,28 +1889,81 @@ damage LLaMA carries at 0.4 to 0.5. Ratios 0.3 and 0.4 are where that prediction
 
 ### Collected
 
-The first nine, on wikitext. Gain is the homogeneous anchor of the same model minus the row:
+All eighteen, on wikitext. Gain is the homogeneous anchor of the same model minus the row:
 
 | arm | 0.2 | gain | 0.5 | gain |
 | --- | --- | --- | --- | --- |
 | dense | 5.02 | -- | 5.02 | -- |
 | homogeneous | 7.24 | -- | 18.35 | -- |
-| `eff_rank_rel` | **6.83** | **+0.41** | 24.14 | **-5.79** |
+| `eff_rank`, raw | 7.24 | -0.00 | 40.80 | -22.46 |
 | `entropy_rel` | 6.83 | +0.40 | 26.15 | -7.80 |
-| `eff_rank_rel`, k and v excluded | **6.69** | **+0.55** | **20.77** | **-2.42** |
+| `eff_rank_rel` | 6.83 | +0.41 | 24.14 | -5.79 |
+| `eff_rank_rel`, `--min_rank_fraction 0.2` | -- | -- | 16.77 | +1.58 |
+| `eff_rank_rel`, `--max_ratio 0.7` | -- | -- | 16.09 | +2.25 |
+| `eff_rank_rel`, `--max_ratio 0.6` | **6.83** | **+0.41** | **15.28** | **+3.07** |
+| `eff_rank_rel`, k and v excluded | 6.69 | +0.55 | 20.77 | -2.42 |
+| `eff_rank_rel`, `--max_ratio 0.6`, k and v excluded | -- | -- | **13.78** | **+4.57** |
 
-**The repair transfers at 0.2 and reverses at 0.5.** Both scores beat the anchor at the low budget
-and lose at the high one, and the exclusion arm is the best of the three at both — the same ordering
-Qwen2.5-7B reports, so that much does carry to `G = 5`. The two scores are 0.01 apart at 0.2, which
-the gate refuses to rank and which stage 1b would have to resolve.
+**The reversal was the bound, not the sharing factor.** It is gone. `--max_ratio 0.6` at ratio 0.5
+turns the -5.79 the unbounded arm measured into **+3.07**, a 16.7% perplexity reduction against the
+anchor, and the exclusion arm under the same bound reaches +4.57, or 24.9%. There is no longer a model
+or a budget in this grid where the allocation loses. The sentence this stage was written to test --
+that the gain reverses at a second sharing factor -- is false, and what was measured instead is that
+the cap is not a tuning knob but a precondition: without it the repair is worse than not repairing at
+all, and with it the repair transfers.
 
-**The reversal is confounded, which is what the nine added runs are for.** Every row above ran at
-`--max_ratio 0.9` with no floor. Offline, at ratio 0.5, that setting leaves `k_proj` **0.0833** of its
-rank against a fitted danger threshold of 0.141, and pins `q_proj`, `k_proj` and `o_proj` to the cap;
-`--max_ratio 0.6` is the only setting of 0.6, 0.7 and 0.9 that clears both the block screen and the KV
-screen, lifting `k_proj` to 0.3333 and `q`/`o` to 0.2000. So the sentence this stage exists to write —
-that the gain reverses at a second sharing factor — is currently indistinguishable from the sentence
-that the repair was never applied.
+**The cap alone is worth more than everything else in the pipeline.** At ratio 0.5 the score, the
+grouping, the inner policy and the outer offset together move 18.35 to 24.14, which is backwards by
+5.79. Adding `--max_ratio 0.6` and changing nothing else moves 24.14 to 15.28, a gain of 8.86. The
+same asymmetry holds on 7B, where the uncapped configuration is worth 13.56 against its anchor and the
+cap on top of it is worth a further 14.39. Whatever §4 says about scores and policies, the bound is the
+larger effect on both grouped-query models.
+
+**The cap beats the floor, and the two are not interchangeable.** `--max_ratio 0.6` (15.28) against
+`--min_rank_fraction 0.2` (16.77) at the same budget: the cap wins by 8.9%. This is the same ordering
+7B reports (39.21 against 44.63, 12.1%), so the answer §3.3.1 promised is consistent across both
+models, and it is the cap. The mechanism is the one the offline pass predicted -- the floor leaves the
+depth profile bit-identical and works only inside blocks, while the cap reshapes depth as well -- and
+`--max_ratio 0.7` landing between them (16.09) is the ladder behaving monotonically in the bound.
+
+**The cap is inert at the low budget, measured rather than argued.** At ratio 0.2 the `cap 0.6` and
+`cap 0.9` runs return **the same perplexity to four decimals** (6.8277), because no block reaches 0.6
+to be clipped. The bound is a high-budget instrument, and a thesis table that reports it at 0.2 is
+reporting the uncapped allocation under another name.
+
+**The curve crosses nowhere: the allocation wins at all four budgets.** The four-point sweep at
+`cap 0.6`, which is the shape RQ1 asks for on a second model:
+
+| ratio | homogeneous | `cap 0.6` | gain | reduction |
+| --- | --- | --- | --- | --- |
+| 0.2 | 7.24 | 6.83 | +0.41 | 5.7% |
+| 0.3 | 8.58 | 7.91 | +0.67 | 7.8% |
+| 0.4 | 10.77 | 10.05 | +0.72 | 6.7% |
+| 0.5 | 18.35 | 15.28 | +3.07 | 16.7% |
+
+The gain is roughly flat from 0.2 to 0.4 and then more than doubles at 0.5, which is where the anchor
+itself starts to fall apart. Read that as the allocation buying most where homogeneous compression has
+least headroom left, not as a slope.
+
+**The full suite agrees, and c4 agrees harder.** On the two budgets that carry the seven reported
+tasks:
+
+| ratio | arm | wikitext | c4 | mean of the five tasks |
+| --- | --- | --- | --- | --- |
+| 0.2 | homogeneous | 7.24 | 20.90 | 0.7038 |
+| 0.2 | `cap 0.6` | **6.83** | **17.07** | **0.7129** |
+| 0.5 | homogeneous | 18.35 | 165.89 | 0.4766 |
+| 0.5 | `cap 0.6` | **15.28** | **90.41** | **0.4886** |
+
+c4 improves by 18.3% at 0.2 and **45.5%** at 0.5, in both cases by more than wikitext does. Calibration
+is wikitext-2 train, so the held-out corpus is where the allocation is *least* able to be overfitting
+and it is where the gain is largest. That is the strongest single argument in the grid against the
+objection that these numbers are a calibration artefact, and it wants stating in §4 explicitly.
+
+**Perplexity was a sound screen.** Spearman between wikitext perplexity and the mean of the five
+multiple-choice tasks is **-1.00** across the five 32B rows carrying both, and -0.97 and -0.96 on
+LLaMA-7B (n = 11) and Qwen2.5-7B (n = 16). Every ranking in stages 1 to 8 was decided on wikitext
+alone; this is the evidence that the decision would not have changed.
 
 **One thing the screens do not do is predict the sign.** At ratio 0.5 and `cap 0.9` the KV screen
 fires just as hard on Qwen2.5-7B (`k_proj` 0.0875) as on 32B (0.0833), and 7B still beat its anchor
@@ -1922,34 +1975,32 @@ the grid that routes through the in-process JAX GPU `eigh` — `SOLVER_GPU_MAX_D
 larger V2 eigendecompositions there. Build it in chunks with `--whitening_start_layer` /
 `--whitening_end_layer` and `--whitening_only`; that pass, not the nine runs, is this stage's cost.
 
-**What to check in it.** The first three are answered by the collected nine and recorded above; the
-rest are what the nine added runs are read for:
+**What it answered.** The stage is complete. Every question it was written to ask is settled by the
+table above except the last, which is methodological and still open:
 
-- **Whether the reversal survives the bound.** `--max_ratio 0.6` at ratio 0.5 against the 24.14 the
-  unbounded arm measured, and against the 18.35 anchor. On Qwen2.5-7B the same change was worth 27%.
-  If it clears the anchor the reversal was a configuration, not a scale effect, and the cross-model
-  claim becomes one about bounds. If it does not, the reversal is real and the thesis can say so with
-  the repair applied rather than withheld.
-- **Cap against floor, on a second model.** `--max_ratio 0.6` against `--min_rank_fraction 0.2` at the
-  same budget. Section 3.3.1 of the thesis introduces the floor and promises Section 4.7 reports what
-  it buys; right now that promise rests on one model. Whichever wins, both numbers are needed, because
-  the two bounds are not interchangeable: the floor leaves the depth profile bit-identical (the block
-  peak is 0.7077 on 7B at both `f = 0` and `f = 0.2`) and works only inside blocks, while the cap
-  reshapes depth as well.
-- **Where the curve crosses.** The four-point curve at `cap 0.6` against its four anchors. A crossover
-  that lands where the damage reading predicts is a much stronger result than a sign flip at one
-  budget, and a crossover that does not land there falsifies the reading cleanly.
-- **The sign.** Whether each elected configuration beats 32B's own homogeneous anchor at each ratio.
-  That alone answers whether the repair transfers.
-- **Which arm wins.** On Qwen2.5-7B the exclusion arm beats the repaired allocation at both budgets,
-  by 8% at 0.2 and 17% at 0.5. If that ordering reverses at `G = 5` it is evidence the gap is the
-  sharing factor rather than something about k and v in general.
-- **The size against `G`.** The gain at `G = 5` against the gain at `G = 7`. The argument predicts the
-  *unrepaired* damage grows with `G`, so the repair should be worth less at 32B, not more. A gain that
-  grows instead means the mechanism is not the one the thesis describes.
-- **The KV rank screen, re-derived.** The 0.141 danger threshold was fitted on eight Qwen2.5-7B runs
-  and is a model property, exactly like `BLOCK_RATIO_DANGER`. Re-fit it here rather than inheriting it,
-  and say in the thesis which of the two numbers any claim rests on.
+- **The sign, and whether the reversal survives the bound.** Both yes. The elected configuration beats
+  32B's own anchor at all four budgets under `cap 0.6`, and the reversal at `cap 0.9` was the bound.
+  The cross-model claim is therefore one about bounds, not about scale.
+- **Cap against floor.** The cap, by 8.9% here and 12.1% on 7B. Section 4.7 can report a single answer
+  for both models rather than hedging, and the reason is the one §3.3.1 gives: the floor leaves the
+  depth profile bit-identical (the block peak is 0.7077 on 7B at both `f = 0` and `f = 0.2`) and works
+  only inside blocks, while the cap reshapes depth as well.
+- **Where the curve crosses.** Nowhere. There is no crossover to report, which is a cleaner result than
+  a sign flip: the allocation is ahead at 0.2, 0.3, 0.4 and 0.5, and the gain widens where the anchor
+  degrades fastest.
+- **Which arm wins.** The exclusion arm, at both budgets, exactly as on 7B: 6.69 against 6.83 at 0.2,
+  and 13.78 against 15.28 at 0.5 under the cap. The ordering does **not** reverse at `G = 5`, which is
+  evidence that what k and v exclusion buys is about k and v being shared at all rather than about one
+  sharing factor.
+- **The size against `G`.** The prediction holds, and is confounded. The gain is 16.7% at `G = 5`
+  against 41.6% at `G = 7` at ratio 0.5, so the repair is worth less where the sharing factor is
+  smaller, which is what the argument predicts. But `G` moves together with depth (64 blocks against
+  28), with width, and above all with how much headroom the anchor has left -- 32B's homogeneous arm
+  sits at 3.66x dense perplexity at ratio 0.5 where 7B's sits at 9.80x. The thesis should report the
+  ordering and name the confound rather than attributing the size to `G`.
+- **The KV rank screen, re-derived.** *Still open.* The 0.141 danger threshold was fitted on eight
+  Qwen2.5-7B runs and is a model property, exactly like `BLOCK_RATIO_DANGER`. Re-fit it on the 32B rows
+  rather than inheriting it, and say in the thesis which of the two numbers any claim rests on.
 
 **Preview.** Stage 0 for the new model, then the elected allocation on it:
 
@@ -2015,10 +2066,11 @@ python run_experiments.py args/experiments_stage7d_gqa_scale.json --dry_run --sk
 python run_experiments.py args/experiments_stage7d_gqa_scale.json --skip_completed
 ```
 
-That leaves 12 invocations of the 18. Entries 4 to 9 skip; entries 1 to 3 do **not**, because the
-anchors and the dense reference now ask for the full suite while only wikitext was collected for them,
-and coverage rather than the file existing is what the flag tests. Run it without the flag first if
-you want the same report without acting on it.
+All 18 are collected, so the flag now skips every one of them and the recipe is kept as the record of
+how the stage was resumed: it left 12 invocations of the 18, skipping entries 4 to 9 and re-running 1
+to 3, because the anchors and the dense reference had asked for the full suite while only wikitext was
+collected for them -- coverage, rather than the file existing, is what the flag tests. Run it without
+the flag first if you want the same report without acting on it.
 
 **Read the gate.**
 
@@ -2079,6 +2131,55 @@ exactly. Checked offline across all 140 matrices at both budgets, the two alloca
 the last bit, so the re-run should reproduce 8.93 and 37.00 and is worth having as a measured
 confirmation of that argument.
 
+### Collected
+
+All twelve, on wikitext, against the anchors 10.72 at ratio 0.2 and 67.15 at 0.5:
+
+| arm | 0.2 | gain | 0.5 | gain |
+| --- | --- | --- | --- | --- |
+| homogeneous | 10.72 | -- | 67.15 | -- |
+| elected `eff_rank_rel` | 9.76 | +0.97 | 53.60 | +13.56 |
+| `--max_ratio 0.6` | 9.76 | +0.97 | **39.21** | **+27.95** |
+| `--max_ratio 0.35` | 9.78 | +0.94 | -- | -- |
+| `--min_rank_fraction 0.2` | -- | -- | 44.63 | +22.52 |
+| `--softmax_temp 0.5` | 9.95 | +0.77 | 105.70 | -38.54 |
+| `decoder` | 10.13 | +0.60 | 80.71 | -13.56 |
+| `type` | 11.60 | -0.88 | 1540.43 | -1473.27 |
+| k and v excluded | **8.93** | **+1.80** | **37.00** | **+30.15** |
+
+**The three arguments it was built to confirm all held, one of them to the last bit.**
+
+- **The cap is inert at the low budget.** `cap 0.6` and `cap 0.9` return the same 9.7555 at ratio 0.2,
+  and `cap 0.35` is very slightly *worse* (9.78) -- tight enough to bind, and binding costs. The bound
+  belongs to the high-budget regime on this model too.
+- **The `_rel` re-spelling of the exclusion arm changed nothing.** It reproduced 8.9277 and 36.9999
+  exactly, matching the raw-score runs to four decimals at both budgets. Once k and v are excluded every
+  remaining matrix has `min(d_out, d_in) = d_model`, so the `_rel` divisor is constant inside each group
+  and `softmax_temp`'s min-max normalization removes it. The offline check said the allocations were
+  identical across all 140 matrices; the measurement agrees. The same equivalence shows up a third time
+  under `type` grouping at 0.2, where `eff_rank` and `eff_rank_rel` both return 11.5994.
+- **The outer water-fill earns its place.** `hierarchical` with `waterfill` (53.60 at ratio 0.5) against
+  `decoder` with `param_share` (80.71) and `type` (1540.43). Since `hierarchical` with `param_share`
+  reproduces `decoder` exactly, that gap *is* the outer level, and at the high budget it is the
+  difference between beating the anchor by 20% and losing to it by 20%.
+
+**The suite rows now describe the method.** Adding the seven tasks to the elected rows was the point of
+the stage, and it changes the sign of what a downstream table says:
+
+| ratio | arm | wikitext | c4 | mean of the five tasks |
+| --- | --- | --- | --- | --- |
+| 0.2 | homogeneous | 10.72 | 40.85 | 0.5817 |
+| 0.2 | `cap 0.6` | 9.76 | 32.56 | 0.5984 |
+| 0.2 | k and v excluded | **8.93** | **22.99** | **0.6458** |
+| 0.5 | homogeneous | 67.15 | 407.31 | 0.3721 |
+| 0.5 | `cap 0.6` | 39.21 | 230.72 | 0.3872 |
+| 0.5 | k and v excluded | **37.00** | **187.48** | **0.4163** |
+
+The exclusion arm at ratio 0.2 recovers **48.7%** of the accuracy the homogeneous anchor gives up
+against dense (0.5817 to 0.6458, dense 0.7134), against 12.7% for the full-matrix arm. As on 32B the c4
+gain exceeds the wikitext gain in every row, by 20.3% against 9.0% at 0.2 and 43.4% against 41.6% at
+0.5.
+
 **Preview.** The cap ladder at the low budget, which is the only genuinely new allocation here:
 
 ```bash
@@ -2101,6 +2202,116 @@ python generate_tables.py output/eval/Qwen_Qwen2.5_7B --report gates \
 
 **Gate.** Reporting. Nothing downstream waits on it, which is why it runs after stage 7d rather than
 before: it closes the 7B grid rather than deciding anything the 32B needs.
+
+---
+
+## Stage 7f: closing the LLaMA-7B grid
+
+**Purpose.** One asymmetry and one hole, both artefacts of the order the grid was run in: the bound
+ladder was discovered on the two Qwen models, after LLaMA-7B had already been swept.
+
+**The cap has never been tested on LLaMA under the configuration the thesis elects.** Both Qwen models
+resolve `--max_ratio` to **0.6** from their own stage 3 gate, and it is the largest single effect in the
+grid -- worth 14.39 perplexity on 7B and 8.86 on 32B at ratio 0.5, in both cases more than the score,
+the grouping, the inner policy and the outer offset achieve between them. LLaMA's gate reports
+`--max_ratio 0.9`, *provisional, one candidate*: its cap sweep ran under `decoder` and `global` with the
+default `waterfill` inner level, and in that configuration the cap cannot act. Offline, under `decoder`
+with `param_share` outside it, every LLaMA block sits at exactly 0.500 at ratio 0.5, so the block peak
+never approaches 0.6 -- which makes the collected `cap0.6` run (24.03) matching its uncapped twin
+(23.91) the expected null rather than evidence against the bound. Under the elected `hierarchical` with
+`waterfill` outside it the same budget spreads the blocks to **0.814 (L27)**, past
+`BLOCK_RATIO_DANGER`. That is the regime the cap exists for, and it has never been measured on an MHA
+model.
+
+**The elected finalist at ratio 0.2 has no downstream data.** The defect stage 7e found on 7B, one row
+wide. Of the eleven LLaMA runs carrying the full suite, the heterogeneous ones at ratio 0.2 are
+`swift_pool`, `byp0-1`, `global` and a composite; the elected
+`hierarchical / eff_rank / softmax_temp / waterfill / 1.05` has wikitext alone. At 0.5 it does have the
+suite, so the c4 and accuracy columns of the thesis's LLaMA table currently exist at one budget out of
+the two it reports. The checkpoint is on disk, so this costs an evaluation and no compression.
+
+**LLaMA needs no shape-invariant score, and that is a theorem rather than an omission.** Every matrix
+in LLaMA-7B has `min(d_out, d_in) = 4096`: `q`, `k`, `v` and `o` are square at `d_model`, and
+`gate`/`up`/`down` are `11008 x 4096` or its transpose. A spectral score's units carry `min(d_out,
+d_in)`, so dividing it out is a global constant rescale, which `softmax_temp` removes anyway. The
+`_rel` family that stages 7b and 7c exist to introduce is provably a no-op here -- the reason LLaMA has
+no `_rel` runs and needs none. Say it that way in §4.7 rather than leaving the model looking
+under-swept.
+
+**Runs.** 3, `args/experiments_stage7f_llama_closeout.json`: one evaluation-only and two compressions,
+all LLaMA-7B and all `float16` inherited from `args/base_args.json`.
+
+**It names the allocation through `__FINALIST1_*` but writes the offset as a literal.** LLaMA's gate
+resolves the four finalist placeholders to `hierarchical / eff_rank / softmax_temp / waterfill`, so the
+file stays self-describing. `--outer_offset` is the literal `1.05` instead of `__BEST_OUTER_OFFSET__`,
+because stage 4c leaves that placeholder unresolved on LLaMA -- the gate prints the whole ladder but
+elects nothing, having priced the offsets across eight budgets without aggregating them -- and
+`run_experiments.py` refuses to start while any placeholder is unresolved. 1.05 is what the elected run
+itself carries.
+
+**Why ratio 0.4 as well as 0.5.** 0.4 is the first budget at which the block screen fires on LLaMA
+under the elected configuration, and it is the cheapest place to watch the cap begin to act. The block
+peak across the curve at `cap 0.9`, from the preview below: 0.326 at ratio 0.2, 0.488 at 0.3, **0.651**
+at 0.4, **0.814** at 0.5, then 0.900 at 0.6, 0.7 and 0.8. The 0.4 entry asks for wikitext only; only
+the 0.5 entry carries the suite, because 0.5 is the budget the thesis reports.
+
+**What it deliberately does not cover.** Ratios 0.6 to 0.8. There the uncapped allocation is pinned
+against `--max_ratio` itself -- the block peak is exactly 0.900 at all three, at L24, L20 and L16 -- and
+the collected stage 8 gains are correspondingly non-monotone: 29.5% at ratio 0.5, then 14.7% at 0.6 and
+12.7% at 0.7 before 45.6% at 0.8. Three more capped runs would very likely make that curve read
+cleanly, and they are worth having if time appears. They are not in this file because RQ1's shape claim
+is already made and the budgets the thesis reports are 0.2 and 0.5.
+
+**Preview.** Where the screen fires across the curve, then the cap ladder at the reported budget:
+
+```bash
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
+    --group_criterion __FINALIST1_GROUPING__ --score_metric __FINALIST1_SCORE__ \
+    --inner_allocation __FINALIST1_INNER__ --outer_allocation __FINALIST1_OUTER__ \
+    --outer_offset 1.05 --max_ratio 0.9 \
+    --sweep "compression_ratio=0.2,0.3,0.4,0.5,0.6,0.7,0.8" \
+    --out_dir ./output/allocation_reports/stage7f_screen --plots
+
+python allocation_report.py --model "huggyllama/llama-7b" --run_v2 \
+    --compress_mlp --compress_att_q --compress_att_k --compress_att_v --compress_att_out \
+    --compression_ratio 0.5 \
+    --group_criterion __FINALIST1_GROUPING__ --score_metric __FINALIST1_SCORE__ \
+    --inner_allocation __FINALIST1_INNER__ --outer_allocation __FINALIST1_OUTER__ \
+    --outer_offset 1.05 \
+    --sweep "max_ratio=0.6,0.7,0.9" \
+    --out_dir ./output/allocation_reports/stage7f_cap --plots
+```
+
+Both were run before the stage was written. `cap 0.6` is the only rung of 0.6, 0.7 and 0.9 that clears
+the block screen -- it lands the peak at 0.600 (L18) against 0.700 (L23) and 0.814 (L27) -- and it wins
+every offline objective except `influence_tail`. The KV rank screen does not apply: under MHA every
+query head owns its key and value, so the damage a truncated `k_proj` does stays inside one head. That
+is the whole reason this stage is one bound and not the three fixes of stage 7c.
+
+**What to check in it.**
+
+- **Whether `cap 0.6` clears LLaMA's own anchor at ratio 0.5, and by how much against the 17.32 the
+  uncapped arm measured.** The same change was worth 14.39 perplexity on 7B and 8.86 on 32B. If LLaMA
+  gains comparably, the bound is about *depth* and has nothing to do with attention sharing -- the
+  simpler and stronger claim, and the one the block screen predicts, since the screen is defined on
+  per-block ratios and never mentions heads. If LLaMA gains far less, the bound is a grouped-query
+  instrument that happens to be harmless under MHA, and §4.7 has to say so.
+- **The ratio 0.2 suite row.** Whether the ordering wikitext gave at the low budget survives on c4 and
+  the five tasks for the row the thesis reports, rather than for `swift_pool`.
+- **Whether the c4 gain exceeds the wikitext gain**, as it does in every row on both Qwen models. If it
+  does on the MHA model too, the calibration-artefact objection is answered on all three.
+
+**Read the gate.**
+
+```bash
+python generate_tables.py output/eval/huggyllama_llama_7b --report gates \
+    --allocation_dir output/allocation_reports -o output/gates/huggyllama_llama_7b/gates_stage7f.md
+```
+
+**Gate.** Reporting, and it decides one sentence in §4.7: whether the cap is stated as a property of
+the allocator or as a property of grouped-query attention. It also settles stage 10's heterogeneous
+arms, which should start from whatever it elects.
 
 ---
 
@@ -2240,6 +2451,21 @@ a heterogeneous allocation than a homogeneous one.
 **Runs.** 4 update-only, `args/experiments_stage10_lora.json`: `--update_taw_only` on the two
 homogeneous anchors and the two heterogeneous winners, `lora` method, `trainer` backend, Alpaca.
 
+**It runs on LLaMA-7B, which is the only model that can.** The roster's `on disk` column decides this
+rather than preference: LLaMA has all four arms, Qwen2.5-7B has the two heterogeneous ones and neither
+anchor, and Qwen2.5-32B has none -- and 32B checkpoints are not kept, so putting this stage on 32B
+would mean four recompressions of a 32B model before the first update starts.
+
+**Check the two heterogeneous paths before launching.** `__CKPT_HET_*__` is resolved by the stage 7
+gate, which is deliberately held at `--max_ratio 0.9` so its rows stay comparable, so the placeholder
+names an *unbounded* checkpoint: on Qwen2.5-7B `entropy_rel`, which the bound ladder has since beaten by
+32%, and on 32B `--min_rank_fraction 0.2`, beaten by 9%. On LLaMA it names the uncapped `eff_rank` run,
+which **is** the current best there -- and stays correct only until stage 7f measures the capped one.
+Repoint both entries by hand at whatever 7f elects. RQ5 asks whether the update erases the allocation's
+advantage; an update applied to an allocation the thesis does not report answers that about the wrong
+object, and the answer would look artificially favourable to the update, because there is more damage
+left in a worse checkpoint for it to recover.
+
 **What to check in it.** The gap closed on each arm, not the final perplexity. If the update closes
 more of the homogeneous gap than the heterogeneous one, the two techniques compete; if it closes both
 equally, they compose, and the thesis can claim the allocation and the update are independent
@@ -2295,11 +2521,12 @@ In execution order.
 | 7c GQA fixes | 18 | wikitext | `family_tail` per score |
 | 7d second sharing factor | 18 | wikitext; full suite on the dense, anchor and elected-bound rows | stage 0, the elected allocation, and the cap and floor sweeps, on 32B |
 | 7e Qwen2.5-7B closeout | 12 | wikitext; full suite on the five reported rows | the cap ladder at 0.2 and the grouping arms, on 7B |
+| 7f LLaMA-7B closeout | 2 (+1 eval-only) | wikitext; full suite on the elected 0.2 row and the capped 0.5 row | the block screen across the curve, and the cap ladder under the elected outer level, on LLaMA |
 | 8 ratio curve | 12 | wikitext | the shape claim, made offline |
 | 9 benchmarks | 9 eval-only | full suite **and c4** | none |
 | 10 LoRA | 4 update-only | wikitext | none |
 
-**246 compression runs**, plus 13 evaluation-only or update-only, plus two extra whitening passes for
+**248 compression runs**, plus 14 evaluation-only or update-only, plus two extra whitening passes for
 stage 1b, one for Qwen2.5-7B and one for Qwen2.5-32B. At roughly 15 minutes a run that is about **55
 GPU hours** for the compressions on the two smaller models; stage 7d's eighteen runs are on a 32B model
 and cost several times that each, which is why they are the only ones the grid rations. Nine of those

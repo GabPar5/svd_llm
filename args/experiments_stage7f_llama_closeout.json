@@ -1,0 +1,27 @@
+[
+  {
+    "--compressed_model_path": "__CKPT_HET_0.2__",
+    "--eval_tasks": "wikitext,c4,arc_easy,hellaswag,openbookqa,piqa,winogrande|0"
+  },
+  {
+    "--compression_ratio": 0.5,
+    "--het": true,
+    "--group_criterion": "__FINALIST1_GROUPING__",
+    "--score_metric": "__FINALIST1_SCORE__",
+    "--inner_allocation": "__FINALIST1_INNER__",
+    "--outer_allocation": "__FINALIST1_OUTER__",
+    "--outer_offset": 1.05,
+    "--max_ratio": 0.6,
+    "--eval_tasks": "wikitext,c4,arc_easy,hellaswag,openbookqa,piqa,winogrande|0"
+  },
+  {
+    "--compression_ratio": 0.4,
+    "--het": true,
+    "--group_criterion": "__FINALIST1_GROUPING__",
+    "--score_metric": "__FINALIST1_SCORE__",
+    "--inner_allocation": "__FINALIST1_INNER__",
+    "--outer_allocation": "__FINALIST1_OUTER__",
+    "--outer_offset": 1.05,
+    "--max_ratio": 0.6
+  }
+]
